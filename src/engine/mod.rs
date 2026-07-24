@@ -348,3 +348,353 @@ impl Engine {
     fn send(&self, cmd: Cmd) -> Result<()> {
         self.inner
             .cmds
+            .send(cmd)
+            .map_err(|_| anyhow!("engine not running"))
+    }
+}
+
+/// How long the watchdog waits between checks. A lock read while healthy;
+/// only an actual recovery costs anything.
+const HEALTH_CHECK: Duration = Duration::from_secs(5);
+/// Audio must advance at least this often while "playing" or the stream is
+/// considered stalled (ffmpeg hung, network dead) and gets rebuilt.
+const STALL_AFTER: Duration = Duration::from_secs(15);
+/// An EOF with less than this much delivered audio is a dropped stream, not a
+/// finished track (see [`Worker::track_ended`]): on this box googlevideo
+/// connections die a few hundred ms in and ffmpeg exits 0, indistinguishable
+/// from a natural end by exit code alone. 5 s is well under any real song.
+const MIN_EOF_POSITION_MS: u32 = 5_000;
+/// How many consecutive short-EOF drops on the same track before it is given
+/// up on (skipped or, at the queue tail with repeat off, stopped cleanly)
+/// instead of rebuilding forever.
+///
+/// The same bound caps `recover_into`'s rebuild loop: both are "how hard do
+/// we keep retrying this track before walking away" — one number, so tuning
+/// it can't leave the two paths disagreeing about when to give up.
+const RECOVERY_ATTEMPTS: u32 = 8;
+/// First and last wait between failed recovery attempts, so an offline spell
+/// doesn't hammer the resolver every five seconds until dawn.
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(120);
+/// The bounded FIFO of pending metadata jobs (F6). 16 is headroom for a
+/// skip-burst at one job per track; the tuna-meta worker drains it at
+/// network+decode speed, and drop-oldest keeps the current track's job from
+/// ever waiting behind saturated work.
+const META_JOBS_CAP: usize = 16;
+
+/// Worker loop wakeup: drains commands, watches for EOF, emits position.
+const TICK: Duration = Duration::from_millis(100);
+/// How often the worker emits a [`EngineEvent::PositionCorrection`] while
+/// playing, to trim the app-side extrapolated playhead.
+const POSITION_EVERY: Duration = Duration::from_secs(1);
+
+fn next_backoff(current: Duration) -> Duration {
+    crate::util::backoff_step(current, RETRY_MAX)
+}
+
+/// Open the output device and build the player + the per-track sound queue.
+/// Runs on the caller's thread so a failure ("no audio device") surfaces from
+/// `run`, not a worker.
+///
+/// The queue pair is the engine's "append" surface: the output side is appended
+/// to the player once (it plays silence when empty), and each track is a
+/// `append_with_signal`d sound on the input side whose exposed receiver is the
+/// EOF signal. `Player` keeps its own queue private, so the pair sits outside
+/// it — volume/pause/play still go through the `Player`.
+fn open_output() -> Result<(
+    MixerDeviceSink,
+    Player,
+    Arc<rodio::queue::SourcesQueueInput>,
+)> {
+    // Device faults (cpal's `BufferUnderrun` on an ALSA/PipeWire xrun) go to
+    // the tuna-tui log instead of rodio's default raw `eprintln!` storming the
+    // terminal beside the TUI. The closure captures nothing, so the builder
+    // stays `Clone` for `open_sink_or_fallback`'s config fallback.
+    let mut sink = DeviceSinkBuilder::from_default_device()
+        .map_err(|e| anyhow!("audio device: {e}"))?
+        .with_error_callback(|err| liblog(format!("audio stream error: {err}")))
+        .open_sink_or_fallback()
+        .context("open audio device")?;
+    sink.log_on_drop(false);
+    let player = Player::connect_new(sink.mixer());
+    let (queue_in, queue_out) = rodio::queue::queue(true);
+    player.append(queue_out);
+    Ok((sink, player, queue_in))
+}
+
+/// Start the engine. Synchronous (it needs no runtime); the worker + watchdog
+/// threads are spawned here. `expander` resolves uris into streams; `events`
+/// receives the EngineEvent stream; `meta_tx`/`meta_rx` are the app's
+/// in-band metadata channel (bounded, drop-oldest) — the engine keeps a
+/// sending clone for its single "tuna-meta" worker and mirrors the receiver
+/// so a saturated channel sheds its oldest message instead of piling up
+/// multi-MB images.
+pub fn run(
+    events: flume::Sender<EngineEvent>,
+    meta_tx: flume::Sender<EngineMeta>,
+    meta_rx: flume::Receiver<EngineMeta>,
+    initial_volume_pct: u8,
+    expander: Arc<dyn Expander>,
+) -> Result<Engine> {
+    let bands = VisBands::shared();
+    let (sink, player, queue) = open_output()?;
+    let (cmds_tx, cmds_rx) = flume::unbounded::<Cmd>();
+    let health = Arc::new(Mutex::new(Health {
+        playing: false,
+        last_progress: Instant::now(),
+    }));
+
+    let queue_snapshot = Arc::new(Mutex::new(Vec::new()));
+    // The single persistent metadata worker (F6): one "tuna-meta" thread
+    // drains the bounded FIFO job queue and ships EngineMeta with
+    // drop-oldest — replacing a detached thread per track start and per
+    // recovery rebuild.
+    let (meta_jobs_tx, meta_jobs_rx) = flume::bounded::<MetaJob>(META_JOBS_CAP);
+    spawn_tuna_meta(meta_jobs_rx.clone(), meta_tx.clone(), meta_rx);
+    let worker = Worker {
+        sink,
+        player,
+        queue,
+        bands: Arc::clone(&bands),
+        events,
+        // Keep-alive only: build_stream hands jobs to the tuna-meta worker,
+        // which holds the sending clone. While this sender lives the meta
+        // channel cannot disconnect, so a worker that dies mid-session
+        // degrades to "no meta" — never a busy-spin on the app's select arm.
+        meta_tx,
+        meta_jobs: meta_jobs_tx,
+        meta_jobs_rx,
+        cmds: cmds_rx,
+        expander: Arc::clone(&expander),
+        queue_snapshot: Arc::clone(&queue_snapshot),
+        state: PlayerState {
+            tracks: Vec::new(),
+            cursor: 0,
+            history: Vec::new(),
+            shuffle: false,
+            repeat: false,
+            volume: initial_volume_pct.clamp(0, 100) as f32 / 100.0,
+            playing: false,
+        },
+        current: None,
+        health: Arc::clone(&health),
+        drop_streak: 0,
+        last_seen_frames: 0,
+        last_correction: Instant::now(),
+        pending: None,
+        recovery: None,
+        paused: None,
+    };
+    std::thread::Builder::new()
+        .name("tuna-engine".to_string())
+        .spawn(move || worker.run())?;
+    spawn_watchdog(Arc::clone(&health), cmds_tx.clone());
+
+    Ok(Engine {
+        bands,
+        inner: Arc::new(Inner {
+            cmds: cmds_tx,
+            expander,
+            queue: queue_snapshot,
+        }),
+    })
+}
+
+/// Poll for a stuck stream and ask the worker to rebuild it.
+///
+/// Holds only a *weak* sender: when the app drops its last [`Engine`], the
+/// worker's channel disconnects, the loop's `upgrade()` returns `None`, and
+/// this thread leaves — letting the worker see `Disconnected` and run its
+/// teardown instead of lingering anonymous forever (the strong sender held by
+/// the watchdog used to make that teardown unreachable).
+fn spawn_watchdog(health: Arc<Mutex<Health>>, cmds: flume::Sender<Cmd>) {
+    let weak = cmds.downgrade();
+    let _ = std::thread::Builder::new()
+        .name("tuna-watchdog".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(HEALTH_CHECK);
+            // `upgrade()` is also the liveness probe: none left → retire.
+            let Some(cmds) = weak.upgrade() else {
+                return;
+            };
+            let h = match health.lock() {
+                Ok(h) => h,
+                Err(p) => p.into_inner(),
+            };
+            if h.playing && h.last_progress.elapsed() > STALL_AFTER {
+                drop(h);
+                // The worker clears `playing` while it rebuilds, so this can
+                // never stack recoveries; it re-arms at the next poll.
+                let _ = cmds.send(Cmd::Recover);
+            }
+        });
+}
+
+/// Send `msg` without ever blocking; a saturated bounded channel sheds its
+/// OLDEST queued message to make room (drop-oldest), then retries until the
+/// send lands or there is nothing left to shed. The porch rule for the meta
+/// pipeline: the current track's message must always land, older tracks'
+/// messages are disposable (the app's `meta_is_current` guard makes a dropped
+/// message invisible beyond that track's fallback), and a blocking send would
+/// park one thread per stuck message — each holding a multi-MB image.
+fn send_drop_oldest<T>(tx: &flume::Sender<T>, rx: &flume::Receiver<T>, mut msg: T) {
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => return,
+            Err(flume::TrySendError::Full(m)) => {
+                msg = m;
+                match rx.try_recv() {
+                    // Dropped the oldest, or a receiver drained the queue
+                    // concurrently — either way there is room now; retry.
+                    Ok(_) | Err(flume::TryRecvError::Empty) => {}
+                    // Receiver gone — nothing left to drop for.
+                    Err(flume::TryRecvError::Disconnected) => return,
+                }
+            }
+            Err(flume::TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
+
+/// The one metadata worker (F6): drains the bounded FIFO [`MetaJob`] queue,
+/// computes in-band metadata for each fresh job and ships it over the bounded
+/// meta channel (drop-oldest on saturation) — one thread instead of a
+/// detached thread per track start and per recovery rebuild. `fresh: false`
+/// jobs (recovery re-deliveries of an already-delivered track) are skipped:
+/// re-applying would re-run `record_played`, inflating Home counts. Known
+/// edge (documented in the PR): a recovery that fires before the first
+/// meta delivery for a track — e.g. the very first `build_stream` fails and
+/// a recovery rebuild succeeds — skips meta for that track, which then falls
+/// back to the bare-URI defaults until it is replayed. Exits when the engine
+/// drops its job sender (the queue disconnects).
+fn spawn_tuna_meta(
+    jobs: flume::Receiver<MetaJob>,
+    meta_tx: flume::Sender<EngineMeta>,
+    meta_rx: flume::Receiver<EngineMeta>,
+) {
+    // Cloning the once-built blocking client (Arc-fee) — constructed by
+    // `httpcache::warm_blocking_client` before the runtime started.
+    let client = crate::httpcache::blocking_client().clone();
+    if std::thread::Builder::new()
+        .name("tuna-meta".to_string())
+        .spawn(move || {
+            while let Ok(job) = jobs.recv() {
+                if !job.fresh {
+                    // Recovery rebuild of an already-delivered track.
+                    continue;
+                }
+                let meta = engine_meta(&job.uri, &job.info, &client);
+                send_drop_oldest(&meta_tx, &meta_rx, meta);
+            }
+        })
+        .is_err()
+    {
+        liblog("engine: failed to spawn tuna-meta worker");
+    }
+}
+
+struct Worker {
+    /// Held alive for the worker's whole life: dropping it stops the device.
+    #[allow(dead_code)] // the guard's whole job is to be held, never read
+    sink: MixerDeviceSink,
+    player: Player,
+    /// The per-track sound queue: tracks are appended here, EOF signals come
+    /// back from its receivers.
+    queue: Arc<rodio::queue::SourcesQueueInput>,
+    bands: Arc<Mutex<VisBands>>,
+    events: flume::Sender<EngineEvent>,
+    /// Keep-alive for the app's in-band metadata channel — see `run`.
+    /// The actual sending clone lives on the tuna-meta worker thread.
+    #[allow(dead_code)] // the guard's whole job is to be held, never read
+    meta_tx: flume::Sender<EngineMeta>,
+    /// The bounded FIFO feeding the single tuna-meta worker (F6). Jobs are
+    /// queued by `build_stream` with drop-oldest on saturation; the receiver
+    /// half is how the oldest queued job is shed.
+    meta_jobs: flume::Sender<MetaJob>,
+    meta_jobs_rx: flume::Receiver<MetaJob>,
+    cmds: flume::Receiver<Cmd>,
+    expander: Arc<dyn Expander>,
+    /// The public mirror of the loaded list (`Engine::queue`).
+    queue_snapshot: Arc<Mutex<Vec<String>>>,
+    state: PlayerState,
+    current: Option<CurrentTrack>,
+    health: Arc<Mutex<Health>>,
+    /// Consecutive short-EOF drops on the current track (mirrors
+    /// [`RECOVERY_ATTEMPTS`]); reset on a natural end or a new track.
+    drop_streak: u32,
+    /// The last frame count seen (stall detection needs deltas).
+    last_seen_frames: u64,
+    last_correction: Instant,
+    /// A user command that pre-empted a recovery retry-sleep; handled before
+    /// anything queued behind it.
+    pending: Option<Cmd>,
+    /// The track a recovery is rebuilding, while `current` is nowhere. The
+    /// watchdog and a pre-empted resume use it to re-enter the rebuild loop
+    /// instead of losing the track.
+    recovery: Option<(String, u32)>,
+    /// The paused track's stream, while `current` is nowhere: the URL stays
+    /// cached so a resume can restart without re-resolving. Cleared on every
+    /// transition out of the pause state (next/prev/stop/load/teardown) so it
+    /// can never resurrect a stale stream on a later resume.
+    paused: Option<PausedTrack>,
+}
+
+impl Worker {
+    fn run(mut self) {
+        self.player.set_volume(self.state.volume);
+        loop {
+            match self.cmds.recv_timeout(TICK) {
+                Ok(cmd) => self.handle(cmd),
+                Err(flume::RecvTimeoutError::Timeout) => self.tick(),
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+            }
+            if let Some(pre) = self.pending.take() {
+                self.handle(pre);
+                // The pre-empting command ran — if the recovery it interrupted
+                // is still owed and nothing else took the stage, re-enter it.
+                if let Some((uri, pos)) = self.recovery.take() {
+                    if self.current.is_none() {
+                        self.recover_into(uri, pos);
+                    }
+                }
+            }
+        }
+        self.teardown();
+    }
+
+    /// The per-tick (100 ms) bookkeeping: EOF, health, position.
+    fn tick(&mut self) {
+        // Collect the EOF flag under the borrow, then act on it after the
+        // borrow of `current` is released (`track_ended` needs `&mut self`).
+        let mut ended = false;
+        if let Some(cur) = self.current.as_mut() {
+            let f = cur.frames.load(Ordering::Relaxed);
+            if f != self.last_seen_frames {
+                self.last_seen_frames = f;
+                if let Ok(mut h) = self.health.lock() {
+                    h.last_progress = Instant::now();
+                }
+            }
+            // Track end: rodio fired the sound-done signal.
+            ended = cur.done.try_recv().is_ok();
+            if !ended && self.state.playing && self.last_correction.elapsed() >= POSITION_EVERY {
+                // Derive the position from `cur` directly (no `&self` borrow
+                // while `current` is mutably borrowed).
+                let frames = cur.frames.load(Ordering::Relaxed);
+                let pos = frames_to_position(cur.position_ms, frames);
+                let uri = cur.uri.clone();
+                let _ = self.events.send(EngineEvent::PositionCorrection {
+                    uri,
+                    position_ms: pos,
+                });
+                self.last_correction = Instant::now();
+            }
+        }
+        if ended {
+            self.track_ended();
+        }
+    }
+
+    fn set_health(&mut self, playing: bool) {
+        if let Ok(mut h) = self.health.lock() {
+            h.playing = playing;
