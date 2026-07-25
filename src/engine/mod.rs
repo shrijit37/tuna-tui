@@ -698,3 +698,403 @@ impl Worker {
     fn set_health(&mut self, playing: bool) {
         if let Ok(mut h) = self.health.lock() {
             h.playing = playing;
+            h.last_progress = Instant::now();
+        }
+    }
+
+    fn set_active(&self, active: bool) {
+        if let Ok(mut b) = self.bands.lock() {
+            b.is_active = active;
+        }
+    }
+
+    fn reset_bands(&self) {
+        if let Ok(mut b) = self.bands.lock() {
+            b.values.fill(0.0);
+            b.peak_envelope = 1e-6;
+            b.updated_at = Instant::now();
+        }
+    }
+
+    fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Load {
+                tracks,
+                start_uri,
+                position_ms,
+                shuffle,
+            } => {
+                self.shutdown_current();
+                // A fresh context supersedes any in-flight recovery.
+                self.recovery = None;
+                let start = start_uri
+                    .as_deref()
+                    .and_then(|u| tracks.iter().position(|t| t == u))
+                    .unwrap_or(0);
+                if let Ok(mut q) = self.queue_snapshot.lock() {
+                    *q = tracks.clone();
+                }
+                self.state = PlayerState {
+                    // `start` is the cursor: advance picks up after the first
+                    // track, and history grows from it — not from 0.
+                    tracks,
+                    cursor: start,
+                    history: Vec::new(),
+                    shuffle,
+                    repeat: self.state.repeat,
+                    volume: self.state.volume,
+                    playing: true,
+                };
+                self.start_track_at(start, position_ms);
+            }
+            Cmd::Resume => {
+                if !self.state.playing && self.current.is_none() {
+                    // Resume from the pause stash: restart the decoder on the
+                    // same already-resolved URL — no network re-resolve. The
+                    // stash is taken (cleared) on every outcome so a failed
+                    // restart can never resurrect it.
+                    let Some(p) = self.paused.take() else {
+                        return;
+                    };
+                    let pos = truncate_seconds(p.position_ms);
+                    match self.restart_stream(&p.url, &p.uri, p.duration_ms, pos, true) {
+                        Ok(()) => {
+                            self.state.playing = true;
+                            self.set_health(true);
+                            self.set_active(true);
+                            // A fresh post-resume decoder starts with a clean
+                            // slate, like seek_now and start_track_at give it —
+                            // the pre-pause streak must not count against it.
+                            self.drop_streak = 0;
+                            let _ = self.events.send(EngineEvent::Playing {
+                                uri: p.uri,
+                                position_ms: pos,
+                            });
+                        }
+                        Err(e) => {
+                            liblog(format!("engine: resume failed: {e}"));
+                            // `state.playing` is false while paused, so the
+                            // rebuild stays paused; after RECOVERY_ATTEMPTS
+                            // give_up_on skips the track — the audit's
+                            // prescribed fallback, recover_into unchanged.
+                            self.recover_into(p.uri, pos);
+                        }
+                    }
+                } else if !self.state.playing && self.current.is_some() {
+                    self.player.play();
+                    self.state.playing = true;
+                    self.set_health(true);
+                    self.set_active(true);
+                    let (uri, pos) = self.current_ident();
+                    let _ = self.events.send(EngineEvent::Playing {
+                        uri,
+                        position_ms: pos,
+                    });
+                }
+            }
+            Cmd::Pause => {
+                if self.state.playing && self.current.is_some() {
+                    self.player.pause();
+                    self.state.playing = false;
+                    self.set_health(false);
+                    self.set_active(false);
+                    let (uri, pos) = self.current_ident();
+                    let _ = self.events.send(EngineEvent::Paused {
+                        uri,
+                        position_ms: pos,
+                    });
+                    // Stash the resolved stream, then tear it down: ffmpeg and
+                    // its googlevideo connection must not stay resident for the
+                    // whole pause. Resume restarts from this stashed URL — no
+                    // re-resolve.
+                    if let Some(cur) = &self.current {
+                        self.paused = Some(PausedTrack {
+                            uri: cur.uri.clone(),
+                            url: cur.url.clone(),
+                            duration_ms: cur.duration_ms,
+                            position_ms: pos,
+                        });
+                    }
+                    self.shutdown_current();
+                }
+            }
+            Cmd::Toggle => {
+                if self.state.playing {
+                    self.handle(Cmd::Pause);
+                } else {
+                    self.handle(Cmd::Resume);
+                }
+            }
+            Cmd::Next => self.advance(),
+            Cmd::Prev => {
+                // The stash counts as the current track: the >5s restart rule
+                // and the no-history restart-at-0 both apply to a paused
+                // track too (seek_now updates the stash, staying paused).
+                let pos = self.current_pos();
+                if (self.current.is_some() || self.paused.is_some()) && pos > 5_000 {
+                    self.seek_now(0);
+                } else if let Some(prev) = self.state.history.pop() {
+                    self.start_track_at(prev, 0);
+                } else if self.current.is_some() || self.paused.is_some() {
+                    self.seek_now(0);
+                }
+            }
+            Cmd::Seek(pos) => self.seek_now(pos),
+            Cmd::Volume(v) => {
+                self.state.volume = v;
+                self.player.set_volume(v);
+            }
+            Cmd::Shuffle(on) => self.state.shuffle = on,
+            Cmd::Repeat(on) => self.state.repeat = on,
+            Cmd::Append(uris) => {
+                if let Ok(mut q) = self.queue_snapshot.lock() {
+                    q.extend(uris.iter().cloned());
+                }
+                self.state.tracks.extend(uris);
+            }
+            Cmd::Stop => self.stop_playback(),
+            Cmd::Recover => self.recover(),
+        }
+    }
+
+    /// The canonical identity of the current track, for events.
+    fn current_ident(&self) -> (String, u32) {
+        match &self.current {
+            Some(c) => (c.uri.clone(), self.position_of(c)),
+            None => (String::new(), 0),
+        }
+    }
+
+    fn position_of(&self, cur: &CurrentTrack) -> u32 {
+        let frames = cur.frames.load(Ordering::Relaxed);
+        frames_to_position(cur.position_ms, frames)
+    }
+
+    fn current_pos(&self) -> u32 {
+        match &self.current {
+            Some(c) => self.position_of(c),
+            // While paused the stash owns the playhead: `prev` consults it so
+            // the pre-teardown contract (restart the current track at 0 when
+            // past 5s, stay paused) survives the teardown.
+            None => self.paused.as_ref().map_or(0, |p| p.position_ms),
+        }
+    }
+
+    /// Move to the next track in the (possibly shuffled) queue; `None` when
+    /// the queue is exhausted and repeat is off.
+    fn advance_index(&mut self) -> Option<usize> {
+        let n = self.state.tracks.len();
+        if n == 0 {
+            return None;
+        }
+        if self.state.shuffle && n > 1 {
+            let pick = shuffle_pick(self.state.cursor, n, &mut rand::rng());
+            self.state.history.push(self.state.cursor);
+            self.state.cursor = pick;
+            return Some(pick);
+        }
+        if self.state.cursor + 1 < n {
+            self.state.history.push(self.state.cursor);
+            self.state.cursor += 1;
+            return Some(self.state.cursor);
+        }
+        if self.state.repeat {
+            self.state.history.push(self.state.cursor);
+            self.state.cursor = 0;
+            return Some(0);
+        }
+        None
+    }
+
+    /// `next` (or the natural end of a finished track) — the shared body.
+    fn advance(&mut self) {
+        if self.current.is_none() && self.state.tracks.is_empty() {
+            return;
+        }
+        match self.advance_index() {
+            Some(idx) => self.start_track_at(idx, 0),
+            None => {
+                // Queue over, repeat off: stop cleanly, like the old endpoint. The loaded
+                // queue is kept — prev/next still navigate the list after a stop.
+                self.shutdown_current();
+                self.stop_tail();
+            }
+        }
+    }
+    /// The natural end of the current track (EOF): advance the queue; if the
+    /// process died instead of ending, rebuild the stream.
+    ///
+    /// A dropped stream is *not* an end of track: YouTube's transport (and
+    /// this box's Wi-Fi, verified 2026-08-16) closes the connection mid-song,
+    /// ffmpeg then exits cleanly (code 0) and the pipe EOFs with only seconds
+    /// of audio delivered. Without this check the engine would treat that as
+    /// a finished track and advance/stop. Anything that "ended" in under
+    /// [`MIN_EOF_POSITION_MS`] of delivered playhead is treated as a failed
+    /// stream and rebuilt — except when the *track itself* is that short
+    /// (`duration_ms` says its real end was reached), which is a genuine EOF.
+    ///
+    /// Rebuilds are bounded by [`RECOVERY_ATTEMPTS`]: each drop on the same track
+    /// counts up and the track is given up on (skipped/stopped) once the
+    /// streak passes, so a persistently-dead stream can't churn forever.
+    fn track_ended(&mut self) {
+        let Some(mut cur) = self.current.take() else {
+            return;
+        };
+        let uri = cur.uri.clone();
+        let pos = self.position_of(&cur);
+        let failed = cur
+            .child
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.code() != Some(0));
+        let dropped = is_stream_dropped(pos, cur.duration_ms, failed);
+        if dropped {
+            let _ = cur.child.kill();
+            let _ = cur.child.wait();
+            self.drop_streak += 1;
+            if self.drop_streak >= RECOVERY_ATTEMPTS {
+                liblog(format!(
+                    "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
+                ));
+                self.give_up_on(uri);
+                return;
+            }
+            if failed {
+                liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
+            } else {
+                liblog(format!(
+                    "engine: stream dropped for {uri} at {pos}ms (expected {:?}ms); rebuilding",
+                    cur.duration_ms
+                ));
+            }
+            self.recover_into(uri, pos);
+            return;
+        }
+        self.drop_streak = 0;
+        drop(cur);
+        self.advance();
+    }
+
+    /// The track is given up on after too many consecutive failures: remove it
+    /// from the queue (keeping the queue view mirror in sync) and play its
+    /// successor — or stop cleanly when the queue is over and repeat is off,
+    /// mirroring `advance()`'s queue-exhausted behavior.
+    fn give_up_on(&mut self, uri: String) {
+        self.recovery = None;
+        self.drop_streak = 0;
+        let dead = self.state.cursor;
+        if dead < self.state.tracks.len() && self.state.tracks[dead] == uri {
+            self.state.tracks.remove(dead);
+        } else {
+            self.state.tracks.retain(|t| *t != uri);
+        }
+        // History indices shift past the removed slot.
+        self.state.history.retain(|&h| h != dead);
+        for h in &mut self.state.history {
+            if *h > dead {
+                *h -= 1;
+            }
+        }
+        *self.queue_snapshot.lock().unwrap() = self.state.tracks.clone();
+        liblog(format!(
+            "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
+        ));
+        if self.state.tracks.is_empty() {
+            self.stop_tail();
+        } else if dead < self.state.tracks.len() {
+            self.start_track_at(dead, 0);
+        } else if self.state.repeat {
+            self.start_track_at(0, 0);
+        } else {
+            self.stop_tail();
+        }
+    }
+
+    /// A watchdog stall or a failing decoder: re-resolve and restart from the
+    /// current position, with the old 5–120 s backoff. Gives up (skips the
+    /// track) after [`RECOVERY_ATTEMPTS`].
+    fn recover(&mut self) {
+        let (uri, pos) = self.current_ident();
+        if uri.is_empty() {
+            // A recovery in flight owns the uri even while `current` is gone.
+            if let Some((uri, pos)) = self.recovery.clone() {
+                self.recover_into(uri, pos);
+            }
+            return;
+        }
+        self.recover_into(uri, pos);
+    }
+
+    fn recover_into(&mut self, uri: String, pos: u32) {
+        self.shutdown_current();
+        self.set_health(false); // watchdog off while we rebuild
+                                // A paused player stays paused: the stalled stream is rebuilt into
+                                // the state it left behind, never force-played.
+        let play = self.state.playing;
+        self.recovery = Some((uri.clone(), pos));
+
+        let mut backoff = RETRY_MIN;
+        for attempt in 0..RECOVERY_ATTEMPTS {
+            if attempt > 0 {
+                let _ = self.events.send(EngineEvent::Reconnecting);
+            }
+            match self.build_stream(&uri, pos, play, false) {
+                Ok(()) => {
+                    if attempt > 0 {
+                        let _ = self.events.send(EngineEvent::Reconnected);
+                    }
+                    self.recovery = None;
+                    return;
+                }
+                Err(e) => {
+                    liblog(format!("engine: recover {uri} attempt {attempt}: {e}"));
+                    if attempt + 1 >= RECOVERY_ATTEMPTS {
+                        break;
+                    }
+                    if let Some(pre) = self.interruptible_sleep(backoff) {
+                        // A user command pre-empted the wait; it is dispatched
+                        // by `run` before anything queued behind it, which then
+                        // re-enters this loop via `recovery`.
+                        self.pending = Some(pre);
+                        return;
+                    }
+                    backoff = next_backoff(backoff);
+                }
+            }
+        }
+        self.recovery = None;
+        self.give_up_on(uri);
+    }
+
+    /// Stop playback and reset every track-related state: cancel the current
+    /// child, clear the queue + mirror + history, and announce `Stopped`.
+    fn stop_playback(&mut self) {
+        self.shutdown_current();
+        self.recovery = None;
+        self.paused = None; // a stop during pause must not resurrect the stash
+        if let Ok(mut q) = self.queue_snapshot.lock() {
+            q.clear();
+        }
+        self.state.tracks.clear();
+        self.state.history.clear();
+        self.state.cursor = 0;
+        self.stop_tail();
+    }
+
+    /// The shared teardown tail of every stop path: mark the player stopped
+    /// (watchdog off, bands zeroed) and announce it. Callers run their own
+    /// prelude — shut down the current child, and (only [`stop_playback`])
+    /// clear the loaded queue.
+    fn stop_tail(&mut self) {
+        self.state.playing = false;
+        self.set_health(false);
+        self.set_active(false);
+        self.reset_bands();
+        self.paused = None; // every stop tail is a transition out of pause
+        let _ = self.events.send(EngineEvent::Stopped);
+    }
+
+    fn interruptible_sleep(&self, dur: Duration) -> Option<Cmd> {
+        let deadline = Instant::now() + dur;
+        while Instant::now() < deadline {
