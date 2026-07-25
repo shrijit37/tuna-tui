@@ -1098,3 +1098,403 @@ impl Worker {
     fn interruptible_sleep(&self, dur: Duration) -> Option<Cmd> {
         let deadline = Instant::now() + dur;
         while Instant::now() < deadline {
+            if let Ok(c) = self.cmds.try_recv() {
+                return Some(c);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// Stop the current child. Flipping the source's cancel flag first makes it
+    /// end on the next audio callback, so the old track's buffered PCM is never
+    /// heard after a swap; the stale done-signal rides out with the track object.
+    fn shutdown_current(&mut self) {
+        if let Some(mut cur) = self.current.take() {
+            cur.cancelled.store(true, Ordering::Relaxed);
+            let _ = cur.child.kill();
+            let _ = cur.child.wait();
+        }
+    }
+
+    /// Begin resolving, decoding and playing `tracks[idx]`.
+    fn start_track_at(&mut self, idx: usize, pos: u32) {
+        // A new track supersedes any paused stash — it must not resurrect on a
+        // later resume.
+        self.paused = None;
+        let Some(uri) = self.state.tracks.get(idx).cloned() else {
+            return;
+        };
+        self.shutdown_current();
+        self.state.cursor = idx;
+        self.state.playing = true;
+        self.set_health(false);
+        self.drop_streak = 0; // a fresh track starts with a clean slate
+        let _ = self
+            .events
+            .send(EngineEvent::TrackChanged { uri: uri.clone() });
+
+        if let Err(e) = self.build_stream(&uri, pos, true, true) {
+            liblog(format!("engine: start {uri} failed: {e}"));
+            self.recover_into(uri, pos);
+        }
+    }
+
+    /// Restart the decoder on `url` at whole-second `pos` — the shared mid-
+    /// section of `build_stream` (fresh track) and `seek_now` (seek on the
+    /// current stream). `play` says whether the new stream should be audible,
+    /// not the engine's playback state: callers own `state.playing` (a seek on
+    /// a paused track stays paused; a recovery rebuild keeps its saved state).
+    fn restart_stream(
+        &mut self,
+        url: &str,
+        uri: &str,
+        duration_ms: Option<u32>,
+        pos: u32,
+        play: bool,
+    ) -> Result<()> {
+        // `-ss` seeks on whole seconds; anchor the playhead at the truncated
+        // position so the extrapolation doesn't run ahead of the decoder.
+        let pos = truncate_seconds(pos);
+        let (child, stdout) = spawn_ffmpeg(url, pos)?;
+        let frames = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let source = FfmpegSource::new(
+            stdout,
+            Arc::clone(&frames),
+            Arc::clone(&self.bands),
+            Arc::clone(&cancelled),
+        );
+        let done = self.queue.append_with_signal(source);
+        if play {
+            self.player.play();
+        } else {
+            self.player.pause();
+        }
+        self.current = Some(CurrentTrack {
+            uri: uri.to_string(),
+            url: url.to_string(),
+            position_ms: pos,
+            duration_ms,
+            child,
+            done,
+            frames,
+            cancelled,
+        });
+        self.last_seen_frames = 0;
+        self.set_health(play);
+        self.set_active(play);
+        self.last_correction = Instant::now();
+        Ok(())
+    }
+
+    /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
+    /// when `play` is false, announce Paused and keep the mixer suspended (a
+    /// recovery rebuilding a track the user had paused must not force-play it).
+    /// `fresh` marks a newly-started track: recovery rebuilds of the same
+    /// track pass `false`, so the tuna-meta worker skips the re-delivery
+    /// (its meta was already applied — see [`spawn_tuna_meta`] for the
+    /// first-delivery edge).
+    fn build_stream(&mut self, uri: &str, pos: u32, play: bool, fresh: bool) -> Result<()> {
+        let resolved = self.expander.resolve(uri).map_err(|e| anyhow!(e))?;
+        let url = resolved.url.clone();
+        self.restart_stream(&url, uri, resolved.duration_ms, pos, play)?;
+        self.state.playing = play;
+        let _ = self.events.send(if play {
+            EngineEvent::Playing {
+                uri: uri.to_string(),
+                position_ms: pos,
+            }
+        } else {
+            EngineEvent::Paused {
+                uri: uri.to_string(),
+                position_ms: pos,
+            }
+        });
+        // In-band metadata for every resolved track (the app has no other
+        // metadata source since the Web API died). Handed to the single
+        // persistent "tuna-meta" worker (F6) — one thread fetches cover +
+        // theme for the FIFO as it drains, instead of a detached thread per
+        // track start AND per recovery rebuild (each re-fetching and
+        // re-decoding the unchanged cover). The send is never blocking: a
+        // saturated job queue drops the OLDEST job, so the current track's
+        // always lands.
+        send_drop_oldest(
+            &self.meta_jobs,
+            &self.meta_jobs_rx,
+            MetaJob {
+                uri: uri.to_string(),
+                info: resolved,
+                fresh,
+            },
+        );
+        Ok(())
+    }
+
+    /// Seek: restart the decoder at `pos` on the current stream URL.
+    fn seek_now(&mut self, pos: u32) {
+        // Scrub-while-paused: no stream is resident, so the target is recorded
+        // on the stash (whole-second truncated) and applied at the next resume
+        // — restart_stream anchors at the same truncation.
+        if let Some(p) = self.paused.as_mut() {
+            p.position_ms = truncate_seconds(pos);
+            // Keep the app (and media controls via apply_position) in sync
+            // with the engine-truncated target — same contract as the
+            // current-based seek path below.
+            let _ = self.events.send(EngineEvent::PositionCorrection {
+                uri: p.uri.clone(),
+                position_ms: p.position_ms,
+            });
+            return;
+        }
+        let Some(mut cur) = self.current.take() else {
+            return;
+        };
+        let url = cur.url.clone();
+        let uri = cur.uri.clone();
+        cur.cancelled.store(true, Ordering::Relaxed);
+        let _ = cur.child.kill();
+        let _ = cur.child.wait();
+        // Same whole-second anchor restart_stream applies; needed here for the
+        // correction event and the recovery fallback.
+        let pos = truncate_seconds(pos);
+        match self.restart_stream(&url, &uri, cur.duration_ms, pos, self.state.playing) {
+            Ok(()) => {
+                // A fresh decoder starts with a clean slate (build_stream's
+                // callers reset the streak before starting a new track).
+                self.drop_streak = 0;
+                let _ = self.events.send(EngineEvent::PositionCorrection {
+                    uri,
+                    position_ms: pos,
+                });
+            }
+            Err(e) => {
+                liblog(format!("engine: seek failed: {e}"));
+                self.set_health(false);
+                self.recover_into(uri, pos);
+            }
+        }
+    }
+
+    fn teardown(&mut self) {
+        if let Some(mut cur) = self.current.take() {
+            cur.cancelled.store(true, Ordering::Relaxed);
+            let _ = cur.child.kill();
+            let _ = cur.child.wait();
+        }
+        self.paused = None;
+        self.set_active(false);
+        self.set_health(false);
+    }
+}
+
+/// Spawn ffmpeg decoding `url` into raw stereo s16 at 44.1 kHz on stdout,
+/// seeking to `pos` first (input seek — fast). Returns the child (for
+/// kill/reap) plus its stdout, which is where the PCM comes from.
+fn spawn_ffmpeg(url: &str, pos: u32) -> Result<(Child, std::process::ChildStdout)> {
+    let bin = crate::config::get().ffmpeg_path.clone();
+    let mut cmd = Command::new(&bin);
+    cmd.args(["-v", "error", "-hide_banner", "-nostdin"]);
+    if url.starts_with("http://") || url.starts_with("https://") {
+        cmd.args([
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ]);
+    }
+    if pos > 0 {
+        cmd.arg("-ss").arg(format!("{}", pos / 1000));
+    }
+    cmd.arg("-i")
+        .arg(url)
+        .args([
+            "-map", "0:a:0", "-vn", "-f", "s16le", "-ac", "2", "-ar", "44100", "-",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .env("FFMPEG_NO_AUTO_CPU_FLAGS", "1");
+    let mut child = cmd.spawn().context("spawn ffmpeg")?;
+    // Catch an immediate self-exit (bad URL, missing lib) — the pipe would
+    // otherwise read EOF immediately and look like a two-sample track.
+    if let Some(status) = child.try_wait().ok().flatten() {
+        return Err(anyhow!("ffmpeg exited immediately: {status}"));
+    }
+    let stdout = child.stdout.take().expect("ffmpeg stdout piped");
+    Ok((child, stdout))
+}
+
+/// Position derivation, pure for testing: `start_ms + frames / 44.1`.
+/// Saturating: hostile frame counts clamp to the position ceiling instead of
+/// wrapping (u64::MAX × 1000 overflows a u64).
+fn frames_to_position(start_ms: u32, frames: u64) -> u32 {
+    (start_ms as u64)
+        .saturating_add(frames.saturating_mul(1000) / 44_100)
+        .min(u32::MAX as u64) as u32
+}
+
+/// Whole-second truncation for `-ss` seeks: the decoder starts at the
+/// truncated offset, so the playhead anchor, the stash and every position
+/// event must agree on it.
+fn truncate_seconds(pos: u32) -> u32 {
+    pos / 1000 * 1000
+}
+
+/// Pure drop-vs-finish helper: determines whether an EOF signal represents a dropped stream
+/// (network closed mid-track) or a natural end of track.
+pub(crate) fn is_stream_dropped(pos: u32, duration_ms: Option<u32>, failed: bool) -> bool {
+    if failed {
+        return true;
+    }
+    match duration_ms {
+        Some(total_ms) => {
+            // A track with known duration is only finished if the playhead reached within 3s of the end.
+            // Any earlier EOF means the stream disconnected mid-track.
+            pos.saturating_add(3_000) < total_ms
+        }
+        None => {
+            // If duration is unknown, anything under 5s is considered a dropped stream.
+            pos < MIN_EOF_POSITION_MS
+        }
+    }
+}
+
+/// Build in-band metadata for a yt: track, fetching its cover + theme the
+/// same way the api layer did (httpcache-keyed, 24 h TTL).
+fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client) -> EngineMeta {
+    let mut image = None;
+    let mut theme = None;
+    let mut image_url = r.thumbnail.clone();
+
+    // Upgrade to official YouTube Music 1:1 square album art if the thumbnail
+    // is a 16:9 widescreen YouTube video frame or missing.
+    if !image_url
+        .as_ref()
+        .is_some_and(|u| u.contains("googleusercontent.com"))
+    {
+        if let Some(id) = crate::util::track_id_from_uri(uri) {
+            let hint = if !r.title.is_empty() {
+                format!("{} {}", r.title, r.artist)
+            } else {
+                String::new()
+            };
+            if let Some(sq) = crate::providers::ytmusic::square_album_art(&id, &hint) {
+                image_url = Some(sq);
+            }
+        }
+    }
+    if let Some(u) = &image_url {
+        image_url = Some(crate::providers::ytmusic::normalize_thumbnail_url(u));
+    }
+
+    if let Some(url) = &image_url {
+        if let Some(bytes) = fetch_cover(client, url) {
+            if let Some(img) = decode_cover(&bytes) {
+                theme = Some(crate::reactive::derive_theme(&img, "album ✦"));
+                image = Some(img);
+            }
+        }
+    }
+    EngineMeta {
+        uri: uri.to_string(),
+        title: r.title.clone(),
+        artist: r.artist.clone(),
+        album: r.album.clone().unwrap_or_default(),
+        duration_ms: r.duration_ms.unwrap_or(0),
+        image_url,
+        image,
+        theme,
+    }
+}
+
+/// Decode cover bytes and downscale to at most 320x320 (F15). The art box is
+/// hard-capped at 14 rows (~280–336 px) and only two pixel consumers exist
+/// (`derive_theme`, `Cover::from_image`) — one downscale feeds both, saving
+/// ~10–15 MB of decode/clone traffic per track at full-res thumbnails.
+/// Small fallback thumbnails pass through unchanged: on image 0.25.10
+/// `thumbnail` has NO no-upscale guard (the 0.24 `nwidth >= width` early
+/// return is gone — it unconditionally resizes), so the size check here is
+/// what guarantees "never upscales". Corrupt bytes take the existing `None`
+fn decode_cover(bytes: &[u8]) -> Option<image::DynamicImage> {
+    image::load_from_memory(bytes).ok()
+}
+
+/// Cover bytes, from disk when they've been seen before; error pages are
+/// never cached (identical policy to the api-layer fetch_cover).
+fn fetch_cover(client: &reqwest::blocking::Client, url: &str) -> Option<Vec<u8>> {
+    if let Some(bytes) = crate::httpcache::get_bytes(url) {
+        return Some(bytes);
+    }
+    let resp = client.get(url).send().ok()?;
+    if !resp.status().is_success() {
+        liblog(format!("cover: {url} -> HTTP {}", resp.status().as_u16()));
+        return None;
+    }
+    let bytes = resp.bytes().ok()?.to_vec();
+    crate::httpcache::put_bytes(url, &bytes);
+    Some(bytes)
+}
+
+/// Rejection loop for shuffle picking — eliminates the per-skip `Vec`
+/// allocation while guaranteeing `pick != cursor`.
+fn shuffle_pick(cursor: usize, n: usize, rng: &mut impl rand::Rng) -> usize {
+    loop {
+        let i = rng.random_range(0..n);
+        if i != cursor {
+            break i;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_failing_recovery_backs_off_up_to_the_cap() {
+        assert!(next_backoff(RETRY_MIN) > RETRY_MIN);
+        let mut wait = RETRY_MIN;
+        for _ in 0..10 {
+            wait = next_backoff(wait);
+            assert!(wait <= RETRY_MAX, "{wait:?} is past the cap");
+        }
+        // An offline night must settle at the cap rather than grow without
+        // bound — the watchdog has to still be trying when the network returns.
+        assert_eq!(wait, RETRY_MAX);
+    }
+
+    #[test]
+    fn volume_maps_linear_units() {
+        // The pre-port mixer's linear 0..=65535 scale.
+        assert_eq!(65_535_f32 / 65_535.0, 1.0);
+        assert_eq!(32_767_f32 / 65_535.0, 0.49999237);
+        assert_eq!(0_f32 / 65_535.0, 0.0);
+    }
+
+    #[test]
+    fn position_derivation_adds_frames() {
+        // 44_100 frames = one second of audio.
+        assert_eq!(frames_to_position(5_000, 44_100), 6_000);
+        assert_eq!(frames_to_position(0, 0), 0);
+        // Huge counts clamp rather than wrap.
+        assert_eq!(frames_to_position(0, u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn truncate_seconds_keeps_whole_seconds() {
+        // The decoder's `-ss` seeks land on whole seconds only; the anchor
+        // (and the pause stash, and every event) must match.
+        assert_eq!(truncate_seconds(0), 0);
+        assert_eq!(truncate_seconds(999), 0);
+        assert_eq!(truncate_seconds(1000), 1000);
+        assert_eq!(truncate_seconds(1500), 1000);
+        assert_eq!(truncate_seconds(59_999), 59_000);
+    }
+
+    #[test]
+    fn paused_stash_is_distinct_from_recovery() {
+        // `paused` must never be the recovery tuple: run()'s pre-empt re-entry
+        // treats `recovery` as an in-flight rebuild and would rebuild the
+        // stream on the next command. The real assertion is compile-time — the
