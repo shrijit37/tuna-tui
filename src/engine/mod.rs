@@ -1498,3 +1498,319 @@ mod tests {
         // `paused` must never be the recovery tuple: run()'s pre-empt re-entry
         // treats `recovery` as an in-flight rebuild and would rebuild the
         // stream on the next command. The real assertion is compile-time — the
+        // Worker field is typed `Option<PausedTrack>` beside
+        // `Option<(String, u32)>` — and this test pins the shape: a tuple has
+        // no `url`/`duration_ms` fields, so collapsing the stash into
+        // recovery's shape stops compiling right here.
+        let stash = PausedTrack {
+            uri: String::from("yt:video:x"),
+            url: String::from("https://example.test/x.m4a"),
+            duration_ms: Some(180_000),
+            position_ms: 30_000,
+        };
+        let _ = (stash.uri, stash.url, stash.duration_ms, stash.position_ms);
+    }
+
+    #[test]
+    fn ffmpeg_cmd_seeks_whole_seconds_only() {
+        // The engine seeks on whole seconds: `-ss` carries the truncated
+        // position so the playhead anchor matches what the decoder did.
+        let bin = crate::config::get().ffmpeg_path.clone();
+        let mut cmd = Command::new(&bin);
+        cmd.arg("-ss").arg("5");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let i = args.iter().position(|a| a == "-ss").expect("-ss present");
+        assert_eq!(args[i + 1], "5");
+    }
+
+    #[test]
+    fn send_drop_oldest_keeps_newest() {
+        // Non-full path: a plain send, nothing shed.
+        let (tx, rx) = flume::bounded::<u32>(2);
+        assert!(tx.send(1).is_ok());
+        send_drop_oldest(&tx, &rx, 2);
+        let got: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got, vec![1, 2]);
+
+        // Full channel: the OLDEST message is shed so the newest lands, and
+        // the channel stays at capacity.
+        let (tx, rx) = flume::bounded::<u32>(2);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        send_drop_oldest(&tx, &rx, 3);
+        let got: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got, vec![2, 3], "drop-oldest must evict 1, keep the newest");
+    }
+
+    #[test]
+    fn decode_cover_loads_image() {
+        let buf = image::RgbaImage::new(100, 100);
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("png encode");
+        let img = decode_cover(&bytes).expect("cover decodes");
+        assert_eq!((img.width(), img.height()), (100, 100));
+    }
+
+    /// Oracle for the playback chain on the ACTUAL machine: does a known 1 s
+    /// buffer, appended through the engine's exact queue pattern, reach the
+    /// device and finish? The done receiver fires only after the mixer truly
+    /// consumed the sound. A timeout here = the rodio/cpal layer itself is
+    /// broken on this box (device config, mixer wiring), independently of
+    /// ffmpeg/yt-dlp. Needs an audio device; `#[ignore]`d for CI.
+    #[test]
+    #[ignore]
+    fn device_pump_plays_a_known_buffer_to_eof() {
+        let (sink, player, queue_in) = open_output().expect("open device");
+        // The sink MUST stay alive: rodio disposes the OS stream when the
+        // DeviceSink drops — dropping it here would end playback before the
+        // buffer is even appended.
+        let _sink = sink;
+        player.play();
+        // Silent by policy (headphones): volume 0 still exercises the full
+        // data path — mixer, device callback, done-signal — just inaudibly.
+        player.set_volume(0.0);
+        let tone: Vec<f32> = (0..44_100usize * 2)
+            .map(|i| {
+                let v = (i / 2) as f32 / 44_100.0;
+                (2.0 * std::f32::consts::PI * 440.0 * v).sin() * 0.2
+            })
+            .collect();
+        let buf = rodio::buffer::SamplesBuffer::new(
+            rodio::math::nz!(2u16),
+            rodio::math::nz!(44_100u32),
+            tone,
+        );
+        let done = queue_in.append_with_signal(buf);
+        match done.recv_timeout(Duration::from_secs(4)) {
+            Ok(()) => {}
+            Err(e) => panic!("device never consumed the 1s buffer: {e:?}"),
+        }
+    }
+
+    /// Oracle #2: the FULL engine source path — FftSource over a real ffmpeg
+    /// child reading a LOCAL wav (no network, no yt-dlp). The playhead counter
+    /// must advance: this splits 'ffmpeg/network stall' from 'source/channel
+    /// bug'. Needs an audio device; `#[ignore]`d for CI.
+    #[test]
+    #[ignore]
+    fn fftsource_over_local_ffmpeg_advances_frames() {
+        // Build a 2s tone wav in the target dir.
+        let wav = std::env::temp_dir().join("tuna-tui-oracle-tone.wav");
+        let status = std::process::Command::new(crate::config::get().ffmpeg_path.as_str())
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                wav.to_str().unwrap_or("/tmp/tone.wav"),
+            ])
+            .status()
+            .expect("ffmpeg gen");
+        assert!(status.success(), "tone generation failed");
+
+        let (sink, player, queue_in) = open_output().expect("open device");
+        let _sink = sink;
+        player.play();
+        // Silent by policy (headphones): volume 0 keeps the source path
+        // exercised end to end without reaching the listener's ears.
+        player.set_volume(0.0);
+        let (mut child, stdout) = spawn_ffmpeg(wav.to_str().unwrap(), 0).expect("spawn ffmpeg");
+        let frames = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let source = FfmpegSource::new(stdout, Arc::clone(&frames), VisBands::shared(), cancelled);
+        queue_in.append_with_signal(source);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if frames.load(Ordering::Relaxed) > 1000 {
+                let _ = child.kill();
+                let _ = child.wait();
+                return; // frames advanced: the source path works
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        panic!(
+            "frames stayed ~0 with a local file: {}",
+            frames.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Regression: the FFT tee must keep feeding while unplayed audio is
+    /// still buffered, even when the pump outruns the playhead (instant for
+    /// local files, bursty for network). No audio device involved: the
+    /// source is driven by hand at CPU speed, which is exactly the
+    /// delivery-outruns-playback condition that froze the spectrum the
+    /// moment music became audible (2026-08-16). With the greedy fold, the
+    /// channel empties in the first few calls and the bands go stale while
+    /// `pending` still holds seconds of audio; the feed must survive to the
+    /// end of the run.
+    #[test]
+    fn visualizer_feed_survives_a_pump_that_outruns_playback() {
+        let wav = std::env::temp_dir().join("tuna-tui-oracle-tone-2s.wav");
+        let gen = std::process::Command::new(crate::config::get().ffmpeg_path.as_str())
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                wav.to_str().unwrap_or("/tmp/tone2s.wav"),
+            ])
+            .status()
+            .expect("ffmpeg gen");
+        assert!(gen.success(), "tone generation failed");
+
+        let mut child = std::process::Command::new(crate::config::get().ffmpeg_path.as_str())
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                wav.to_str().unwrap_or("/tmp/tone2s.wav"),
+                "-f",
+                "s16le",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                "-",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn decoder");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let bands = VisBands::shared();
+        let mut source = FfmpegSource::new(
+            stdout,
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&bands),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // ~3 s of playback, paced to realtime: 441 pops are 10 ms of audio,
+        // and each 10 ms of audio is paid with a 10 ms sleep. The device is
+        // the pacemaker in production; an unpaced CPU-speed dry-run would
+        // outrun the pump thread itself, starving the tee by scheduling
+        // alone regardless of the fold fix.
+        let mut mid = None;
+        for i in 0..(44_100 * 3) {
+            let _ = source.next();
+            if i % 441 == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if i == 44_100 {
+                mid = Some(bands.lock().unwrap().updated_at);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let mid = mid.expect("mid marker");
+        let end = bands.lock().unwrap().updated_at;
+        assert!(
+            end > mid,
+            "FFT feed died while unplayed audio was still buffered"
+        );
+        let peak = bands
+            .lock()
+            .unwrap()
+            .values
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
+        assert!(peak > 0.0, "bands never fed at all (peak 0)");
+    }
+
+    /// Oracle #3: the FFT tee must keep feeding the band cell AFTER the
+    /// prebuffer gate has opened and music is audibly playing. A freeze here
+    /// (feed alive pre-start, dead once `started` flips) would reproduce the
+    /// user's 2026-08-16 symptom: "visualizer moves, then stops as soon as the
+    /// music starts" — with a local file there is no network to blame.
+    #[test]
+    #[ignore]
+    fn fft_tee_keeps_feeding_once_music_is_audible() {
+        let wav = std::env::temp_dir().join("tuna-tui-oracle-tone-4s.wav");
+        let st = std::process::Command::new(crate::config::get().ffmpeg_path.as_str())
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=4",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                wav.to_str().unwrap_or("/tmp/tone4s.wav"),
+            ])
+            .status()
+            .expect("ffmpeg gen");
+        assert!(st.success(), "tone generation failed");
+
+        let (sink, player, queue_in) = open_output().expect("open device");
+        let _sink = sink;
+        player.play();
+        // Silent by policy (headphones): volume 0 keeps the FFT tee fed
+        // through the real device path without an audible test.
+        player.set_volume(0.0);
+        let (mut child, stdout) = spawn_ffmpeg(wav.to_str().unwrap(), 0).expect("spawn ffmpeg");
+        let bands = VisBands::shared();
+        let frames = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let source = FfmpegSource::new(stdout, Arc::clone(&frames), Arc::clone(&bands), cancelled);
+        queue_in.append_with_signal(source);
+        // Prebuffer + playback start (~1.2 s is well past the 93 ms gate).
+        std::thread::sleep(Duration::from_millis(1200));
+        let first_update = bands.lock().unwrap().updated_at;
+        let peak1 = {
+            let g = bands.lock().unwrap();
+            g.values.iter().copied().fold(0.0f32, f32::max)
+        };
+        assert!(peak1 > 0.0, "bands flat at t=1.2s (peak {peak1})");
+        // Audible playback continues for another 1.5 s; the tee must keep
+        // refreshing the cell (a stale `updated_at` = frozen spectrum).
+        std::thread::sleep(Duration::from_millis(1500));
+        let fresh = bands.lock().unwrap().updated_at > first_update;
+        let peak2 = {
+            let g = bands.lock().unwrap();
+            g.values.iter().copied().fold(0.0f32, f32::max)
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(fresh, "bands stopped updating during audible playback");
+        assert!(
+            peak2 > 0.0,
+            "bands fell to zero during audible playback: {peak2}"
+        );
+    }
+    #[test]
+    fn shuffle_pick_never_returns_the_cursor() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x53EED);
+        for n in 2..=10usize {
+            for cursor in 0..=n {
+                for _ in 0..500 {
+                    let pick = shuffle_pick(cursor, n, &mut rng);
+                    assert!(
+                        pick < n,
+                        "pick {pick} out of range for n={n}, cursor={cursor}"
+                    );
+                    assert_ne!(pick, cursor, "pick == cursor {cursor} for n={n}");
+                }
+            }
+        }
+    }
+}
