@@ -398,3 +398,403 @@ pub fn resolve_kind(kind: &str, id: &str, limit: usize) -> Vec<YtVideo> {
                 let vids = playlist_entries(&crate::util::channel_videos_url(id));
                 if !vids.is_empty() {
                     return vids;
+                }
+            }
+            let vids = ytmusic_search(&format!("{id} songs"), limit);
+            if vids.is_empty() {
+                search(&format!("{id} songs"), limit)
+            } else {
+                vids
+            }
+        }
+        "artist" => {
+            let vids = ytmusic_search(&format!("{id} songs"), limit);
+            if vids.is_empty() {
+                search(&format!("{id} songs"), limit)
+            } else {
+                vids
+            }
+        }
+        "album" => {
+            let vids = ytmusic_search(&format!("{id} album songs"), limit);
+            let vids = if vids.is_empty() {
+                ytmusic_search(id, limit)
+            } else {
+                vids
+            };
+            if vids.is_empty() {
+                search(id, limit)
+            } else {
+                vids
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `Videos` rows from any playlist-shaped `-J` dump (`entries:` array).
+fn entries(root: &serde_json::Value) -> Vec<YtVideo> {
+    root["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(video_from)
+        .collect()
+}
+
+/// One `entries[]` row -> `YtVideo`. `None` drops rows with no video id — the
+/// flat-playlist equivalent of `api/library.rs`'s region-locked-row skip.
+fn video_from(v: &serde_json::Value) -> Option<YtVideo> {
+    let id = v["id"].as_str()?;
+    let title = v["title"].as_str().unwrap_or("").to_string();
+    let artist = v["artist"]
+        .as_str()
+        .or_else(|| v["channel"].as_str())
+        .or_else(|| v["uploader"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let album = v["album"].as_str().map(String::from);
+    let duration_ms = v["duration"]
+        .as_u64()
+        // checked_mul: `s * 1000` would wrap/panic on a hostile `-J` dump
+        // (u64::MAX × 1000 overflows before the u32 try_from can guard it).
+        .and_then(|s| s.checked_mul(1000))
+        .and_then(|ms| u32::try_from(ms).ok());
+    let thumbnail = pick_thumbnail(v);
+    let uri = format!("yt:video:{id}");
+    Some(YtVideo {
+        uri,
+        title,
+        artist,
+        album,
+        duration_ms,
+        thumbnail,
+    })
+}
+
+/// Square-first thumbnail picker. YouTube Music album art (`w544-h544`,
+/// `width == height`) beats bigger 16:9 video frames regardless of array
+/// position; among equal-tier candidates the largest area wins and ties go to
+/// the later entry. Width-less legacy rows keep the old last-entry behavior,
+/// and a bare top-level `thumbnail` string is the final fallback.
+pub fn pick_thumbnail(v: &serde_json::Value) -> Option<String> {
+    let arr = v["thumbnails"].as_array();
+    // Tier 0: true squares (width == height > 0) with a url.
+    let mut best: Option<(u64, usize)> = None;
+    if let Some(entries) = arr {
+        for (i, t) in entries.iter().enumerate() {
+            let Some(_url) = t["url"].as_str() else {
+                continue;
+            };
+            let w = t["width"].as_u64().unwrap_or(0);
+            let h = t["height"].as_u64().unwrap_or(0);
+            if w > 0 && w == h && (best.is_none_or(|(a, _)| w >= a)) {
+                best = Some((w, i));
+            }
+        }
+        if let Some((_, idx)) = best {
+            return entry_url(entries, idx);
+        }
+        // Tier 1: dimensioned non-squares — largest area wins.
+        let mut area_best: Option<(u64, usize)> = None;
+        for (i, t) in entries.iter().enumerate() {
+            let Some(_url) = t["url"].as_str() else {
+                continue;
+            };
+            let w = t["width"].as_u64().unwrap_or(0);
+            let h = t["height"].as_u64().unwrap_or(0);
+            if w == 0 || h == 0 {
+                continue;
+            }
+            // saturating: a hostile u64::MAX dimension degrades to "huge",
+            // it never aborts the pick.
+            let area = w.saturating_mul(h);
+            if area_best.is_none_or(|(a, _)| area >= a) {
+                area_best = Some((area, i));
+            }
+        }
+        if let Some((_, idx)) = area_best {
+            return entry_url(entries, idx);
+        }
+        // Tier 2: legacy width-less rows — last entry with a url wins.
+        for t in entries.iter().rev() {
+            if let Some(url) = t["url"].as_str() {
+                return Some(url.to_string());
+            }
+        }
+    }
+    v["thumbnail"].as_str().map(String::from)
+}
+
+/// The url of `entries[i]`, re-borrowed so the borrow checker sees one lookup.
+fn entry_url(entries: &[serde_json::Value], i: usize) -> Option<String> {
+    entries[i]["url"].as_str().map(String::from)
+}
+
+/// Parse an InnerTube YouTube Music search payload into flat `YtVideo` rows.
+/// Only music shelves are read (`musicCardShelfRenderer` top result +
+/// `musicShelfRenderer` song rows); unknown or non-music renderers are
+/// ignored, and malformed shapes degrade to fewer/empty rows — never a panic.
+pub fn parse_ytmusic_search(root: &serde_json::Value) -> Vec<YtVideo> {
+    let Some(contents) = root
+        .get("contents")
+        .and_then(|c| c.get("tabbedSearchResultsRenderer"))
+        .and_then(|t| t.get("tabs"))
+        .and_then(|t| t.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tab in contents {
+        let Some(sections) = tab
+            .get("tabRenderer")
+            .and_then(|t| t.get("content"))
+            .and_then(|c| c.get("sectionListRenderer"))
+            .and_then(|s| s.get("contents"))
+            .and_then(|s| s.as_array())
+        else {
+            continue;
+        };
+        for section in sections {
+            // Top result card.
+            if let Some(card) = section.get("musicCardShelfRenderer") {
+                if let Some(v) = ytv_from_card(card) {
+                    out.push(v);
+                }
+            }
+            // Songs shelf rows.
+            if let Some(shelf) = section
+                .get("musicShelfRenderer")
+                .and_then(|s| s.get("contents"))
+                .and_then(|c| c.as_array())
+            {
+                for row in shelf {
+                    if let Some(item) = row.get("musicResponsiveListItemRenderer") {
+                        if let Some(v) = ytv_from_music_row(item) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `musicCardShelfRenderer` → the top-result `YtVideo`.
+fn ytv_from_card(card: &serde_json::Value) -> Option<YtVideo> {
+    let id = card
+        .get("playlistItemData")
+        .and_then(|p| p.get("videoId"))
+        .and_then(|v| v.as_str())?;
+    let title = runs_text(&card["title"]);
+    if title.is_empty() {
+        return None;
+    }
+    // Subtitle runs look like ["Video", " · ", "Daft Punk"] — drop the type
+    // token and separators; whatever remains is the artist line.
+    let artist = card
+        .get("subtitle")
+        .and_then(|s| s.get("runs"))
+        .and_then(|r| r.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !matches!(*t, "Video" | "Song" | " · " | " • "))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    let thumbnail = pick_thumbnail(card);
+    Some(YtVideo {
+        uri: format!("yt:video:{id}"),
+        title,
+        artist,
+        album: None,
+        duration_ms: None,
+        thumbnail,
+    })
+}
+
+/// A `musicResponsiveListItemRenderer` shelf row → `YtVideo`.
+fn ytv_from_music_row(item: &serde_json::Value) -> Option<YtVideo> {
+    let id = item
+        .get("playlistItemData")
+        .and_then(|p| p.get("videoId"))
+        .and_then(|v| v.as_str())?;
+    let flex = item.get("flexColumns")?.as_array()?;
+    let title = flex
+        .first()
+        .and_then(|c| c.get("musicResponsiveListItemFlexColumnRenderer"))
+        .map(runs_text_of_col)
+        .unwrap_or_default();
+    if title.is_empty() {
+        return None;
+    }
+    // Second column: "Artist • Album".
+    let meta = flex
+        .get(1)
+        .and_then(|c| c.get("musicResponsiveListItemFlexColumnRenderer"))
+        .map(runs_text_of_col)
+        .unwrap_or_default();
+    let (artist, album) = match meta.split_once(" • ") {
+        Some((a, al)) => (
+            a.trim().to_string(),
+            Some(al.trim()).filter(|s| !s.is_empty()).map(String::from),
+        ),
+        None => (meta.trim().to_string(), None),
+    };
+    // Fixed column carries the duration ("5:20", "—" when unknown).
+    let duration_ms = item
+        .get("fixedColumns")
+        .and_then(|f| f.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("musicResponsiveListItemFixedColumnRenderer"))
+        .map(runs_text_of_col)
+        .and_then(|t| parse_hms_ms(&t));
+    let thumbnail = pick_thumbnail(item);
+    Some(YtVideo {
+        uri: format!("yt:video:{id}"),
+        title,
+        artist,
+        album,
+        duration_ms,
+        thumbnail,
+    })
+}
+
+/// The joined text of a flex/fixed column renderer's `text.runs`.
+fn runs_text_of_col(col: &serde_json::Value) -> String {
+    col.get("text").map(runs_text).unwrap_or_default()
+}
+
+/// Joined `runs[].text`, empty when absent.
+fn runs_text(v: &serde_json::Value) -> String {
+    v.get("runs")
+        .and_then(|r| r.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// `m:ss` / `h:mm:ss` → milliseconds. Anything unparsable → `None`.
+fn parse_hms_ms(s: &str) -> Option<u32> {
+    let mut ms: u64 = 0;
+    let mut mul: u64 = 1;
+    for part in s.trim().split(':').rev() {
+        let n: u64 = part.parse().ok()?;
+        ms += n.checked_mul(mul)?;
+        mul *= 60;
+    }
+    u32::try_from(ms.saturating_mul(1000)).ok()
+}
+
+/// YT Music search: the live InnerTube songs endpoint first (music-filtered,
+/// ~1 request); offline or empty, fall back to the flat `ytsearchN:` dump,
+/// parsing its InnerTube envelope when present. An empty query never spawns
+/// a child process.
+pub fn ytmusic_search(query: &str, limit: usize) -> Vec<YtVideo> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let limit = limit.max(1);
+    if let Some(songs) = crate::providers::ytmusic::search_songs(query, limit) {
+        let rows: Vec<YtVideo> = songs
+            .into_iter()
+            .take(limit)
+            .map(|s| YtVideo {
+                uri: format!("yt:video:{}", s.id),
+                title: s.title,
+                artist: s
+                    .artists
+                    .first()
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default(),
+                album: s.album.map(|a| a.name),
+                duration_ms: s.duration_ms,
+                thumbnail: s.thumbnails.first().map(|t| t.url.clone()),
+            })
+            .collect();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    if let Some(root) = yt_json(
+        &["--flat-playlist", &format!("ytsearch{limit}:{query}")],
+        None,
+    ) {
+        let rows = parse_ytmusic_search(&root);
+        if !rows.is_empty() {
+            return rows.into_iter().take(limit).collect();
+        }
+        return entries(&root).into_iter().take(limit).collect();
+    }
+    Vec::new()
+}
+
+/// Wait up to `deadline` for one of `p`'s permits, polling every 50ms.
+/// `None` means the budget is exhausted: the caller MUST fail open (spawn
+/// anyway and block for a permit) — a permit-shaped `None` must never surface
+/// as a request failure, because `yt_stdout`'s `None` is a dropped stream to
+/// the engine. In production `None` only appears under pathological
+/// contention, where the fail-open fallback blocks until a permit frees
+/// (unbounded wait; the single-permit cap is retained).
+fn wait_for_permit(p: &Semaphore, deadline: Instant) -> Option<SemaphorePermit<'_>> {
+    loop {
+        if let Ok(permit) = p.try_acquire() {
+            return Some(permit);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Run `yt-dlp … -J` and parse its dumped JSON.
+fn yt_json(extra: &[&str], cancel: Option<Arc<AtomicBool>>) -> Option<serde_json::Value> {
+    yt_stdout(&["-J"], extra, cancel).and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// The stream leg is resolved with the `android` player client. On this box
+/// (verified 2026-08-16, bead Myx-jqp) URLs from the default/web/tv clients
+/// stall at the transport level — ffmpeg connects and receives 0 bytes in
+/// 15 s, while the `android` client's URL flows instantly (~180 ms to first
+/// PCM, 3/3 runs vs 0/9 for the others). A stalled URL starves the engine's
+/// prebuffer → silent playback, ALSA underrun errors, frozen position and
+/// visualizer, and watchdog rebuild loops.
+///
+/// Trade-off: the android client exposes no audio-only itags — `-f bestaudio`
+/// hard-fails under it, so the `/best` fallback below always lands on the
+/// muxed (360p video + audio) stream, wasting bandwidth the engine never
+/// decodes. That cost is deliberate: an unthrottled stream is worth 3× the
+/// bytes; a user-set `audio_format` without a fallback is tolerated by
+/// appending `/best` rather than letting resolution fail.
+const STREAM_PLAYER_CLIENT: &str = "android";
+
+/// Pull the direct stream URL out of a `-J` info dump — the same pick the old
+/// `-g -f <configured>/best` leg made, now from the dump's own data:
+/// 1. a `formats[]` entry whose `format_id` equals a bare `configured` (a
+///    user's `audio_format = "251"` must select that exact itag);
+/// 2. otherwise the *last playable* entry — the android dump appends
+///    storyboard entries (`sb*`, both codecs "none") after the real stream,
+///    so the naive "last entry" would hand back a storyboard URL;
+/// 3. finally the info dict's own top-level `url` — which with `-f` active is
+///    exactly the format `-g` would have printed.
+fn pick_url<'a>(root: &'a serde_json::Value, configured: &str) -> Option<&'a str> {
+    if let Some(entries) = root["formats"].as_array() {
+        if !configured.contains('/') {
+            if let Some(f) = entries
+                .iter()
+                .find(|f| f["format_id"].as_str() == Some(configured))
+                .and_then(|f| f["url"].as_str())
+            {
+                return Some(f);
+            }
+        }
+        if let Some(f) = entries.iter().rev().find(|f| {
+            let playable = f["vcodec"].as_str().is_some_and(|v| v != "none")
