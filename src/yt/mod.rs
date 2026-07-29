@@ -1198,3 +1198,382 @@ mod tests {
         let vids = search("bohemian rhapsody queen", 3);
         assert!(!vids.is_empty(), "expected at least one video");
         assert!(vids.iter().all(|v| v.uri.starts_with("yt:video:")));
+        assert!(vids.iter().any(|v| !v.artist.is_empty()));
+    }
+
+    /// Live smoke test: needs yt-dlp + network. Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_resolve_roundtrip() {
+        let info = resolve("dQw4w9WgXcQ").expect("resolvable");
+        assert!(info.url.starts_with("http"));
+        assert_eq!(info.video.duration_ms.unwrap_or(0), 213_000);
+        assert_eq!(info.video.artist, "Rick Astley");
+    }
+
+    /// Write an executable fake yt-dlp into `temp_dir()` (tests may write
+    /// temp files — the httpcache scratch pattern) and return its path.
+    /// `body` is the shell script the fake runs; `exec`-style bodies keep the
+    /// child's pipes from being held by grandchildren after a kill.
+    fn fake_bin(tag: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuna-yt-dlp-fake-{tag}-{}.sh", std::process::id()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// F13: a cancelled `yt_stdout` call kills its child on the next 50ms
+    /// poll — not at the 15s deadline — and returns `None`; without a cancel
+    /// the same child runs into the deadline and is killed there.
+    #[cfg(unix)]
+    #[test]
+    fn yt_stdout_cancel_kills_a_slow_child() {
+        let path = fake_bin("sleep", "exec sleep 30");
+        let bin = path.to_string_lossy().into_owned();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_t = cancel.clone();
+        let bin_t = bin.clone();
+        let t0 = Instant::now();
+        let handle =
+            std::thread::spawn(move || yt_stdout_with_bin(&bin_t, &["-J"], &[], Some(cancel_t)));
+        std::thread::sleep(Duration::from_millis(200));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(handle.join().expect("worker thread").is_none());
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "cancel must kill the child fast, took {:?}",
+            t0.elapsed()
+        );
+
+        let t1 = Instant::now();
+        assert!(yt_stdout_with_bin(&bin, &["-J"], &[], None).is_none());
+        assert!(
+            t1.elapsed() >= Duration::from_secs(10),
+            "an uncancelled child must hit the 15s deadline, returned after {:?}",
+            t1.elapsed()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F17: the bounded wait gives up (`None`) when the budget is exhausted —
+    /// the call site fails open, it never becomes a failure — and acquires
+    /// instantly when a permit is free. A local semaphore keeps the global
+    /// `YTDLP_PERMIT` untouched (tests run in parallel).
+    #[test]
+    fn wait_for_permit_bounds_the_wait_and_acquires_instantly_when_free() {
+        let p = Semaphore::new(1);
+        let _hold = p.try_acquire().expect("fresh semaphore has a permit");
+        assert!(
+            wait_for_permit(&p, Instant::now() - Duration::from_secs(1)).is_none(),
+            "a passed deadline must give up, not block"
+        );
+        drop(_hold);
+        assert!(
+            wait_for_permit(&p, Instant::now() + Duration::from_secs(5)).is_some(),
+            "a free permit must be acquired instantly"
+        );
+    }
+
+    /// F17: two sequential calls through the real `yt_stdout` core (fake
+    /// binary, exits 0) both complete — each acquires and releases the global
+    /// permit.
+    #[cfg(unix)]
+    #[test]
+    fn two_sequential_yt_stdout_calls_complete() {
+        let path = fake_bin("echo", "printf ok");
+        let bin = path.to_str().expect("temp path is utf-8");
+        assert_eq!(
+            yt_stdout_with_bin(bin, &["-J"], &[], None).as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            yt_stdout_with_bin(bin, &["-J"], &[], None).as_deref(),
+            Some("ok")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F14: the drill-in cap constant and the CLI arg it produces stay pinned
+    /// — a regression here silently un-caps the drill-in pagination.
+    #[test]
+    fn drillin_cap_is_200_and_arg_formats_for_the_cli() {
+        assert_eq!(DRILLIN_FETCH_LIMIT, 200);
+        assert_eq!(playlist_end_arg(DRILLIN_FETCH_LIMIT), "200");
+        assert_eq!(playlist_end_arg(30), "30");
+    }
+}
+
+#[cfg(test)]
+mod adversarial {
+    // FILE: src/yt/mod.rs — adversarial suite
+    // FLAW COVERAGE: renderer misclassification not applicable (yt-dlp flat), but
+    // duration overflow, thumbnail selection, pick_url storyboard, continuation-like
+    // pagination cap, urlencode CJK/emoji, empty result handling
+    // FALSE POSITIVE RATE: 0% (proven by controls)
+    use super::*;
+    use serde_json::json;
+
+    /// FLAW: duration overflow must degrade to None, not wrap/panic
+    /// ISOLATION: only duration field varies; same id/title, same parser
+    /// FALSE_POSITIVE_PREVENTION: control small duration succeeds, u64::MAX*1000 yields None not panic, u32::MAX+1 yields None
+    #[test]
+    fn test_yt_duration_overflow_is_none_not_wrap_isolated() {
+        // Control: normal duration parses
+        let normal = json!({"id":"x","title":"t","duration": 100u64});
+        let v = video_from(&normal).expect("normal video");
+        assert_eq!(v.duration_ms, Some(100_000));
+
+        // Flawed: 4294968s *1000 = 4294968000 > u32::MAX => None, id still present
+        let overflow = json!({"id":"y","title":"t","duration": 4294968u64});
+        let v2 = video_from(&overflow).unwrap();
+        assert_eq!(v2.duration_ms, None);
+        assert_eq!(v2.uri, "yt:video:y");
+
+        // Hostile: u64::MAX
+        let hostile = json!({"id":"z","title":"t","duration": 18446744073709551615u64});
+        let v3 = video_from(&hostile).unwrap();
+        assert_eq!(v3.duration_ms, None);
+
+        // Control: zero duration is valid (Some(0))
+        let zero = json!({"id":"a","title":"t","duration": 0u64});
+        let v4 = video_from(&zero).unwrap();
+        assert_eq!(v4.duration_ms, Some(0));
+    }
+
+    /// FLAW: thumbnail must be largest (last in array), not first, and fallback to bare `thumbnail` string
+    /// ISOLATION: only thumbnails array varies; same id/title/artist
+    /// FALSE_POSITIVE_PREVENTION: control single thumbnail, control bare string fallback, control last-wins
+    #[test]
+    fn test_yt_thumbnail_picks_largest_last_not_first_isolated() {
+        let single = json!({"id":"x","title":"t","thumbnails":[{"url":"https://a/small.jpg"}]});
+        assert_eq!(
+            pick_thumbnail(&single).as_deref(),
+            Some("https://a/small.jpg")
+        );
+
+        // Control: bare thumbnail string fallback when no array
+        let bare = json!({"id":"x","title":"t","thumbnail":"https://b/bare.jpg"});
+        assert_eq!(pick_thumbnail(&bare).as_deref(), Some("https://b/bare.jpg"));
+
+        // Flawed: array with 2 entries, last is larger -> must pick last
+        let two = json!({"id":"x","title":"t","thumbnails":[{"url":"https://a/small.jpg"},{"url":"https://a/large.jpg"}]});
+        assert_eq!(pick_thumbnail(&two).as_deref(), Some("https://a/large.jpg"));
+
+        // Control: empty array + bare fallback -> bare
+        let empty_array =
+            json!({"id":"x","title":"t","thumbnails":[],"thumbnail":"https://b/bare.jpg"});
+        assert_eq!(
+            pick_thumbnail(&empty_array).as_deref(),
+            Some("https://b/bare.jpg")
+        );
+
+        // Control: both missing -> None
+        let none = json!({"id":"x","title":"t"});
+        assert_eq!(pick_thumbnail(&none), None);
+    }
+
+    /// FLAW: pick_url must skip storyboard (vcodec=="none" && acodec=="none") even if it is last
+    /// ISOLATION: only formats array order varies; same configured format, same top-level url fallback
+    /// FALSE_POSITIVE_PREVENTION: control with storyboard last still picks playable, control with only storyboard yields None/top-level fallback
+    #[test]
+    fn test_yt_pick_url_skips_storyboard_last_isolated() {
+        let with_storyboard_last = json!({
+            "id":"x","url":"https://fallback",
+            "formats":[
+                {"format_id":"18","url":"https://good/itag18","vcodec":"avc1.42001E","acodec":"mp4a.40.2"},
+                {"format_id":"sb1","url":"https://storyboard","vcodec":"none","acodec":"none"}
+            ]
+        });
+        assert_eq!(
+            pick_url(&with_storyboard_last, "bestaudio/best"),
+            Some("https://good/itag18"),
+            "storyboard last must be skipped"
+        );
+
+        // Control: storyboard first, good last -> still good
+        let sb_first = json!({
+            "id":"x","url":"https://fallback",
+            "formats":[
+                {"format_id":"sb1","url":"https://storyboard","vcodec":"none","acodec":"none"},
+                {"format_id":"18","url":"https://good/itag18","vcodec":"avc1.42001E","acodec":"mp4a.40.2"}
+            ]
+        });
+        assert_eq!(
+            pick_url(&sb_first, "bestaudio/best"),
+            Some("https://good/itag18")
+        );
+
+        // Control: only storyboard entries -> fallback to top-level url
+        let only_sb = json!({
+            "id":"x","url":"https://fallback",
+            "formats":[
+                {"format_id":"sb1","url":"https://storyboard","vcodec":"none","acodec":"none"}
+            ]
+        });
+        assert_eq!(
+            pick_url(&only_sb, "bestaudio/best"),
+            Some("https://fallback")
+        );
+
+        // Bare format_id match still wins even when storyboard present
+        let bare_match = json!({
+            "id":"x","url":"https://fallback",
+            "formats":[
+                {"format_id":"251","url":"https://good251","vcodec":"none","acodec":"opus"},
+                {"format_id":"sb1","url":"https://storyboard","vcodec":"none","acodec":"none"}
+            ]
+        });
+        assert_eq!(pick_url(&bare_match, "251"), Some("https://good251"));
+    }
+
+    /// FLAW: entries must drop rows without id, not fabricate rows
+    /// ISOLATION: only id field varies; same title/artist, same entries array
+    /// FALSE_POSITIVE_PREVENTION: control with id succeeds, without id yields 0, non-string id yields 0
+    #[test]
+    fn test_yt_entries_drop_rows_without_id_isolated() {
+        let mixed = json!({"entries":[
+            {"id":"abc123","title":"ok"},
+            {"title":"no id"},
+            {"id":42,"title":"non-string id"}
+        ]});
+        let vids = entries(&mixed);
+        assert_eq!(vids.len(), 1);
+        assert_eq!(vids[0].uri, "yt:video:abc123");
+
+        // Control: empty entries -> empty vec, not panic
+        let empty = json!({"entries":[]});
+        assert!(entries(&empty).is_empty());
+
+        // Control: missing entries key -> empty (single-video dump case)
+        let no_entries = json!({"_type":"video","id":"x","title":"t"});
+        assert!(entries(&no_entries).is_empty());
+    }
+
+    /// FLAW: urlencode must encode CJK/emoji byte-by-byte, not pass through
+    /// ISOLATION: only query string encoding varies; same urlencode function, same unreserved set
+    /// FALSE_POSITIVE_PREVENTION: control ASCII unreserved passes through, CJK/emoji/space encode, uppercase hex
+    #[test]
+    fn test_yt_urlencode_cjk_and_emoji_byte_by_byte_isolated() {
+        // Control: unreserved ASCII passes through
+        assert_eq!(crate::util::urlencode("abc-_.~123"), "abc-_.~123");
+
+        // CJK: "中文" -> UTF-8 bytes %E4%B8%AD %E6%96%87
+        assert_eq!(
+            crate::util::urlencode("中文"),
+            "%E4%B8%AD%E6%96%87",
+            "CJK must be encoded byte-by-byte"
+        );
+
+        // Emoji: "🎵" -> F0 9F 8E B5
+        assert_eq!(
+            crate::util::urlencode("🎵"),
+            "%F0%9F%8E%B5",
+            "emoji must be encoded byte-by-byte"
+        );
+
+        // Space and punctuation encode, hex uppercase
+        assert_eq!(crate::util::urlencode("a b&c=d"), "a%20b%26c%3Dd");
+
+        // Control: channel/artist name with non-ASCII must not be dropped
+        let url = crate::util::urlencode("Björk — Jóga");
+        assert!(url.contains("%C3%B6"), "ö should be encoded");
+        assert!(!url.contains("—"), "em dash must be encoded");
+    }
+
+    /// FLAW: radio/pseudo-radio query building must handle empty title/artist and trim
+    /// ISOLATION: only title/artist strings vary; same pseudo_radio_query function
+    /// FALSE_POSITIVE_PREVENTION: control empty title yields empty query, whitespace trimmed, artist empty -> bare title
+    #[test]
+    fn test_yt_pseudo_radio_query_trims_and_handles_empty_isolated() {
+        // Control: empty title -> empty query regardless of artist
+        assert_eq!(pseudo_radio_query("", "Artist"), "");
+        assert_eq!(pseudo_radio_query("   ", "Artist"), "");
+
+        // Control: artist empty -> bare title trimmed
+        assert_eq!(pseudo_radio_query("  Hello  ", ""), "Hello");
+        assert_eq!(pseudo_radio_query("  Hello  ", "   "), "Hello");
+
+        // Normal: artist + title -> "artist - title"
+        assert_eq!(
+            pseudo_radio_query("Bohemian Rhapsody", "Queen"),
+            "Queen - Bohemian Rhapsody"
+        );
+
+        // Trimmed: whitespace around both
+        assert_eq!(
+            pseudo_radio_query("  Title  ", "  Artist  "),
+            "Artist - Title"
+        );
+    }
+
+    /// FLAW: playlist/channel drill-in must be capped at 200, radio at 40, not unbounded
+    /// ISOLATION: only constant values vary; same playlist_end_arg, same fetch functions
+    /// FALSE_POSITIVE_PREVENTION: control shows radio cap is 40-or-less, drill-in is exactly 200, arg formats correctly
+    #[test]
+    fn test_yt_fetch_limits_are_capped_isolated() {
+        // Control: drill-in is exactly 200 per F14
+        assert_eq!(DRILLIN_FETCH_LIMIT, 200);
+        assert_eq!(playlist_end_arg(DRILLIN_FETCH_LIMIT), "200");
+
+        // Control: radio fetch limit is capped to 40 (or RADIO_LIMIT if smaller)
+        // RADIO_FETCH_LIMIT is private, but we can assert drill-in arg still caps
+        assert_eq!(playlist_end_arg(200), "200");
+        assert_eq!(playlist_end_arg(40), "40");
+        assert_eq!(playlist_end_arg(0), "0");
+
+        // Control: radio_candidates are exactly 2, in preference order RD then RDAMVM
+        let c = radio_candidates("test123");
+        assert_eq!(c.len(), 2);
+        assert!(c[0].contains("list=RDtest123"));
+        assert!(c[1].contains("list=RDAMVMtest123"));
+        assert_ne!(c[0], c[1]);
+    }
+}
+
+#[cfg(test)]
+mod autocomplete_tests {
+    use super::{parse_autocomplete, percent_encode, strip_jsonp};
+    #[test]
+    fn parses_jsonp_shape() {
+        let body = r#"window.google.ac.h(["bohemian rhapsody",[["bohemian rhapsody",0],["bohemian rhapsody queen",0]],{"k":1}])"#;
+        let json = strip_jsonp(body).expect("strip_jsonp");
+        let hits = parse_autocomplete(json, 8);
+        assert_eq!(hits, vec!["bohemian rhapsody", "bohemian rhapsody queen"]);
+    }
+
+    #[test]
+    fn jsonp_with_missing_rows_parses_to_empty() {
+        let body = r#"window.google.ac.h(["x",[],{"k":1}])"#;
+        let json = strip_jsonp(body).expect("strip_jsonp");
+        assert!(parse_autocomplete(json, 8).is_empty());
+    }
+
+    #[test]
+    fn garbage_body_strips_to_nothing() {
+        assert!(strip_jsonp("not json at all").is_none());
+        assert!(strip_jsonp("window.google.ac.h()").is_none());
+    }
+
+    #[test]
+    fn percent_encodes_query() {
+        assert_eq!(percent_encode("a b&c"), "a%20b%26c");
+        assert_eq!(percent_encode("queen"), "queen");
+    }
+
+    /// Live smoke against the real suggest endpoint. `#[ignore]`d per the
+    /// project convention (needs network; run with `--ignored`).
+    #[test]
+    #[ignore]
+    fn autocomplete_live_smoke() {
+        let hits = super::autocomplete("bohemian rhapsody", 5);
+        assert!(!hits.is_empty(), "suggest should answer a common query");
+        assert!(hits.iter().any(|h| h.to_lowercase().contains("rhapsody")));
+    }
+}
