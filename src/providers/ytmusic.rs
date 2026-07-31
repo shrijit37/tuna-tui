@@ -348,3 +348,353 @@ fn collect_radio_items<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a serde_jso
             for e in arr {
                 collect_radio_items(e, out);
             }
+        }
+        _ => {}
+    }
+}
+
+fn song_from_mrlir(item: &serde_json::Value) -> Option<Song> {
+    let id = extract_video_id(item)?;
+    let title = extract_title(item)?;
+    let (artists_raw, album_raw, duration_ms) = parse_subtitle(item);
+    let thumbnail_url = thumbnail_from_value(item);
+    let artists = artists_raw
+        .into_iter()
+        .map(|name| ArtistRef { id: None, name })
+        .collect::<Vec<_>>();
+    let album = album_raw.map(|name| AlbumRef { id: None, name });
+    let thumbnails = thumbnail_url
+        .map(|url| Thumbnail {
+            url,
+            width: 544,
+            height: 544,
+        })
+        .into_iter()
+        .collect();
+    Some(Song {
+        id,
+        title,
+        subtitle: None,
+        artists,
+        album,
+        duration_ms,
+        thumbnails,
+    })
+}
+
+fn ytv_from_radio(item: &serde_json::Value) -> Option<YtVideo> {
+    let video_id = item.get("videoId").and_then(|v| v.as_str()).or_else(|| {
+        item.get("navigationEndpoint")
+            .and_then(|n| n.get("watchEndpoint"))
+            .and_then(|w| w.get("videoId"))
+            .and_then(|v| v.as_str())
+    })?;
+    if video_id.is_empty() {
+        return None;
+    }
+    // title: title.runs[0].text or simpleText
+    let title = item
+        .get("title")
+        .and_then(|t| {
+            t.get("runs")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .and_then(|r| r.get("text"))
+                .and_then(|v| v.as_str())
+                .or_else(|| t.get("simpleText").and_then(|v| v.as_str()))
+        })
+        .unwrap_or("")
+        .to_string();
+    if title.is_empty() {
+        return None;
+    }
+    // artist: shortBylineText.runs[0].text  / longBylineText
+    let artist = item
+        .get("shortBylineText")
+        .or_else(|| item.get("longBylineText"))
+        .and_then(|t| {
+            t.get("runs")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .and_then(|r| r.get("text"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("")
+        .to_string();
+    // duration: lengthText.runs[0].text or lengthText.simpleText
+    let duration_ms = item
+        .get("lengthText")
+        .and_then(|t| {
+            t.get("runs")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .and_then(|r| r.get("text"))
+                .and_then(|v| v.as_str())
+                .or_else(|| t.get("simpleText").and_then(|v| v.as_str()))
+        })
+        .and_then(parse_duration_to_ms);
+    let thumbnail = thumbnail_from_value(item);
+    Some(YtVideo {
+        uri: format!("yt:video:{video_id}"),
+        title,
+        artist,
+        album: None,
+        duration_ms,
+        thumbnail,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// public API
+
+/// YouTube Music song search. Returns `None` on transport failure (caller
+/// falls back to yt-dlp); `Some(vec![])` on a valid but empty result.
+pub fn search_songs(query: &str, limit: usize) -> Option<Vec<Song>> {
+    if query.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let body = serde_json::json!({
+        "context": innertube_context(),
+        "query": query,
+        "params": "EgWKAQIIAQ=="
+    });
+    let root = post(SEARCH_URL, body)?;
+    let songs = parse_search_value(&root, limit);
+    Some(songs)
+}
+
+fn parse_search_value(root: &serde_json::Value, limit: usize) -> Vec<Song> {
+    let mut items = Vec::new();
+    collect_mrlir(root, &mut items);
+    let mut out = Vec::new();
+    for it in items {
+        if let Some(s) = song_from_mrlir(it) {
+            out.push(s);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a video id to (title, author, album, thumbnail_url) via the
+/// YouTube Music player endpoint. `album` is `None` — the endpoint rarely
+/// carries it; the caller keeps the yt-dlp fallback's album when absent.
+pub fn track_meta(video_id: &str) -> Option<(String, String, Option<String>, Option<String>)> {
+    if video_id.trim().is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "context": innertube_context(),
+        "videoId": video_id
+    });
+    let root = post(PLAYER_URL, body)?;
+    parse_player_value(&root)
+}
+
+fn parse_player_value(
+    root: &serde_json::Value,
+) -> Option<(String, String, Option<String>, Option<String>)> {
+    let details = root.get("videoDetails")?;
+    let title = details.get("title").and_then(|v| v.as_str())?.to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let author = details
+        .get("author")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // largest thumbnail
+    let thumbnail = details
+        .get("thumbnail")
+        .and_then(|t| t.get("thumbnails"))
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.last())
+        .and_then(|e| e.get("url"))
+        .and_then(|u| u.as_str())
+        .map(normalize_thumbnail_url);
+    Some((title, author, None, thumbnail))
+}
+
+/// Fast radio recommendations via the YouTube Music `next` endpoint.
+pub fn radio(video_id: &str) -> Option<Vec<YtVideo>> {
+    if video_id.trim().is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "context": innertube_context(),
+        "videoId": video_id,
+        "playlistId": format!("RDAMVM{video_id}"),
+        "params": "wAEB"
+    });
+    let root = post(NEXT_URL, body)?;
+    let mut items = Vec::new();
+    collect_radio_items(&root, &mut items);
+    if items.is_empty() {
+        return None;
+    }
+    let out: Vec<YtVideo> = items.into_iter().filter_map(ytv_from_radio).collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Fetch official lyrics for a video id from YouTube Music InnerTube (`next` -> `browse` endpoint).
+pub fn lyrics(video_id: &str) -> Option<String> {
+    if video_id.trim().is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "context": innertube_context(),
+        "videoId": video_id,
+    });
+    let next_root = post(NEXT_URL, body)?;
+    let tabs = next_root
+        .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")?
+        .as_array()?;
+    let lyrics_tab = tabs.iter().find(|t| {
+        t.pointer("/tabRenderer/title")
+            .and_then(|v| v.as_str())
+            .is_some_and(|title| title.eq_ignore_ascii_case("lyrics"))
+    })?;
+    let browse_id = lyrics_tab
+        .pointer("/tabRenderer/endpoint/browseEndpoint/browseId")?
+        .as_str()?;
+
+    let browse_body = serde_json::json!({
+        "context": innertube_context(),
+        "browseId": browse_id,
+    });
+    let browse_root = post(BROWSE_URL, browse_body)?;
+    let runs = browse_root
+        .pointer("/contents/sectionListRenderer/contents/0/musicDescriptionShelfRenderer/description/runs")?
+        .as_array()?;
+    let mut out = String::new();
+    for r in runs {
+        if let Some(text) = r["text"].as_str() {
+            out.push_str(text);
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Query YouTube Music for the official 1:1 square album art (`544x544`)
+/// for a video ID, falling back to a YouTube Music search by title if needed.
+pub fn square_album_art(video_id: &str, title_hint: &str) -> Option<String> {
+    if video_id.trim().is_empty() {
+        return None;
+    }
+    // 1. Try /youtubei/v1/next with videoId (fastest: ~100ms)
+    let body = serde_json::json!({
+        "context": innertube_context(),
+        "videoId": video_id
+    });
+    if let Some(root) = post(NEXT_URL, body) {
+        if let Some(url) = deep_googleusercontent_thumb(&root) {
+            return Some(normalize_thumbnail_url(&url));
+        }
+    }
+    // 2. Try searching YouTube Music songs with the title/artist hint
+    let query = title_hint.trim();
+    if !query.is_empty() {
+        let search_body = serde_json::json!({
+            "context": innertube_context(),
+            "query": query,
+            "params": "EgWKAQIIAQ=="
+        });
+        if let Some(root) = post(SEARCH_URL, search_body) {
+            if let Some(url) = deep_googleusercontent_thumb(&root) {
+                return Some(normalize_thumbnail_url(&url));
+            }
+        }
+    }
+    None
+}
+
+fn deep_googleusercontent_thumb(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(arr) = map.get("thumbnails").and_then(|a| a.as_array()) {
+                for t in arr.iter().rev() {
+                    if let Some(u) = t.get("url").and_then(|u| u.as_str()) {
+                        if u.contains("googleusercontent.com") {
+                            return Some(u.to_string());
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(u) = deep_googleusercontent_thumb(child) {
+                    return Some(u);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for e in arr {
+                if let Some(u) = deep_googleusercontent_thumb(e) {
+                    return Some(u);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// offline-tested parsers (exposed for unit tests)
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn parse_search_json_for_test(root: &serde_json::Value, limit: usize) -> Vec<Song> {
+    parse_search_value(root, limit)
+}
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn parse_player_json_for_test(
+    root: &serde_json::Value,
+) -> Option<(String, String, Option<String>, Option<String>)> {
+    parse_player_value(root)
+}
+#[cfg(test)]
+pub(crate) fn parse_next_json_for_test(root: &serde_json::Value) -> Vec<YtVideo> {
+    let mut items = Vec::new();
+    collect_radio_items(root, &mut items);
+    items.into_iter().filter_map(ytv_from_radio).collect()
+}
+
+// ---------------------------------------------------------------------------
+// tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_rewrites_googleusercontent_and_passes_others() {
+        assert_eq!(
+            normalize_thumbnail_url("https://lh3.googleusercontent.com/abc=w60-h60-l90-rj"),
+            "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj"
+        );
+        assert_eq!(
+            normalize_thumbnail_url("https://lh3.googleusercontent.com/abc=s100"),
+            "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj"
+        );
+        assert_eq!(
+            normalize_thumbnail_url("https://lh3.googleusercontent.com/abc=w120-h120-l90-rj"),
+            "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj"
+        );
+        // i.ytimg.com untouched
+        assert_eq!(
+            normalize_thumbnail_url("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+        );
