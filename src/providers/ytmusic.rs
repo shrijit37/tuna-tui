@@ -698,3 +698,326 @@ mod tests {
             normalize_thumbnail_url("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"),
             "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
         );
+        // no param
+        assert_eq!(
+            normalize_thumbnail_url("https://lh3.googleusercontent.com/abc"),
+            "https://lh3.googleusercontent.com/abc"
+        );
+    }
+
+    #[test]
+    fn duration_parses_common_shapes() {
+        assert_eq!(parse_duration_to_ms("3:45"), Some(225_000));
+        assert_eq!(parse_duration_to_ms("0:30"), Some(30_000));
+        assert_eq!(parse_duration_to_ms("1:02:03"), Some(3_723_000));
+        assert_eq!(parse_duration_to_ms("10:00"), Some(600_000));
+        assert_eq!(parse_duration_to_ms(""), None);
+        assert_eq!(parse_duration_to_ms("abc"), None);
+        assert_eq!(parse_duration_to_ms("3:"), None);
+    }
+
+    const SEARCH_FIXTURE: &str = r#"{
+        "contents": {
+            "tabbedSearchResultsRenderer": {
+                "tabs": [{
+                    "tabRenderer": {
+                        "content": {
+                            "sectionListRenderer": {
+                                "contents": [{
+                                    "musicShelfRenderer": {
+                                        "contents": [
+                                            {
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Bohemian Rhapsody"}]}}},
+                                                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                                                            {"text": "Song"}, {"text": " • "},
+                                                            {"text": "Queen"}, {"text": " • "},
+                                                            {"text": "A Night at the Opera"}, {"text": " • "},
+                                                            {"text": "5:55"}
+                                                        ]}}}
+                                                    ],
+                                                    "thumbnail": {
+                                                        "musicThumbnailRenderer": {
+                                                            "thumbnail": {
+                                                                "thumbnails": [
+                                                                    {"url": "https://lh3.googleusercontent.com/abc=w60-h60-l90-rj"},
+                                                                    {"url": "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj"}
+                                                                ]
+                                                            }
+                                                        }
+                                                    },
+                                                    "playlistItemData": {"videoId": "fJ9rUzIMcZQ"},
+                                                    "overlay": {
+                                                        "musicItemThumbnailOverlayRenderer": {
+                                                            "content": {
+                                                                "musicPlayButtonRenderer": {
+                                                                    "playNavigationEndpoint": {
+                                                                        "watchEndpoint": {"videoId": "fJ9rUzIMcZQ"}
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Stairway to Heaven"}]}}},
+                                                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                                                            {"text": "Song"}, {"text": " • "},
+                                                            {"text": "Led Zeppelin"}, {"text": " • "},
+                                                            {"text": "Led Zeppelin IV"}, {"text": " • "},
+                                                            {"text": "8:02"}
+                                                        ]}}}
+                                                    ],
+                                                    "thumbnail": {
+                                                        "musicThumbnailRenderer": {
+                                                            "thumbnail": {
+                                                                "thumbnails": [{"url": "https://lh3.googleusercontent.com/def=s60"}]
+                                                            }
+                                                        }
+                                                    },
+                                                    "playlistItemData": {"videoId": "QkF3oxziUI4"}
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+    }"#;
+
+    const PLAYER_FIXTURE: &str = r#"{
+        "videoDetails": {
+            "videoId": "dQw4w9WgXcQ",
+            "title": "Rick Astley - Never Gonna Give You Up",
+            "author": "Rick Astley",
+            "lengthSeconds": "213",
+            "thumbnail": {
+                "thumbnails": [
+                    {"url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg", "width": 480},
+                    {"url": "https://lh3.googleusercontent.com/xyz=w60-h60-l90-rj", "width": 60},
+                    {"url": "https://lh3.googleusercontent.com/xyz=w120-h120-l90-rj", "width": 120}
+                ]
+            }
+        }
+    }"#;
+
+    const NEXT_FIXTURE: &str = r#"{
+        "contents": {
+            "singleColumnMusicWatchNextResultsRenderer": {
+                "tabbedRenderer": {
+                    "watchNextTabbedResultsRenderer": {
+                        "tabs": [{
+                            "tabRenderer": {
+                                "content": {
+                                    "musicQueueRenderer": {
+                                        "content": {
+                                            "playlistPanelRenderer": {
+                                                "contents": [
+                                                    {
+                                                        "playlistPanelVideoRenderer": {
+                                                            "videoId": "fJ9rUzIMcZQ",
+                                                            "title": {"runs": [{"text": "Bohemian Rhapsody"}]},
+                                                            "shortBylineText": {"runs": [{"text": "Queen"}]},
+                                                            "lengthText": {"runs": [{"text": "5:55"}]},
+                                                            "thumbnail": {
+                                                                "thumbnails": [
+                                                                    {"url": "https://lh3.googleusercontent.com/q1=w60-h60-l90-rj"}
+                                                                ]
+                                                            }
+                                                        }
+                                                    },
+                                                    {
+                                                        "playlistPanelVideoRenderer": {
+                                                            "videoId": "QkF3oxziUI4",
+                                                            "title": {"simpleText": "Stairway to Heaven"},
+                                                            "shortBylineText": {"runs": [{"text": "Led Zeppelin"}]},
+                                                            "lengthText": {"simpleText": "8:02"},
+                                                            "thumbnail": {
+                                                                "thumbnails": [
+                                                                    {"url": "https://i.ytimg.com/vi/QkF3oxziUI4/hqdefault.jpg"}
+                                                                ]
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn search_parses_songs_artists_album_duration_and_normalized_thumb() {
+        let root: serde_json::Value = serde_json::from_str(SEARCH_FIXTURE).unwrap();
+        let songs = parse_search_value(&root, 10);
+        assert_eq!(songs.len(), 2);
+        assert_eq!(songs[0].id, "fJ9rUzIMcZQ");
+        assert_eq!(songs[0].title, "Bohemian Rhapsody");
+        assert_eq!(songs[0].artists[0].name, "Queen");
+        assert_eq!(
+            songs[0].album.as_ref().unwrap().name,
+            "A Night at the Opera"
+        );
+        assert_eq!(songs[0].duration_ms, Some(355_000));
+        // last thumbnail normalized to 544
+        assert_eq!(
+            songs[0].thumbnails[0].url,
+            "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj"
+        );
+        assert_eq!(songs[1].id, "QkF3oxziUI4");
+        assert_eq!(songs[1].artists[0].name, "Led Zeppelin");
+        assert_eq!(songs[1].duration_ms, Some(482_000));
+    }
+
+    #[test]
+    fn search_respects_limit_and_drops_malformed() {
+        let root: serde_json::Value = serde_json::from_str(SEARCH_FIXTURE).unwrap();
+        let songs = parse_search_value(&root, 1);
+        assert_eq!(songs.len(), 1);
+        // missing videoId dropped
+        let bad = serde_json::json!({
+            "musicResponsiveListItemRenderer": {
+                "flexColumns": [
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "NoId"}]}}},
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Song"}, {"text": " • "}, {"text": "Artist"}]}}}
+                ],
+                "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://x"}]}}}
+            }
+        });
+        assert!(parse_search_value(&bad, 10).is_empty());
+    }
+
+    #[test]
+    fn player_parses_title_author_and_square_art() {
+        let root: serde_json::Value = serde_json::from_str(PLAYER_FIXTURE).unwrap();
+        let (title, author, _album, thumb) = parse_player_value(&root).unwrap();
+        assert_eq!(title, "Rick Astley - Never Gonna Give You Up");
+        assert_eq!(author, "Rick Astley");
+        // last thumb is the 120 one normalized to 544
+        assert_eq!(
+            thumb.as_deref(),
+            Some("https://lh3.googleusercontent.com/xyz=w544-h544-l90-rj")
+        );
+    }
+
+    #[test]
+    fn next_parses_radio_items_with_duration_and_thumb() {
+        let root: serde_json::Value = serde_json::from_str(NEXT_FIXTURE).unwrap();
+        let mut items = Vec::new();
+        collect_radio_items(&root, &mut items);
+        assert_eq!(items.len(), 2);
+        let vids = parse_next_json_for_test(&root);
+        assert_eq!(vids.len(), 2);
+        assert_eq!(vids[0].uri, "yt:video:fJ9rUzIMcZQ");
+        assert_eq!(vids[0].title, "Bohemian Rhapsody");
+        assert_eq!(vids[0].artist, "Queen");
+        assert_eq!(vids[0].duration_ms, Some(355_000));
+        assert_eq!(
+            vids[0].thumbnail.as_deref(),
+            Some("https://lh3.googleusercontent.com/q1=w544-h544-l90-rj")
+        );
+        assert_eq!(vids[1].uri, "yt:video:QkF3oxziUI4");
+        assert_eq!(vids[1].duration_ms, Some(482_000));
+        // i.ytimg.com passes through untouched
+        assert_eq!(
+            vids[1].thumbnail.as_deref(),
+            Some("https://i.ytimg.com/vi/QkF3oxziUI4/hqdefault.jpg")
+        );
+    }
+
+    #[test]
+    fn thumbnail_helper_handles_both_shapes() {
+        let v1 = serde_json::json!({
+            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/a=w60-h60-l90-rj"}]}}}
+        });
+        assert_eq!(
+            thumbnail_from_value(&v1).as_deref(),
+            Some("https://lh3.googleusercontent.com/a=w544-h544-l90-rj")
+        );
+        let v2 = serde_json::json!({
+            "thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/b=s100"}]}
+        });
+        assert_eq!(
+            thumbnail_from_value(&v2).as_deref(),
+            Some("https://lh3.googleusercontent.com/b=w544-h544-l90-rj")
+        );
+    }
+
+    /// Live smoke test: YouTube Music search. Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_ytmusic_search_songs() {
+        let songs = search_songs("daft punk get lucky", 3).expect("live search response");
+        assert!(!songs.is_empty(), "expected at least 1 song");
+        assert!(songs[0].title.to_lowercase().contains("get lucky"));
+        assert!(!songs[0].artists.is_empty());
+        if let Some(thumb) = songs[0].thumbnails.first() {
+            assert!(thumb.url.contains("=w544-h544-l90-rj") || thumb.url.starts_with("http"));
+        }
+    }
+
+    /// Live smoke test: YouTube Music track_meta (square art). Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_ytmusic_track_meta() {
+        let (title, author, _, thumb) = track_meta("dQw4w9WgXcQ").expect("live player response");
+        assert!(!title.is_empty());
+        assert!(!author.is_empty());
+        if let Some(t) = thumb {
+            assert!(t.contains("=w544-h544-l90-rj") || t.starts_with("http"));
+        }
+    }
+
+    /// Live smoke test: YouTube Music radio recommendations. Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_ytmusic_radio() {
+        let vids = radio("fJ9rUzIMcZQ").expect("live next radio response");
+        assert!(
+            vids.len() >= 5,
+            "expected multiple radio tracks, got {}",
+            vids.len()
+        );
+        assert!(vids[0].uri.starts_with("yt:video:"));
+        assert!(!vids[0].title.is_empty());
+    }
+
+    /// Live smoke test: YouTube Music square album art. Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_ytmusic_square_album_art() {
+        let art = square_album_art("VG0tZwdg8nU", "Bohemian Rhapsody Queen")
+            .expect("live square album art");
+        assert!(art.contains("googleusercontent.com"));
+        assert!(art.contains("=w544-h544-l90-rj"));
+
+        let art2 = square_album_art("dQw4w9WgXcQ", "Never Gonna Give You Up Rick Astley")
+            .expect("live square album art for Rick Astley");
+        assert!(art2.contains("googleusercontent.com"));
+        assert!(art2.contains("=w544-h544-l90-rj"));
+    }
+
+    /// Live smoke test: YouTube Music regional lyrics (Hindi/Punjabi). Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_ytmusic_regional_lyrics() {
+        // Kesariya by Arijit Singh
+        let text = lyrics("NJAv_7lHUIU").expect("live lyrics for Kesariya");
+        assert!(!text.is_empty());
+        assert!(text.contains("केसरिया") || text.contains("रब्बा") || text.contains("मुझको"));
+    }
+}
