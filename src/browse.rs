@@ -318,3 +318,321 @@ pub(crate) fn fetch_detail_blocking(
 ) -> (String, Vec<LibItem>) {
     // "Play all" row first.
     let mut items = vec![LibItem::play(format!("▶︎ Play {name}"), uri.to_string())];
+
+    let (_, kind, id) = match uri_parts(uri) {
+        Some(p) => p,
+        None => return (name.to_string(), items),
+    };
+
+    match kind {
+        // A playlist whose contents have grown locally renders its own rows;
+        // otherwise the network copy (flat-extracted) is the contents.
+        // (No `if let` match guard: unstable E0658 on the current toolchain.)
+        "playlist" => {
+            // Prefer the local rows when the store has them.
+            if let Some(rows) = store.playlist_tracks(uri) {
+                append_or_hint(
+                    &mut items,
+                    rows.iter()
+                        .map(|t| LibItem::track(t.name.clone(), t.subtitle.clone(), t.uri.clone())),
+                    "empty playlist",
+                );
+                return (name.to_string(), items);
+            }
+            // Capped (F14): the drill-in view must not paginate a whole
+            // multi-hundred-row playlist. Deliberately NOT `search_limit`
+            // (defaults to 6 — would truncate a 30-track playlist with no
+            // hint) and NOT `resolve_kind`: that table feeds the PLAY path,
+            // which must stay un-capped (bead Myx-a4.8).
+            append_or_hint(
+                &mut items,
+                kind_rows(&yt::playlist_entries_capped(
+                    &tuna_tui::util::playlist_uri(id),
+                    yt::DRILLIN_FETCH_LIMIT,
+                )),
+                "no tracks — empty or restricted",
+            );
+        }
+        "channel" => {
+            append_or_hint(
+                &mut items,
+                kind_rows(&yt::playlist_entries_capped(
+                    &tuna_tui::util::channel_videos_url(id),
+                    yt::DRILLIN_FETCH_LIMIT,
+                )),
+                "no uploads — empty or restricted",
+            );
+        }
+        "artist" => {
+            let vids = yt::ytmusic_search(&format!("{id} songs"), 25);
+            let vids = if vids.is_empty() {
+                yt::ytmusic_search(id, 25)
+            } else {
+                vids
+            };
+            if !vids.is_empty() {
+                items.extend(
+                    vids.into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                );
+            } else {
+                append_or_hint(
+                    &mut items,
+                    yt::search(&format!("{id} songs"), config::get().search_limit)
+                        .into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                    "no songs found for artist",
+                );
+            }
+        }
+        "album" => {
+            let vids = yt::ytmusic_search(&format!("{id} album songs"), 25);
+            let vids = if vids.is_empty() {
+                yt::ytmusic_search(id, 25)
+            } else {
+                vids
+            };
+            if !vids.is_empty() {
+                items.extend(
+                    vids.into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                );
+            } else {
+                append_or_hint(
+                    &mut items,
+                    yt::resolve_kind(kind, id, config::get().search_limit)
+                        .into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                    "nothing loaded — album search failed",
+                );
+            }
+        }
+        "video" => {
+            append_or_hint(
+                &mut items,
+                yt::video_meta(id)
+                    .into_iter()
+                    .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                "couldn't load — check the network",
+            );
+        }
+        _ => {}
+    }
+
+    (name.to_string(), items)
+}
+
+/// Extend `items` with `rows`; when the source yielded nothing (an empty or
+/// restricted playlist, a failed search), push a header `hint` instead.
+/// Returns whether rows were added.
+fn append_or_hint(
+    items: &mut Vec<LibItem>,
+    rows: impl IntoIterator<Item = LibItem>,
+    hint: &str,
+) -> bool {
+    let before = items.len();
+    items.extend(rows);
+    if items.len() == before {
+        items.push(LibItem::header(hint));
+        false
+    } else {
+        true
+    }
+}
+
+/// The history rows shared by Home's Recently Played / Top Tracks and the
+/// Recent section — one mapping so `PlayedEntry`'s shape stays in sync
+/// everywhere it renders.
+fn history_rows<'a>(
+    rows: impl Iterator<Item = &'a PlayedEntry> + 'a,
+) -> impl Iterator<Item = LibItem> + 'a {
+    rows.map(|h| LibItem::track(h.title.clone(), h.artist.clone(), h.uri.clone()))
+}
+
+/// Playlist / channel rows in local style: flat entries are title-only —
+/// split "Artist - Title (…)" so the list isn't long pasted strings.
+fn kind_rows(rows: &[yt::YtVideo]) -> Vec<LibItem> {
+    rows.iter()
+        .map(|v| {
+            let (name, subtitle) = title_artist_split(&v.title);
+            LibItem::track(name, subtitle, v.uri.clone())
+        })
+        .collect()
+}
+
+/// Split a YouTube title at a power-separator: "Artist - Title (Official
+/// Video)" → ("Title (Official Video)", "Artist"). Falls back to the whole
+/// string (subtitle empty) when no separator exists.
+fn title_artist_split(s: &str) -> (String, String) {
+    for sep in [" – ", " - ", " — ", "-"] {
+        if let Some((artist, title)) = s.split_once(sep) {
+            return (title.trim().to_string(), artist.trim().to_string());
+        }
+    }
+    (s.to_string(), String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_pulls_artist_and_title_around_dashes() {
+        assert_eq!(
+            title_artist_split("Queen – Bohemian Rhapsody (Official Video Remastered)"),
+            (
+                "Bohemian Rhapsody (Official Video Remastered)".to_string(),
+                "Queen".to_string()
+            )
+        );
+        assert_eq!(
+            title_artist_split("Survivor - Eye Of The Tiger (Official HD Video)"),
+            (
+                "Eye Of The Tiger (Official HD Video)".to_string(),
+                "Survivor".to_string()
+            )
+        );
+        assert_eq!(
+            title_artist_split("Some Plain Podcast Episode"),
+            ("Some Plain Podcast Episode".to_string(), String::new())
+        );
+        // No double-split: "A - B - C" takes the first separator only.
+        assert_eq!(
+            title_artist_split("A - B - C"),
+            ("B - C".to_string(), "A".to_string())
+        );
+    }
+
+    #[test]
+    fn liked_rows_keep_the_synthetic_play_row() {
+        let mut store = Store::default();
+        store.toggle(
+            StoreKind::Liked,
+            "t".into(),
+            "a".into(),
+            "yt:video:x".into(),
+        );
+        let (tx, rx) = flume::unbounded();
+        build_sections(&store, tx);
+        // Six sections, Liked last — drain the five before it.
+        for _ in 0..5 {
+            rx.recv().unwrap();
+        }
+        let (s, liked) = rx.recv().unwrap();
+        assert_eq!(s, Section::Liked);
+        assert!(liked[0].is_play);
+        assert_eq!(liked[0].uri, "tuna:action:liked-play");
+        assert!(liked[1].is_header);
+        assert_eq!(liked[2].uri, "yt:video:x");
+    }
+
+    #[test]
+    fn home_builds_recent_and_top_from_history() {
+        let mut store = Store::default();
+        // Play one track more than the others: it must lead "Top Tracks".
+        store.record_played("yt:video:a", "Alpha", "AA");
+        store.record_played("yt:video:b", "Beta", "BB");
+        store.record_played("yt:video:b", "Beta", "BB");
+        let (tx, rx) = flume::unbounded();
+        build_sections(&store, tx);
+        let (sec, home) = rx.recv().unwrap();
+        assert_eq!(sec, Section::Home);
+        let headers: Vec<&str> = home
+            .iter()
+            .filter(|i| i.is_header)
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(headers, ["Recently Played", "Top Tracks"]);
+        let top: Vec<&str> = home
+            .iter()
+            .skip_while(|i| !i.is_header || i.name != "Top Tracks")
+            .filter(|i| !i.is_header)
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(top, ["Beta", "Alpha"]);
+    }
+
+    #[test]
+    fn empty_history_renders_a_hint_not_nothing() {
+        let (tx, rx) = flume::unbounded();
+        build_sections(&Store::default(), tx);
+        let (_, home) = rx.recv().unwrap();
+        assert!(home.iter().all(|i| i.is_header));
+        assert_eq!(home[0].name, "nothing played yet — search for a song");
+    }
+
+    #[test]
+    fn build_all_sections_populates_artists_and_albums_from_history() {
+        let mut store = Store::default();
+        store.record_played("yt:video:kesariya", "Kesariya", "Arijit Singh, Pritam");
+        store.record_played("yt:video:luther", "luther", "Kendrick Lamar & SZA");
+        let sections = build_all_sections(&store);
+        let artists_sec = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Artists)
+            .unwrap();
+        let albums_sec = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Albums)
+            .unwrap();
+        let playlists_sec = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Playlists)
+            .unwrap();
+
+        // Artists must contain Arijit Singh, Pritam, Kendrick Lamar, SZA
+        let artist_names: Vec<&str> = artists_sec.1.iter().map(|i| i.name.as_str()).collect();
+        assert!(artist_names.contains(&"Arijit Singh"));
+        assert!(artist_names.contains(&"Kendrick Lamar"));
+        assert!(artists_sec.1[0].uri.starts_with("yt:artist:"));
+
+        // Albums must contain Kesariya and luther
+        let album_names: Vec<&str> = albums_sec.1.iter().map(|i| i.name.as_str()).collect();
+        assert!(album_names.contains(&"Kesariya"));
+        assert!(album_names.contains(&"luther"));
+        assert!(albums_sec.1[0].uri.starts_with("yt:album:"));
+
+        // Playlists always starts with "New Playlist" action
+        assert_eq!(playlists_sec.1[0].uri, "tuna:action:new-playlist");
+    }
+    #[test]
+    fn build_all_sections_updates_playlist_track_count() {
+        let mut store = Store::default();
+        store.toggle(
+            StoreKind::Playlist,
+            "My Favorites".to_string(),
+            String::new(),
+            "tuna:playlist:123".to_string(),
+        );
+        let sections = build_all_sections(&store);
+        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        assert_eq!(playlists.1[1].subtitle, "0 tracks");
+
+        store.add_to_playlist(
+            "tuna:playlist:123",
+            "My Favorites".to_string(),
+            crate::app::LibEntry {
+                name: "Track 1".into(),
+                subtitle: "Artist 1".into(),
+                uri: "yt:video:1".into(),
+            },
+        );
+        let sections = build_all_sections(&store);
+        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        assert_eq!(playlists.1[1].subtitle, "1 track");
+
+        store.add_to_playlist(
+            "tuna:playlist:123",
+            "My Favorites".to_string(),
+            crate::app::LibEntry {
+                name: "Track 2".into(),
+                subtitle: "Artist 2".into(),
+                uri: "yt:video:2".into(),
+            },
+        );
+        let sections = build_all_sections(&store);
+        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        assert_eq!(playlists.1[1].subtitle, "2 tracks");
+    }
+
+}
