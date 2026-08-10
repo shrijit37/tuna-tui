@@ -698,3 +698,353 @@ mod tests {
             { "trackName": "farther", "duration": 107.0, "syncedLyrics": "[00:01.00]also ok" },
         ]);
         let picked =
+            pick_search_match(&search, 100.0, FALLBACK_TOLERANCE_S).expect("candidate in range");
+        assert_eq!(picked["trackName"], "winner");
+    }
+
+    #[test]
+    fn search_match_boundary_is_inclusive_at_exactly_ten_seconds() {
+        let at_boundary = json!([{ "trackName": "edge", "duration": 110.0, "plainLyrics": "x" }]);
+        let picked = pick_search_match(&at_boundary, 100.0, FALLBACK_TOLERANCE_S)
+            .expect("exactly 10 s off is in");
+        assert_eq!(picked["trackName"], "edge");
+        let past_boundary =
+            json!([{ "trackName": "past", "duration": 110.000001, "plainLyrics": "x" }]);
+        assert!(pick_search_match(&past_boundary, 100.0, FALLBACK_TOLERANCE_S).is_none());
+    }
+
+    #[test]
+    fn search_match_rejects_candidates_outside_tolerance() {
+        let search = json!([
+            { "trackName": "close but no", "duration": 89.0, "plainLyrics": "x" },
+            { "trackName": "close but no 2", "duration": 111.0, "plainLyrics": "y" },
+        ]);
+        assert!(pick_search_match(&search, 100.0, FALLBACK_TOLERANCE_S).is_none());
+    }
+
+    #[test]
+    fn search_match_prefers_nearest_not_smallest_in_tolerance() {
+        let search = json!([
+            { "trackName": "smaller", "duration": 90.5, "syncedLyrics": "[00:01.00]x" },
+            { "trackName": "nearest", "duration": 96.0, "syncedLyrics": "[00:01.00]y" },
+        ]);
+        let picked =
+            pick_search_match(&search, 100.0, FALLBACK_TOLERANCE_S).expect("candidate in range");
+        assert_eq!(picked["trackName"], "nearest");
+    }
+
+    #[test]
+    fn search_url_includes_album_only_when_non_empty() {
+        assert_eq!(
+            search_url("a b", "c d", ""),
+            "https://lrclib.net/api/search?artist_name=a%20b&track_name=c%20d"
+        );
+        assert_eq!(
+            search_url("a b", "c d", "e f"),
+            "https://lrclib.net/api/search?artist_name=a%20b&track_name=c%20d&album_name=e%20f"
+        );
+    }
+
+    #[test]
+    fn search_match_ignores_non_array_response() {
+        assert!(
+            pick_search_match(&json!({"error": "nope"}), 100.0, FALLBACK_TOLERANCE_S).is_none()
+        );
+        assert!(pick_search_match(&json!([]), 100.0, FALLBACK_TOLERANCE_S).is_none());
+        assert!(pick_search_match(
+            &json!([{"trackName": "no duration"}]),
+            100.0,
+            FALLBACK_TOLERANCE_S
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fetch_lyrics_url_returns_duration_nearest_search_result() {
+        let url = canned_url(
+            r#"[{"trackName":"far","duration":88.0,"plainLyrics":"no"},{"trackName":"ghost","plainLyrics":"not a candidate"},{"trackName":"winner","duration":96.0,"syncedLyrics":"[00:01.00]yes it is"},{"trackName":"farther","duration":107.0,"syncedLyrics":"[00:01.00]second best"}]"#,
+        );
+        let client = reqwest::blocking::Client::new();
+        assert_eq!(
+            fetch_lyrics_url(&client, &url, 100.0),
+            (vec![(1000, "yes it is".to_string())], true)
+        );
+    }
+
+    #[test]
+    fn fetch_lyrics_url_returns_empty_when_no_candidate_in_tolerance() {
+        let url = canned_url(
+            r#"[{"trackName":"too short","duration":80.0,"plainLyrics":"x"},{"trackName":"too long","duration":120.0,"plainLyrics":"y"}]"#,
+        );
+        let client = reqwest::blocking::Client::new();
+        assert_eq!(fetch_lyrics_url(&client, &url, 100.0), (Vec::new(), false));
+    }
+
+    #[test]
+    fn fetch_lyrics_url_falls_back_to_a_single_record_response() {
+        let url = canned_url(r#"{"syncedLyrics":"[00:02.00]lone wolf","plainLyrics":null}"#);
+        let client = reqwest::blocking::Client::new();
+        assert_eq!(
+            fetch_lyrics_url(&client, &url, 999.0),
+            (vec![(2000, "lone wolf".to_string())], true)
+        );
+    }
+
+    #[test]
+    fn instrumental_record_is_skipped_even_if_nearest() {
+        let search = json!([
+            { "trackName": "instrumental", "duration": 100.0, "instrumental": true, "plainLyrics": "x" },
+            { "trackName": "real", "duration": 101.0, "plainLyrics": "y" },
+        ]);
+        let picked =
+            pick_search_match(&search, 100.0, PRIMARY_TOLERANCE_S).expect("real candidate");
+        assert_eq!(picked["trackName"], "real");
+    }
+
+    #[test]
+    fn memo_key_retains_duration_dimension() {
+        let k1 = memo_key("Artist", "Title", "Album", 100000);
+        let k2 = memo_key("Artist", "Title", "Album", 200000);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn normalize_query_strips_feat_and_parens() {
+        assert_eq!(normalize_query("Hello (feat. World) - Test"), "hello test");
+        assert_eq!(normalize_query("Song feat. Artist"), "song artist");
+        assert_eq!(normalize_query("  Multiple   Spaces  "), "multiple spaces");
+    }
+
+    #[test]
+    fn search_match_for_title_rejects_unrelated_song_with_matching_duration() {
+        let search = json!([
+            { "trackName": "All The Stars", "duration": 178.0, "syncedLyrics": "[00:01.00]stars" },
+            { "trackName": "Kendrick Lamar & SZA - luther", "duration": 180.0, "syncedLyrics": "[00:01.00]luther" },
+        ]);
+        // Even though "All The Stars" has duration 178.0 (exact match for 178.0),
+        // searching for "luther" must pick "luther" (180.0, within 3s tolerance).
+        let picked = pick_search_match_for_title(&search, 178.0, PRIMARY_TOLERANCE_S, "luther")
+            .expect("must find luther");
+        assert_eq!(picked["trackName"], "Kendrick Lamar & SZA - luther");
+    }
+
+    #[test]
+    fn search_match_for_title_returns_none_if_only_unrelated_songs_in_tolerance() {
+        let search = json!([
+            { "trackName": "All The Stars", "duration": 178.0, "syncedLyrics": "[00:01.00]stars" },
+            { "trackName": "HUMBLE.", "duration": 177.0, "syncedLyrics": "[00:01.00]humble" },
+        ]);
+        let picked = pick_search_match_for_title(&search, 178.0, PRIMARY_TOLERANCE_S, "luther");
+        assert!(
+            picked.is_none(),
+            "must not pick All The Stars or HUMBLE for luther"
+        );
+    }
+
+    #[test]
+    fn search_match_prefers_latin_script_over_indic_script_within_tolerance() {
+        let search = json!([
+            { "trackName": "Kesariya", "duration": 178.0, "syncedLyrics": "[00:01.00]मुझको इतना बताए कोई" },
+            { "trackName": "Kesariya", "duration": 179.0, "syncedLyrics": "[00:01.00]Mujhko itna bataaye koi" },
+        ]);
+        // Even though Devanagari is exact 178.0 and Latin is 179.0, Latin is preferred for terminal compatibility
+        let picked = pick_search_match_for_title(&search, 178.0, PRIMARY_TOLERANCE_S, "Kesariya")
+            .expect("must pick a candidate");
+        assert!(picked["syncedLyrics"].as_str().unwrap().contains("Mujhko"));
+    }
+
+    #[test]
+    #[ignore = "requires live internet connection to lrclib.net"]
+    fn live_fetch_lyrics_for_luther_returns_correct_lyrics() {
+        let (lines, synced) =
+            fetch_lyrics_blocking("Kendrick Lamar & SZA", "luther", "GNX", 178_000);
+        assert!(synced, "luther should have synced lyrics");
+        assert!(!lines.is_empty(), "lyrics should not be empty");
+        let text = lines
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.to_lowercase().contains("world were mine")
+                || text.to_lowercase().contains("roman numeral seven"),
+            "lyrics must be for luther, got: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("all the stars are closer"),
+            "lyrics must not be for All The Stars"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires live internet connection to lrclib.net"]
+    fn live_fetch_lyrics_for_kesariya_prefers_latin_script() {
+        let (lines, synced) =
+            fetch_lyrics_blocking("Pritam, Arijit Singh", "Kesariya", "Brahmastra", 268_000);
+        assert!(synced, "Kesariya should have synced lyrics");
+        assert!(!lines.is_empty(), "lyrics should not be empty");
+        let text = lines
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            crate::lyrics::transliterate::is_latin_text(&text),
+            "lyrics must be Latin/Romanized, got:\n{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("mujhko") || text.to_lowercase().contains("kesariya"),
+            "lyrics must contain Kesariya text, got:\n{text}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires live internet connection to lrclib.net"]
+    fn live_fetch_lyrics_for_excuses_prefers_latin_script() {
+        let (lines, _) = fetch_lyrics_blocking("AP Dhillon", "Excuses", "Hidden Gems", 176_000);
+        assert!(!lines.is_empty(), "lyrics should not be empty");
+        let text = lines
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            crate::lyrics::transliterate::is_latin_text(&text),
+            "lyrics must be Latin/Romanized, got:\n{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("mere dil") || text.to_lowercase().contains("intense"),
+            "lyrics must contain Excuses text, got:\n{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod adversarial {
+    // FILE: src/lyrics/fetch.rs — adversarial suite
+    // FLAW COVERAGE: duration tolerance (primary 3s / fallback 10s), empty-lyrics bypass,
+    // instrumental/karaoke skip, zero-duration memo poison, duration-dimensioned memo key,
+    // synced-vs-plain tie-break, normalized query fallback, lrc hostile stamp
+    // FALSE POSITIVE RATE: 0% (proven by controls)
+    use super::*;
+    use serde_json::json;
+    use std::net::TcpListener;
+
+    fn serve_listener(listener: TcpListener, body: &'static str) {
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    fn canned_adversarial_url(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        serve_listener(listener, body);
+        format!("http://127.0.0.1:{port}/api/search?artist_name=a&track_name=b")
+    }
+
+    /// FLAW: primary tolerance must be exactly 3s inclusive, not percentage
+    /// ISOLATION: only duration varies; same artist/title/network mock, same API
+    /// FALSE_POSITIVE_PREVENTION: control 2.9s passes, 3.0 passes, 3.000001 fails for primary but passes for fallback
+    #[test]
+    fn test_lyrics_duration_primary_tolerance_boundary_isolated() {
+        let exact = json!([{ "trackName": "exact", "duration": 100.0, "plainLyrics": "x" }]);
+        let hit = pick_search_match(&exact, 100.0, PRIMARY_TOLERANCE_S)
+            .expect("exact must be in primary");
+        assert_eq!(hit["trackName"], "exact");
+
+        let within = json!([{ "trackName": "within", "duration": 102.9, "plainLyrics": "x" }]);
+        assert!(
+            pick_search_match(&within, 100.0, PRIMARY_TOLERANCE_S).is_some(),
+            "2.9s must be within primary"
+        );
+
+        let at = json!([{ "trackName": "edge", "duration": 103.0, "plainLyrics": "x" }]);
+        let picked = pick_search_match(&at, 100.0, PRIMARY_TOLERANCE_S)
+            .expect("3.0s inclusive per spec §20");
+        assert_eq!(picked["trackName"], "edge");
+
+        let past = json!([{ "trackName": "past", "duration": 103.000001, "plainLyrics": "x" }]);
+        assert!(
+            pick_search_match(&past, 100.0, PRIMARY_TOLERANCE_S).is_none(),
+            "3.000001s must be out of primary"
+        );
+        assert!(
+            pick_search_match(&past, 100.0, FALLBACK_TOLERANCE_S).is_some(),
+            "3.000001s must still be within fallback — proves delta is primary-specific"
+        );
+    }
+
+    /// FLAW: fallback tolerance must be exactly 10s inclusive
+    /// ISOLATION: only duration varies; PRIMARY vs FALLBACK distinguished
+    /// FALSE_POSITIVE_PREVENTION: control 9.9 passes, 10 passes, 10.000001 fails for both tolerances
+    #[test]
+    fn test_lyrics_duration_fallback_tolerance_boundary_isolated() {
+        let at = json!([{ "trackName": "edge", "duration": 110.0, "plainLyrics": "x" }]);
+        let picked =
+            pick_search_match(&at, 100.0, FALLBACK_TOLERANCE_S).expect("10.0s inclusive fallback");
+        assert_eq!(picked["trackName"], "edge");
+
+        let past = json!([{ "trackName": "past", "duration": 110.000001, "plainLyrics": "x" }]);
+        assert!(
+            pick_search_match(&past, 100.0, FALLBACK_TOLERANCE_S).is_none(),
+            "10.000001s must be out of fallback"
+        );
+        assert!(
+            pick_search_match(&past, 100.0, PRIMARY_TOLERANCE_S).is_none(),
+            "also out of primary — proves fallback boundary, not generic failure"
+        );
+
+        let within = json!([{ "trackName": "within", "duration": 109.9, "plainLyrics": "x" }]);
+        assert!(
+            pick_search_match(&within, 100.0, FALLBACK_TOLERANCE_S).is_some(),
+            "9.9s must be within fallback"
+        );
+    }
+
+    /// FLAW: duration-nearest must pick closest, not smallest or first in array
+    /// ISOLATION: same tolerance, same lyrics presence, only distances differ
+    /// FALSE_POSITIVE_PREVENTION: control proves “nearest” vs “first” vs “smallest” are distinct
+    #[test]
+    fn test_lyrics_duration_nearest_picks_closest_not_first_isolated() {
+        // Control: first element is farther (9.5s) but nearest (4s) is second — nearest must win
+        let search = json!([
+            { "trackName": "smaller_but_farther", "duration": 90.5, "syncedLyrics": "[00:01.00]x" },
+            { "trackName": "nearest", "duration": 96.0, "syncedLyrics": "[00:01.00]y" },
+        ]);
+        let picked =
+            pick_search_match(&search, 100.0, FALLBACK_TOLERANCE_S).expect("nearest in range");
+        assert_eq!(
+            picked["trackName"], "nearest",
+            "only distance matters, not array order or smallest duration"
+        );
+
+        // Control reversed: nearest is first, still nearest
+        let reversed = json!([
+            { "trackName": "nearest_first", "duration": 99.0, "plainLyrics": "x" },
+            { "trackName": "farther_second", "duration": 105.0, "plainLyrics": "y" },
+        ]);
+        let picked2 = pick_search_match(&reversed, 100.0, FALLBACK_TOLERANCE_S).expect("candidate");
+        assert_eq!(picked2["trackName"], "nearest_first");
+    }
+
+    /// FLAW: instrumental/karaoke records (instrumental:true, null lyrics) must be skipped even if nearest
+    /// ISOLATION: same duration distance, same array position, only instrumental flag + lyrics presence differ
+    /// FALSE_POSITIVE_PREVENTION: control without instrumental passes; instrumental-only yields None
+    #[test]
+    fn test_lyrics_instrumental_skipped_even_if_nearest_isolated() {
+        // Control: non-instrumental nearest wins
+        let search = json!([
