@@ -1048,3 +1048,225 @@ mod adversarial {
     fn test_lyrics_instrumental_skipped_even_if_nearest_isolated() {
         // Control: non-instrumental nearest wins
         let search = json!([
+            { "trackName": "instrumental", "duration": 100.0, "instrumental": true, "plainLyrics": "x" },
+            { "trackName": "real", "duration": 101.0, "plainLyrics": "y" },
+        ]);
+        let picked =
+            pick_search_match(&search, 100.0, PRIMARY_TOLERANCE_S).expect("real must be picked");
+        assert_eq!(picked["trackName"], "real");
+        // Delta proves flaw: instrumental distance 0.0 would win if not filtered
+        assert!(
+            !has_lyrics(&search[0]),
+            "instrumental fixture must be has_lyrics==false"
+        );
+        assert!(has_lyrics(&search[1]));
+
+        // Control: if only instrumental in tolerance, result is None (not instrumental lyrics)
+        let only_instrumental = json!([
+            { "trackName": "only_inst", "duration": 100.0, "instrumental": true, "plainLyrics": "x" }
+        ]);
+        assert!(
+            pick_search_match(&only_instrumental, 100.0, PRIMARY_TOLERANCE_S).is_none(),
+            "instrumental-only must yield None, not empty lyrics"
+        );
+    }
+
+    /// FLAW: empty lyrics body must not bypass has_lyrics filter nor be returned
+    /// ISOLATION: empty vs non-empty lyrics, same bad duration offset, same tolerance
+    /// FALSE_POSITIVE_PREVENTION: non-empty at same duration fails for distance, empty fails for has_lyrics — distinct error signatures
+    #[test]
+    fn test_lyrics_empty_body_rejected_even_if_in_tolerance_isolated() {
+        // Control: non-empty at same valid duration passes
+        let valid_nonempty =
+            json!([{ "trackName": "valid", "duration": 100.0, "plainLyrics": "hello" }]);
+        assert!(
+            pick_search_match(&valid_nonempty, 100.0, PRIMARY_TOLERANCE_S).is_some(),
+            "non-empty valid duration must pass"
+        );
+
+        // Flawed: empty syncedLyrics + empty plainLyrics at same duration must be rejected via has_lyrics
+        let empty_both = json!([{ "trackName": "empty", "duration": 100.0, "syncedLyrics": "", "plainLyrics": "" }]);
+        assert!(
+            pick_search_match(&empty_both, 100.0, PRIMARY_TOLERANCE_S).is_none(),
+            "empty body must be filtered by has_lyrics even if duration matches"
+        );
+
+        let whitespace_only =
+            json!([{ "trackName": "ws", "duration": 100.0, "plainLyrics": "   " }]);
+        assert!(
+            pick_search_match(&whitespace_only, 100.0, PRIMARY_TOLERANCE_S).is_none(),
+            "whitespace-only must be filtered"
+        );
+
+        // Network-level: empty lyrics via fetch_lyrics_url must return (empty,false) not (0,"")
+        let url = canned_adversarial_url(
+            r#"[{"trackName":"empty","duration":100.0,"syncedLyrics":"","plainLyrics":""}]"#,
+        );
+        let client = reqwest::blocking::Client::new();
+        assert_eq!(
+            fetch_lyrics_url(&client, &url, 100.0),
+            (Vec::new(), false),
+            "empty lyrics record must not produce a line"
+        );
+    }
+
+    /// FLAW: memo key MUST retain duration dimension (F1) — same artist/title/album at different lengths must not collide
+    /// ISOLATION: only duration_ms varies; artist/title/album/normalization identical
+    /// FALSE_POSITIVE_PREVENTION: control same duration collides, different duration distinct — proves delta is duration-specific
+    #[test]
+    fn test_lyrics_memo_key_retains_duration_dimension_isolated() {
+        let k1 = memo_key("Artist", "Title", "Album", 100_000);
+        let k2 = memo_key("Artist", "Title", "Album", 200_000);
+        assert_ne!(
+            k1, k2,
+            "different seconds must yield different memo keys (F1)"
+        );
+        // Delta: 100_000 vs 100_999 both map to 100s bucket — intentional truncation, not a flaw
+        let k_same_bucket = memo_key("Artist", "Title", "Album", 100_999);
+        assert_eq!(k1, k_same_bucket, "same second bucket must collide");
+        // Control: normalization keeps case/trim invariant but duration still distinguishes
+        let k_lower = memo_key("artist", "title", "album", 100_000);
+        assert_eq!(
+            k1, k_lower,
+            "lowercase normalization must not break duration dimension"
+        );
+    }
+
+    /// FLAW: duration_ms==0 must never memoize (F2) — flat playlist rows / stash restores would poison the session
+    /// ISOLATION: same URL shape, only expected_s differs (0 vs non-zero)
+    /// FALSE_POSITIVE_PREVENTION: non-zero expected_s inserts into MEMO, zero does not — delta is memoization, not network
+    #[test]
+    fn test_lyrics_zero_duration_does_not_poison_memo_isolated() {
+        let _guard = MEMO_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        MEMO.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let client = reqwest::blocking::Client::new();
+
+        let url_nonzero = canned_adversarial_url(r#"[]"#);
+        let _: (Vec<(u32, String)>, bool) =
+            fetch_lyrics_memo_with_expected(&client, &url_nonzero, 100.0);
+        let len_after_nonzero = MEMO.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(
+            len_after_nonzero, 1,
+            "non-zero duration must memoize (control)"
+        );
+
+        let url_zero =
+            canned_adversarial_url(r#"[{"trackName":"x","duration":100.0,"plainLyrics":"y"}]"#);
+        let before_zero = MEMO.lock().unwrap_or_else(|p| p.into_inner()).len();
+        let _: (Vec<(u32, String)>, bool) =
+            fetch_lyrics_memo_with_expected(&client, &url_zero, 0.0);
+        let after_zero = MEMO.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(
+            before_zero, after_zero,
+            "zero-duration must not memoize — F2 poison prevention"
+        );
+
+        MEMO.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// FLAW: picker has no synced-over-plain preference; tie-break pins array order (Myx-ndr)
+    /// ISOLATION: two candidates at identical distance (both 1s off), one synced one plain, array order controls winner
+    /// FALSE_POSITIVE_PREVENTION: swapping order swaps winner — proves flaw is tie-break, not distance
+    #[test]
+    fn test_lyrics_synced_vs_plain_tie_break_is_array_order_isolated() {
+        // Both candidates are 1.0s from expected 100.0, one synced one plain — order decides
+        let synced_first = json!([
+            { "trackName": "synced", "duration": 99.0, "syncedLyrics": "[00:01.00]synced" },
+            { "trackName": "plain", "duration": 101.0, "plainLyrics": "plain text" }
+        ]);
+        let picked =
+            pick_search_match(&synced_first, 100.0, FALLBACK_TOLERANCE_S).expect("candidate");
+        assert_eq!(
+            picked["trackName"], "synced",
+            "when distances equal, first in array wins (synced first)"
+        );
+
+        let plain_first = json!([
+            { "trackName": "plain", "duration": 101.0, "plainLyrics": "plain text" },
+            { "trackName": "synced", "duration": 99.0, "syncedLyrics": "[00:01.00]synced" }
+        ]);
+        let picked2 =
+            pick_search_match(&plain_first, 100.0, FALLBACK_TOLERANCE_S).expect("candidate");
+        assert_eq!(
+            picked2["trackName"], "plain",
+            "swapping order swaps winner — proves no synced preference, only array order (Myx-ndr)"
+        );
+
+        // Control: when distances differ, closer wins regardless of type
+        let closer_plain = json!([
+            { "trackName": "synced_far", "duration": 95.0, "syncedLyrics": "[00:01.00]x" },
+            { "trackName": "plain_near", "duration": 99.5, "plainLyrics": "y" }
+        ]);
+        let picked3 =
+            pick_search_match(&closer_plain, 100.0, FALLBACK_TOLERANCE_S).expect("candidate");
+        assert_eq!(
+            picked3["trackName"], "plain_near",
+            "distance still dominates when not tied"
+        );
+    }
+
+    /// FLAW: normalize_query must strip feat/ft/parentheses/hyphens for fallback search
+    /// ISOLATION: only query string varies; tolerance and candidate set identical
+    /// FALSE_POSITIVE_PREVENTION: control exact query vs normalized query produce different normalized forms but same fallback tolerance
+    #[test]
+    fn test_lyrics_normalized_query_strips_feat_and_parens_isolated() {
+        // Ground truth: exact and normalized forms
+        assert_eq!(normalize_query("Hello (feat. World) - Test"), "hello test");
+        assert_eq!(normalize_query("Song feat. Artist"), "song artist");
+        assert_eq!(normalize_query("Track ft. Someone"), "track someone");
+        assert_eq!(normalize_query("A - B_C"), "a b c");
+
+        // Control: already normalized input is idempotent
+        let already = "hello world";
+        assert_eq!(normalize_query(already), "hello world");
+
+        // Delta: feat variant in title must normalize away so fallback q search can hit
+        let n_artist = normalize_query("Daft Punk feat. Julian");
+        let n_title = normalize_query("Instant Crush (feat. Julian Casablancas)");
+        assert_eq!(n_artist, "daft punk julian");
+        assert_eq!(n_title, "instant crush");
+        // Proving isolation: whitespace collapse is independent of feat stripping
+        assert_eq!(normalize_query("  Multiple   Spaces  "), "multiple spaces");
+    }
+
+    /// FLAW: hostile LRC stamps must not panic and must be rejected (multi-byte fraction, overflow)
+    /// ISOLATION: only stamp string varies; same parse_lrc outer loop, same DB/network mock none
+    /// FALSE_POSITIVE_PREVENTION: control valid stamp parses, hostile returns None and surrounding stamps survive
+    #[test]
+    fn test_lyrics_hostile_lrc_stamp_does_not_panic_isolated() {
+        // Control: valid stamp works
+        assert_eq!(
+            crate::lyrics::parse::parse_lrc_stamp("00:01.00"),
+            Some(1000)
+        );
+        assert_eq!(
+            crate::lyrics::parse::parse_lrc_stamp("01:02.345"),
+            Some(62345)
+        );
+
+        // Hostile: multi-byte fraction must be rejected not sliced at byte boundary (would panic with panic=abort)
+        assert_eq!(
+            crate::lyrics::parse::parse_lrc_stamp("00:01.a\u{65e5}"),
+            None,
+            "multi-byte fraction must be rejected"
+        );
+        assert_eq!(
+            crate::lyrics::parse::parse_lrc_stamp("00:01.12\u{65e5}"),
+            None
+        );
+
+        // Hostile: overflow must be checked, not wrap/panic
+        assert_eq!(
+            crate::lyrics::parse::parse_lrc_stamp("99999999:00"),
+            None,
+            "overflow minutes must return None"
+        );
+
+        // Control: surrounding valid stamps survive hostile sibling (from tests/lyrics.rs)
+        let lrc = "[ar: artist]\n[00:01.00]hello\n[00:02.xx]bad\n[00:03.00]world";
+        let parsed = crate::lyrics::parse::parse_lrc(lrc);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], (1000, "hello".to_string()));
+        assert_eq!(parsed[1], (3000, "world".to_string()));
+    }
+}
