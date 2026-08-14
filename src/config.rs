@@ -348,3 +348,353 @@ impl Default for Config {
             animation_fps: 120,
             visualizer_style: VisualizerStyle::Block,
             visualizer_smoothing: VisualizerSmoothing::Balanced,
+            visualizer_bar_width: 1,
+            visualizer_color_scheme: 0,
+            progress_bar_style: 0,
+            theme_fade_speed: 1500,
+            zen_default: false,
+            theme_name: "Adaptive".to_string(),
+
+            audio_quality: AudioQuality::Best,
+            volume_step: 5,
+            crossfade_enabled: false,
+            crossfade_duration_ms: 3000,
+            gapless_playback: true,
+            replay_gain: false,
+            next_track_prefetch: true,
+
+            lyrics_alignment: LyricsAlignment::Center,
+            lyrics_transliterate: true,
+            lyrics_auto_scroll: true,
+            lyrics_font_size: 100,
+            lyrics_highlight_color: 0,
+
+            ui_density: 1,
+            show_album_art_in_queue: false,
+            show_progress_in_footer: true,
+            footer_clock_format: 1,
+            sidebar_width_pct: 30,
+
+            mpris_enabled: true,
+
+            debug_mode: false,
+            debug_verbose_logging: false,
+            debug_performance_overlay: false,
+            debug_network_logging: false,
+            debug_audio_diagnostics: false,
+            debug_engine_state: false,
+            debug_visualizer_raw: false,
+            debug_cache_stats: false,
+            debug_lyrics_timing: false,
+            debug_search_queries: false,
+            debug_log_file: false,
+            debug_log_level: 0,
+        }
+    }
+}
+
+/// The settings, read once. Shared so the client-id lookup and the UI can't
+/// disagree about what the file says.
+pub fn get() -> &'static Config {
+    static CONFIG: OnceLock<Config> = OnceLock::new();
+    CONFIG.get_or_init(Config::load)
+}
+
+/// Written on first run so there is a file to edit instead of a path to guess.
+/// Every key is commented out, so it parses to exactly the defaults.
+const TEMPLATE: &str = "\
+# tuna-tui settings. Every key is optional — uncomment one to change it.
+
+# Rows kept visible above and below the list cursor, like vim's scrolloff.
+#scrolloff = 3
+
+# Resume the locally saved track, source and position when Tuna TUI starts.
+#restore_on_startup = true
+
+# Terminal graphics protocol: kitty, iterm2, sixel or halfblocks.
+# Leave it commented to auto-detect; set it if album art comes out as a coarse
+# mosaic, which means the detection query went unanswered.
+#protocol = \"kitty\"
+
+# The yt-dlp binary used by the YouTube layer (port in progress).
+# Only needed if yt-dlp is not on PATH.
+#ytdlp_path = \"yt-dlp\"
+
+# The ffmpeg binary that decodes the stream into raw PCM for the engine.
+# Only needed if ffmpeg is not on PATH.
+#ffmpeg_path = \"ffmpeg\"
+
+# Format-selection string for stream resolution (passed to `yt-dlp -f`).
+# Note: stream URLs are resolved with the `android` player client
+# (unthrottled on this box), which exposes no audio-only formats — the
+# `best` fallback tail always lands on the muxed 360p stream. Keep the
+# `/best` fallback; a bare `bestaudio` would resolve to the same muxed
+# stream via the engine's appended fallback, so the knob mostly matters
+# for metadata, not bandwidth.
+#audio_format = \"bestaudio/best\"
+
+# How many results `ytsearchN:` is asked for per search.
+#search_limit = 6
+
+# Optional cookies file for yt-dlp (a Netscape-format file, e.g. exported from
+# your browser). Unlocks private playlists / liked lists / history and quiets
+# the bot checks that throttle anonymized traffic.
+#cookies_file = \"/home/you/.config/tuna-tui/cookies.txt\"
+
+# Seconds of decoded PCM buffered before playback output starts (1..30).
+# Larger buffers smooth stutter on high-latency or fluctuating connections;
+# each stream start (track, seek, pause-resume) waits this long in silence
+# while the buffer fills.
+#buffer_duration_secs = 2
+";
+
+/// One-time move of the pre-rebrand `myx` dirs to the `tuna-tui` names.
+///
+/// Only acts when the legacy dir exists AND the new one doesn't — a fresh
+/// install, or an already-migrated home, is left completely alone. Moving the
+/// whole dir carries config.toml (and its cookies path), the session snapshot,
+/// the yt-dlp api cache, and the log over in one shot; nothing is deleted, so
+/// the move is safe even with a stale `myx` binary still running alongside.
+pub fn migrate_legacy_paths() {
+    // Cache first: this function logs through liblog, whose write itself
+    // creates `~/.cache/tuna-tui` — running the cache move any later would
+    // hit the freshly-created target and bail on its `new.exists()` guard.
+    migrate_dir(".cache/myx", ".cache/tuna-tui");
+    migrate_dir(".config/myx", ".config/tuna-tui");
+}
+
+fn migrate_dir(legacy: &str, current: &str) {
+    let Some(home) = crate::home_dir() else {
+        return;
+    };
+    let old = home.join(legacy);
+    let new = home.join(current);
+    if !old.exists() || new.exists() {
+        return;
+    }
+    match std::fs::rename(&old, &new) {
+        Ok(()) => crate::liblog::liblog(format!("migrated {legacy} -> {current}")),
+        Err(e) => crate::liblog::liblog(format!("migrate {legacy} -> {current} failed: {e}")),
+    }
+}
+
+impl Config {
+    pub fn path() -> Option<PathBuf> {
+        Some(crate::home_dir()?.join(".config/tuna-tui/config.toml"))
+    }
+
+    fn load() -> Self {
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
+        if !path.exists() {
+            write_template(&path);
+        }
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| Self::parse(&s))
+            .unwrap_or_default()
+    }
+
+    /// Parse the document as a generic map and extract each key with a type
+    /// check of its own. Under the old one-shot serde read, a single bad
+    /// value (e.g. `buffer_duration_secs = 300` or `= 2.5` on a u8 field)
+    /// failed the WHOLE document and the caller's `unwrap_or_default`
+    /// silently discarded every other key — cookies unlock, yt-dlp/ffmpeg
+    /// paths, audio format — all gone with no message, which is exactly the
+    /// "a typo must never lock someone out" failure the module preamble
+    /// promises against. Now a wrong-typed value costs only its own key, an
+    /// out-of-range integer literal costs only its own *line* (see the
+    /// salvage pass), and unknown keys stay ignored so an older binary
+    /// never chokes on a newer config.
+    fn parse(s: &str) -> Option<Self> {
+        // Fast path: the whole document parses.
+        if let Ok(table) = s.parse::<toml::Table>() {
+            return Some(Self::from_table(&table));
+        }
+        // Salvage: TOML integers are i64-bounded, so an over-range literal
+        // (`buffer_duration_secs = 99999999999999999999`, issue #15) is a
+        // DOCUMENT-level syntax error — the per-key reader above never sees
+        // it. Drop one line at a time and retry: the first parseable
+        // candidate is the document with the offending line removed, and
+        // that key falls back to its default while every other key
+        // survives. A document whose badness spans lines (a multi-line
+        // construct broken twice) defeats single-line salvage and falls
+        // back wholesale.
+        for drop in 0..s.lines().count() {
+            let mut candidate = String::with_capacity(s.len());
+            for (i, line) in s.lines().enumerate() {
+                if i != drop {
+                    candidate.push_str(line);
+                    candidate.push('\n');
+                }
+            }
+            if let Ok(table) = candidate.parse::<toml::Table>() {
+                return Some(Self::from_table(&table));
+            }
+        }
+        None
+    }
+
+    /// The per-key lenient reader: extract each field with a type check of
+    /// its own, defaulting per key. Shared by the fast path and the salvage
+    /// candidates.
+    fn from_table(table: &toml::Table) -> Self {
+        let d = Self::default();
+        let get_val = |k: &str| -> Option<&toml::Value> {
+            table.get(k).or_else(|| {
+                for section in ["display", "audio", "lyrics", "search", "system"] {
+                    if let Some(v) = table.get(section).and_then(|t| t.as_table()).and_then(|t| t.get(k)) {
+                        return Some(v);
+                    }
+                }
+                None
+            })
+        };
+        let int = |k: &str| get_val(k).and_then(toml::Value::as_integer);
+        let boolean = |k: &str| get_val(k).and_then(toml::Value::as_bool);
+        let text = |k: &str| {
+            get_val(k)
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        Config {
+            scrolloff: int("scrolloff")
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(d.scrolloff),
+            restore_on_startup: boolean("restore_on_startup").unwrap_or(d.restore_on_startup),
+            protocol: text("protocol").or(d.protocol),
+            ytdlp_path: text("ytdlp_path").unwrap_or(d.ytdlp_path),
+            ffmpeg_path: text("ffmpeg_path").unwrap_or(d.ffmpeg_path),
+            audio_format: text("audio_format").unwrap_or(d.audio_format),
+            search_limit: int("search_limit")
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(d.search_limit),
+            cookies_file: text("cookies_file").or(d.cookies_file),
+            buffer_duration_secs: int("buffer_duration_secs")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (1..=30).contains(v))
+                .unwrap_or(d.buffer_duration_secs),
+
+            animation_fps: int("animation_fps")
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v >= 1 && *v <= 1000)
+                .unwrap_or(d.animation_fps),
+            visualizer_style: text("visualizer_style")
+                .and_then(|s| VisualizerStyle::parse_str(&s))
+                .unwrap_or(d.visualizer_style),
+            visualizer_smoothing: text("visualizer_smoothing")
+                .and_then(|s| VisualizerSmoothing::parse_str(&s))
+                .unwrap_or(d.visualizer_smoothing),
+            visualizer_bar_width: int("visualizer_bar_width")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (1..=4).contains(v))
+                .unwrap_or(d.visualizer_bar_width),
+            visualizer_color_scheme: int("visualizer_color_scheme")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 5)
+                .unwrap_or(d.visualizer_color_scheme),
+            progress_bar_style: int("progress_bar_style")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 4)
+                .unwrap_or(d.progress_bar_style),
+            theme_fade_speed: int("theme_fade_speed")
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v >= 200 && *v <= 5000)
+                .unwrap_or(d.theme_fade_speed),
+            zen_default: boolean("zen_default").unwrap_or(d.zen_default),
+            theme_name: text("theme_name").unwrap_or(d.theme_name),
+
+            audio_quality: text("audio_quality")
+                .and_then(|s| AudioQuality::parse_str(&s))
+                .unwrap_or(d.audio_quality),
+            volume_step: int("volume_step")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (1..=50).contains(v))
+                .unwrap_or(d.volume_step),
+            crossfade_enabled: boolean("crossfade_enabled").unwrap_or(d.crossfade_enabled),
+            crossfade_duration_ms: int("crossfade_duration_ms")
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v >= 100 && *v <= 20000)
+                .unwrap_or(d.crossfade_duration_ms),
+            gapless_playback: boolean("gapless_playback").unwrap_or(d.gapless_playback),
+            replay_gain: boolean("replay_gain").unwrap_or(d.replay_gain),
+            next_track_prefetch: boolean("next_track_prefetch").unwrap_or(d.next_track_prefetch),
+
+            lyrics_alignment: text("lyrics_alignment")
+                .and_then(|s| LyricsAlignment::parse_str(&s))
+                .unwrap_or(d.lyrics_alignment),
+            lyrics_transliterate: boolean("lyrics_transliterate").unwrap_or(d.lyrics_transliterate),
+            lyrics_auto_scroll: boolean("lyrics_auto_scroll").unwrap_or(d.lyrics_auto_scroll),
+            lyrics_font_size: int("lyrics_font_size")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (50..=200).contains(v))
+                .unwrap_or(d.lyrics_font_size),
+            lyrics_highlight_color: int("lyrics_highlight_color")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 4)
+                .unwrap_or(d.lyrics_highlight_color),
+
+            ui_density: int("ui_density")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 2)
+                .unwrap_or(d.ui_density),
+            show_album_art_in_queue: boolean("show_album_art_in_queue").unwrap_or(d.show_album_art_in_queue),
+            show_progress_in_footer: boolean("show_progress_in_footer").unwrap_or(d.show_progress_in_footer),
+            footer_clock_format: int("footer_clock_format")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 3)
+                .unwrap_or(d.footer_clock_format),
+            sidebar_width_pct: int("sidebar_width_pct")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (10..=60).contains(v))
+                .unwrap_or(d.sidebar_width_pct),
+
+            mpris_enabled: boolean("mpris_enabled").unwrap_or(d.mpris_enabled),
+
+            debug_mode: boolean("debug_mode").unwrap_or(d.debug_mode),
+            debug_verbose_logging: boolean("debug_verbose_logging").unwrap_or(d.debug_verbose_logging),
+            debug_performance_overlay: boolean("debug_performance_overlay").unwrap_or(d.debug_performance_overlay),
+            debug_network_logging: boolean("debug_network_logging").unwrap_or(d.debug_network_logging),
+            debug_audio_diagnostics: boolean("debug_audio_diagnostics").unwrap_or(d.debug_audio_diagnostics),
+            debug_engine_state: boolean("debug_engine_state").unwrap_or(d.debug_engine_state),
+            debug_visualizer_raw: boolean("debug_visualizer_raw").unwrap_or(d.debug_visualizer_raw),
+            debug_cache_stats: boolean("debug_cache_stats").unwrap_or(d.debug_cache_stats),
+            debug_lyrics_timing: boolean("debug_lyrics_timing").unwrap_or(d.debug_lyrics_timing),
+            debug_search_queries: boolean("debug_search_queries").unwrap_or(d.debug_search_queries),
+            debug_log_file: boolean("debug_log_file").unwrap_or(d.debug_log_file),
+            debug_log_level: int("debug_log_level")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 4)
+                .unwrap_or(d.debug_log_level),
+        }
+    }
+
+    /// Serialize current configuration into clean, human-readable TOML.
+    pub fn serialize_toml(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# tuna-tui configuration\n\n");
+
+        out.push_str("[display]\n");
+        out.push_str(&format!("animation_fps = {}\n", self.animation_fps));
+        out.push_str(&format!("visualizer_style = \"{}\"\n", self.visualizer_style.as_str()));
+        out.push_str(&format!("visualizer_smoothing = \"{}\"\n", self.visualizer_smoothing.as_str()));
+        out.push_str(&format!("visualizer_bar_width = {}\n", self.visualizer_bar_width));
+        out.push_str(&format!("visualizer_color_scheme = {}\n", self.visualizer_color_scheme));
+        out.push_str(&format!("progress_bar_style = {}\n", self.progress_bar_style));
+        out.push_str(&format!("theme_fade_speed = {}\n", self.theme_fade_speed));
+        if let Some(proto) = &self.protocol {
+            out.push_str(&format!("protocol = \"{}\"\n", proto));
+        }
+        out.push_str(&format!("zen_default = {}\n", self.zen_default));
+        out.push_str(&format!("theme_name = \"{}\"\n\n", self.theme_name));
+
+        out.push_str("[audio]\n");
+        out.push_str(&format!("audio_quality = \"{}\"\n", self.audio_quality.as_str()));
+        out.push_str(&format!("buffer_duration_secs = {}\n", self.buffer_duration_secs));
+        out.push_str(&format!("volume_step = {}\n", self.volume_step));
+        out.push_str(&format!("crossfade_enabled = {}\n", self.crossfade_enabled));
+        out.push_str(&format!("crossfade_duration_ms = {}\n", self.crossfade_duration_ms));
+        out.push_str(&format!("gapless_playback = {}\n", self.gapless_playback));
+        out.push_str(&format!("replay_gain = {}\n", self.replay_gain));
+        out.push_str(&format!("restore_on_startup = {}\n", self.restore_on_startup));
