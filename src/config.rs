@@ -698,3 +698,306 @@ impl Config {
         out.push_str(&format!("gapless_playback = {}\n", self.gapless_playback));
         out.push_str(&format!("replay_gain = {}\n", self.replay_gain));
         out.push_str(&format!("restore_on_startup = {}\n", self.restore_on_startup));
+        out.push_str(&format!("next_track_prefetch = {}\n\n", self.next_track_prefetch));
+
+        out.push_str("[lyrics]\n");
+        out.push_str(&format!("lyrics_alignment = \"{}\"\n", self.lyrics_alignment.as_str()));
+        out.push_str(&format!("lyrics_transliterate = {}\n", self.lyrics_transliterate));
+        out.push_str(&format!("lyrics_auto_scroll = {}\n", self.lyrics_auto_scroll));
+        out.push_str(&format!("lyrics_font_size = {}\n", self.lyrics_font_size));
+        out.push_str(&format!("lyrics_highlight_color = {}\n\n", self.lyrics_highlight_color));
+
+        out.push_str("[interface]\n");
+        out.push_str(&format!("search_limit = {}\n", self.search_limit));
+        out.push_str(&format!("scrolloff = {}\n", self.scrolloff));
+        out.push_str(&format!("ui_density = {}\n", self.ui_density));
+        out.push_str(&format!("show_album_art_in_queue = {}\n", self.show_album_art_in_queue));
+        out.push_str(&format!("show_progress_in_footer = {}\n", self.show_progress_in_footer));
+        out.push_str(&format!("footer_clock_format = {}\n", self.footer_clock_format));
+        out.push_str(&format!("sidebar_width_pct = {}\n\n", self.sidebar_width_pct));
+
+        out.push_str("[system]\n");
+        out.push_str(&format!("mpris_enabled = {}\n", self.mpris_enabled));
+        out.push_str(&format!("ytdlp_path = \"{}\"\n", self.ytdlp_path));
+        out.push_str(&format!("ffmpeg_path = \"{}\"\n", self.ffmpeg_path));
+        out.push_str(&format!("audio_format = \"{}\"\n", self.audio_format));
+        if let Some(cookies) = &self.cookies_file {
+            out.push_str(&format!("cookies_file = \"{}\"\n", cookies));
+        }
+        out.push('\n');
+
+        out.push_str("[debug]\n");
+        out.push_str(&format!("debug_mode = {}\n", self.debug_mode));
+        out.push_str(&format!("debug_verbose_logging = {}\n", self.debug_verbose_logging));
+        out.push_str(&format!("debug_performance_overlay = {}\n", self.debug_performance_overlay));
+        out.push_str(&format!("debug_network_logging = {}\n", self.debug_network_logging));
+        out.push_str(&format!("debug_audio_diagnostics = {}\n", self.debug_audio_diagnostics));
+        out.push_str(&format!("debug_engine_state = {}\n", self.debug_engine_state));
+        out.push_str(&format!("debug_visualizer_raw = {}\n", self.debug_visualizer_raw));
+        out.push_str(&format!("debug_cache_stats = {}\n", self.debug_cache_stats));
+        out.push_str(&format!("debug_lyrics_timing = {}\n", self.debug_lyrics_timing));
+        out.push_str(&format!("debug_search_queries = {}\n", self.debug_search_queries));
+        out.push_str(&format!("debug_log_file = {}\n", self.debug_log_file));
+        out.push_str(&format!("debug_log_level = {}\n", self.debug_log_level));
+
+        out
+    }
+
+
+    /// Save configuration to file path.
+    pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, self.serialize_toml())
+    }
+}
+
+/// Best effort: a read-only home just means no file, never a failed start.
+fn write_template(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, TEMPLATE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_config_is_all_defaults() {
+        let c = Config::parse("").expect("empty toml is valid");
+        assert_eq!(c.scrolloff, 3);
+        assert!(c.restore_on_startup);
+        assert_eq!(c.buffer_duration_secs, 2);
+    }
+
+    #[test]
+    fn buffer_duration_reads_when_present() {
+        let c = Config::parse("buffer_duration_secs = 7").expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 7);
+    }
+
+    #[test]
+    fn prebuffer_samples_converts_secs_to_stereo_floats() {
+        // 2 s default → 2 × 44_100 frames × 2 channels; 5 s → five times that.
+        assert_eq!(prebuffer_samples(2), 176_400);
+        assert_eq!(prebuffer_samples(5), 441_000);
+    }
+
+    #[test]
+    fn reads_keys() {
+        let c = Config::parse(
+            "scrolloff = 5\nrestore_on_startup = false\n\
+             ytdlp_path = \"/opt/yt-dlp\"\nffmpeg_path = \"/opt/ffmpeg\"\
+             \naudio_format = \"bestaudio\"\nsearch_limit = 9",
+        )
+        .expect("valid toml");
+        assert_eq!(c.scrolloff, 5);
+        assert!(!c.restore_on_startup);
+        assert_eq!(c.ytdlp_path, "/opt/yt-dlp");
+        assert_eq!(c.ffmpeg_path, "/opt/ffmpeg");
+        assert_eq!(c.audio_format, "bestaudio");
+        assert_eq!(c.search_limit, 9);
+    }
+    #[test]
+    fn extended_settings_parse_and_serialize() {
+        let toml = r#"
+animation_fps = 60
+visualizer_style = "braille"
+visualizer_smoothing = "liquid"
+audio_quality = "high"
+volume_step = 10
+lyrics_alignment = "left"
+lyrics_transliterate = false
+next_track_prefetch = true
+mpris_enabled = false
+theme_name = "Nord"
+zen_default = true
+"#;
+        let c = Config::parse(toml).expect("valid extended toml");
+        assert_eq!(c.animation_fps, 60);
+        assert_eq!(c.visualizer_style, VisualizerStyle::Braille);
+        assert_eq!(c.visualizer_smoothing, VisualizerSmoothing::Liquid);
+        assert_eq!(c.audio_quality, AudioQuality::High);
+        assert_eq!(c.volume_step, 10);
+        assert_eq!(c.lyrics_alignment, LyricsAlignment::Left);
+        assert!(!c.lyrics_transliterate);
+        assert!(c.next_track_prefetch);
+        assert!(!c.mpris_enabled);
+        assert_eq!(c.theme_name, "Nord");
+        assert!(c.zen_default);
+
+        let serialized = c.serialize_toml();
+        let parsed_again = Config::parse(&serialized).expect("serialized toml parses");
+        assert_eq!(c, parsed_again);
+    }
+
+    #[test]
+    fn yt_keys_default_to_the_configured_defaults() {
+        let c = Config::parse("").expect("empty toml is valid");
+        assert_eq!(c.ytdlp_path, "yt-dlp");
+        assert_eq!(c.ffmpeg_path, "ffmpeg");
+        assert_eq!(c.audio_format, "bestaudio/best");
+        assert_eq!(c.search_limit, 6);
+        assert!(c.cookies_file.is_none());
+    }
+
+    #[test]
+    fn cookies_file_reads_when_present() {
+        let c = Config::parse("cookies_file = \"/tmp/c.txt\"").expect("valid toml");
+        assert_eq!(c.cookies_file.as_deref(), Some("/tmp/c.txt"));
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        // An older tuna-tui must not choke on a config written for a newer one.
+        let c = Config::parse("scrolloff = 1\nfuture_key = true").expect("valid toml");
+        assert_eq!(c.scrolloff, 1);
+    }
+
+    #[test]
+    fn a_single_malformed_line_costs_only_that_line() {
+        // One unparseable line makes the whole document fail the table
+        // parse; the salvage pass drops just that line, so the keys beside
+        // it survive untouched.
+        let c = Config::parse("scrolloff = = =\ncookies_file = \"/tmp/c.txt\"").expect("salvaged");
+        assert_eq!(c.scrolloff, 3, "the dropped line defaults its key");
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "good line survives"
+        );
+    }
+
+    #[test]
+    fn an_unsalvageable_document_falls_back_wholesale() {
+        // Two broken lines: no single-line drop can yield a parseable
+        // document, so the whole thing falls back.
+        assert!(Config::parse("scrolloff = = =\nstill not toml ] ] ]").is_none());
+    }
+
+    #[test]
+    fn an_out_of_range_integer_literal_costs_only_its_own_line() {
+        // TOML integers are i64-bounded (issue #15): an over-range literal
+        // is a document-level syntax error, so the per-key reader never
+        // sees it — the salvage pass removes that one line and keeps
+        // everything beside it.
+        let c = Config::parse(
+            "buffer_duration_secs = 99999999999999999999\n\
+             cookies_file = \"/tmp/c.txt\"\n\
+             ffmpeg_path = \"/opt/ffmpeg\"",
+        )
+        .expect("salvaged");
+        assert_eq!(
+            c.buffer_duration_secs, 2,
+            "the bad literal defaults its key"
+        );
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "cookies survive"
+        );
+        assert_eq!(c.ffmpeg_path, "/opt/ffmpeg", "ffmpeg path survives");
+    }
+
+    #[test]
+    fn a_wrong_typed_value_defaults_only_its_own_key() {
+        // `buffer_duration_secs = 300` doesn't fit u8 and `= 2.5` is a float:
+        // both are plausible user typos in exactly the file the template
+        // points them at. Each must cost only that key — never the cookies
+        // unlock or the binary paths beside it (the old one-shot serde read
+        // silently discarded the whole config on the first bad value).
+        let c = Config::parse(
+            "buffer_duration_secs = 300\n\
+             cookies_file = \"/tmp/c.txt\"\n\
+             ffmpeg_path = \"/opt/ffmpeg\"",
+        )
+        .expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 2, "out-of-range u8 falls back");
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "cookies survive"
+        );
+        assert_eq!(c.ffmpeg_path, "/opt/ffmpeg", "ffmpeg path survives");
+
+        let c = Config::parse("buffer_duration_secs = 2.5").expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 2, "float for u8 falls back");
+        let c = Config::parse("buffer_duration_secs = \"5\"").expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 2, "string for u8 falls back");
+    }
+
+    #[test]
+    fn an_out_of_range_buffer_secs_defaults_its_key() {
+        // The template documents 1..30. 0 would silently switch the
+        // prebuffer off; 31..=255 are typos. All fall back to the default,
+        // while the documented endpoints survive.
+        for bad in [0u8, 31, 200, 255] {
+            let c = Config::parse(&format!("buffer_duration_secs = {bad}")).expect("valid toml");
+            assert_eq!(
+                c.buffer_duration_secs, 2,
+                "{bad} is outside the documented 1..30 and must default"
+            );
+        }
+        for good in [1u8, 30] {
+            let c = Config::parse(&format!("buffer_duration_secs = {good}")).expect("valid toml");
+            assert_eq!(c.buffer_duration_secs, good, "{good} is in range");
+        }
+    }
+
+    #[test]
+    fn wrong_typed_legacy_keys_default_their_own_key() {
+        // Same leniency for the pre-buffer keys: one bad line among good ones
+        // must not take the good ones down with it.
+        let c = Config::parse(
+            "scrolloff = -4\nsearch_limit = \"many\"\n\
+             restore_on_startup = \"yes\"\ncookies_file = \"/tmp/c.txt\"",
+        )
+        .expect("valid toml");
+        assert_eq!(c.scrolloff, 3, "negative int falls back");
+        assert_eq!(c.search_limit, 6, "string for usize falls back");
+        assert!(c.restore_on_startup, "string for bool falls back");
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "good key survives"
+        );
+    }
+
+    #[test]
+    fn the_first_run_template_parses_to_the_defaults() {
+        // Everything in it is commented out, so writing it can never change how
+        // tuna-tui behaves — it only shows what there is to change.
+        let c = Config::parse(TEMPLATE).expect("template is valid toml");
+        let d = Config::default();
+        assert_eq!(c.scrolloff, d.scrolloff);
+        assert_eq!(c.restore_on_startup, d.restore_on_startup);
+        assert!(c.protocol.is_none());
+        assert_eq!(c.ytdlp_path, d.ytdlp_path);
+        assert_eq!(c.ffmpeg_path, d.ffmpeg_path);
+        assert_eq!(c.audio_format, d.audio_format);
+        assert_eq!(c.search_limit, d.search_limit);
+    }
+
+    #[test]
+    fn the_template_is_written_once_and_never_over_an_existing_file() {
+        let dir = std::env::temp_dir().join("tuna-tui-config-template");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        write_template(&path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), TEMPLATE);
+
+        std::fs::write(&path, "scrolloff = 9").unwrap();
+        // `load` only writes when the file is missing; the edit has to survive.
+        assert!(path.exists());
+        assert_eq!(
+            Config::parse(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .scrolloff,
+            9
+        );
+    }
+}
