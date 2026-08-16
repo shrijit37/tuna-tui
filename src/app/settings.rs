@@ -348,3 +348,353 @@ impl SettingsState {
                             Some("sixel") => 2,
                             Some("iterm2") => 3,
                             Some("halfblocks") => 4,
+                            _ => 0,
+                        },
+                        options: vec![
+                            "Auto-detect".into(),
+                            "Kitty (GPU-accelerated)".into(),
+                            "Sixel (tmux-friendly)".into(),
+                            "iTerm2 (native)".into(),
+                            "Halfblocks (universal)".into(),
+                        ],
+                    },
+                },
+                SettingRow {
+                    id: "zen",
+                    label: "Default to Zen Mode",
+                    description: "Launch in fullscreen Now Playing without the sidebar.",
+                    control: SettingControl::Toggle(self.zen_default),
+                },
+            ],
+            SettingsTab::Playback => vec![
+                SettingRow {
+                    id: "sep_quality",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Stream Quality  ━━━"),
+                },
+                SettingRow {
+                    id: "audio_quality",
+                    label: "Audio Stream Quality",
+                    description: "YouTube audio format preference. Higher quality = more bandwidth.",
+                    control: SettingControl::Choice {
+                        current: AudioQuality::ALL
+                            .iter()
+                            .position(|q| *q == self.audio_quality)
+                            .unwrap_or(0),
+                        options: AudioQuality::ALL.iter().map(|q| q.label().to_string()).collect(),
+                    },
+                },
+                SettingRow {
+                    id: "buffer_duration",
+                    label: "Prebuffer Duration",
+                    description: "Seconds of decoded audio buffered before playback starts. Higher = fewer stutters on slow networks.",
+                    control: SettingControl::Number {
+                        val: self.buffer_duration_secs as i64,
+                        min: 1,
+                        max: 15,
+                        step: 1,
+                        suffix: " s",
+                    },
+                },
+                SettingRow {
+                    id: "sep_transition",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Track Transitions  ━━━"),
+                },
+                SettingRow {
+                    id: "crossfade",
+                    label: "Crossfade Between Tracks",
+                    description: "Overlap end of current track with start of next for seamless flow.",
+                    control: SettingControl::Toggle(self.crossfade_enabled),
+                },
+                SettingRow {
+                    id: "crossfade_duration",
+                    label: "Crossfade Duration",
+                    description: "Overlap length in milliseconds. Only applies when crossfade is enabled.",
+                    control: SettingControl::Number {
+                        val: self.crossfade_duration_ms as i64,
+                        min: 500,
+                        max: 10000,
+                        step: 250,
+                        suffix: " ms",
+                    },
+                },
+                SettingRow {
+                    id: "gapless",
+                    label: "Gapless Playback",
+                    description: "Eliminate silence between consecutive tracks from the same album/playlist.",
+                    control: SettingControl::Toggle(self.gapless_playback),
+                },
+                SettingRow {
+                    id: "replay_gain",
+                    label: "ReplayGain Normalization",
+                    description: "Automatically normalize loudness across tracks using embedded tags.",
+                    control: SettingControl::Toggle(self.replay_gain),
+                },
+                SettingRow {
+                    id: "sep_volume",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Volume & Controls  ━━━"),
+                },
+                SettingRow {
+                    id: "volume_step",
+                    label: "Volume Step Size",
+                    description: "Percentage change per +/- keypress or mouse scroll.",
+                    control: SettingControl::Number {
+                        val: self.volume_step as i64,
+                        min: 1,
+                        max: 25,
+                        step: 1,
+                        suffix: " %",
+                    },
+                },
+                SettingRow {
+                    id: "sep_startup",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Startup & Prefetching  ━━━"),
+                },
+                SettingRow {
+                    id: "restore_on_startup",
+                    label: "Resume Playback on Launch",
+                    description: "Restore last track, queue position, and playback state.",
+                    control: SettingControl::Toggle(self.restore_on_startup),
+                },
+                SettingRow {
+                    id: "next_track_prefetch",
+                    label: "Next-Track Audio Prefetching",
+                    description: "Resolve next song stream URL in background for instant transitions.",
+                    control: SettingControl::Toggle(self.next_track_prefetch),
+                },
+            ],
+            SettingsTab::Lyrics => vec![
+                SettingRow {
+                    id: "sep_align",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Layout & Alignment  ━━━"),
+                },
+                SettingRow {
+                    id: "lyrics_align",
+                    label: "Lyrics Alignment",
+                    description: "Horizontal text alignment for verses in the Lyrics view.",
+                    control: SettingControl::Choice {
+                        current: LyricsAlignment::ALL
+                            .iter()
+                            .position(|a| *a == self.lyrics_alignment)
+                            .unwrap_or(0),
+                        options: LyricsAlignment::ALL.iter().map(|a| a.label().to_string()).collect(),
+                    },
+                },
+                SettingRow {
+                    id: "lyrics_font_size",
+                    label: "Lyrics Font Scale",
+                    description: "Relative size of lyrics text. 100% = normal terminal size.",
+                    control: SettingControl::Number {
+                        val: self.lyrics_font_size as i64,
+                        min: 80,
+                        max: 150,
+                        step: 10,
+                        suffix: " %",
+                    },
+                },
+                SettingRow {
+                    id: "lyrics_highlight",
+                    label: "Active Line Highlight",
+                    description: "Visual style for the currently playing verse.",
+                    control: SettingControl::Choice {
+                        current: self.lyrics_highlight_color as usize,
+                        options: vec![
+                            "Bold + Primary Color".into(),
+                            "Bold + Accent Color".into(),
+                            "Inverted (Background Swap)".into(),
+                            "Underline Only".into(),
+                            "Background Block".into(),
+                        ],
+                    },
+                },
+                SettingRow {
+                    id: "sep_behavior",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Scrolling & Behavior  ━━━"),
+                },
+                SettingRow {
+                    id: "lyrics_auto_scroll",
+                    label: "Auto-Scroll Synced Lyrics",
+                    description: "Keep the active verse centered while lyrics scroll with playback.",
+                    control: SettingControl::Toggle(self.lyrics_auto_scroll),
+                },
+                SettingRow {
+                    id: "lyrics_transliterate",
+                    label: "Auto-Transliteration",
+                    description: "Convert non-Latin scripts (Indic, CJK, Arabic) to phonetic Latin.",
+                    control: SettingControl::Toggle(self.lyrics_transliterate),
+                },
+            ],
+            SettingsTab::Interface => vec![
+                SettingRow {
+                    id: "sep_search",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Search & Library  ━━━"),
+                },
+                SettingRow {
+                    id: "search_limit",
+                    label: "Search Result Limit",
+                    description: "Maximum tracks returned per YouTube Music search query.",
+                    control: SettingControl::Number {
+                        val: self.search_limit as i64,
+                        min: 5,
+                        max: 50,
+                        step: 5,
+                        suffix: " tracks",
+                    },
+                },
+                SettingRow {
+                    id: "scrolloff",
+                    label: "List Cursor Scrolloff",
+                    description: "Visible rows kept above/below cursor (vim 'scrolloff').",
+                    control: SettingControl::Number {
+                        val: self.scrolloff as i64,
+                        min: 0,
+                        max: 15,
+                        step: 1,
+                        suffix: " rows",
+                    },
+                },
+                SettingRow {
+                    id: "ui_density",
+                    label: "UI Density",
+                    description: "Vertical spacing between list items. Compact = more items on screen.",
+                    control: SettingControl::Choice {
+                        current: self.ui_density as usize,
+                        options: vec![
+                            "Comfortable (2-line items)".into(),
+                            "Standard (1-line items)".into(),
+                            "Compact (tight packing)".into(),
+                        ],
+                    },
+                },
+                SettingRow {
+                    id: "sep_layout",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Layout & Panels  ━━━"),
+                },
+                SettingRow {
+                    id: "sidebar_width",
+                    label: "Sidebar Width",
+                    description: "Percentage of terminal width for the left library sidebar.",
+                    control: SettingControl::Number {
+                        val: self.sidebar_width_pct as i64,
+                        min: 20,
+                        max: 50,
+                        step: 5,
+                        suffix: " %",
+                    },
+                },
+                SettingRow {
+                    id: "show_art_queue",
+                    label: "Album Art in Queue",
+                    description: "Show track thumbnails in the Queue view (requires width).",
+                    control: SettingControl::Toggle(self.show_album_art_in_queue),
+                },
+                SettingRow {
+                    id: "show_progress_footer",
+                    label: "Progress in Footer",
+                    description: "Show mini progress bar and time in the bottom footer bar.",
+                    control: SettingControl::Toggle(self.show_progress_in_footer),
+                },
+                SettingRow {
+                    id: "footer_clock",
+                    label: "Footer Clock Format",
+                    description: "Time display style in the footer.",
+                    control: SettingControl::Choice {
+                        current: self.footer_clock_format as usize,
+                        options: vec![
+                            "12h (3:45 PM)".into(),
+                            "24h (15:45)".into(),
+                            "Relative (3m 45s)".into(),
+                            "Hidden".into(),
+                        ],
+                    },
+                },
+                SettingRow {
+                    id: "sep_behavior_ui",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Behavior  ━━━"),
+                },
+            ],
+            SettingsTab::System => vec![
+                SettingRow {
+                    id: "sep_system",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  System Integration  ━━━"),
+                },
+                SettingRow {
+                    id: "mpris",
+                    label: "MPRIS / Media Keys",
+                    description: "Enable OS media controls, keyboard media keys, and playerctl.",
+                    control: SettingControl::Toggle(self.mpris_enabled),
+                },
+                SettingRow {
+                    id: "sep_debug",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Debug & Diagnostics  ━━━"),
+                },
+                SettingRow {
+                    id: "debug_mode",
+                    label: "Debug Mode (Master Toggle)",
+                    description: "Enable all debug subsystems. When on, individual toggles below take effect.",
+                    control: SettingControl::Toggle(self.debug_mode),
+                },
+                SettingRow {
+                    id: "debug_verbose",
+                    label: "Verbose Logging",
+                    description: "Log every engine event, metadata fetch, and state transition to console/file.",
+                    control: SettingControl::Toggle(self.debug_verbose_logging),
+                },
+                SettingRow {
+                    id: "debug_perf",
+                    label: "Performance Overlay",
+                    description: "Show real-time FPS, frame time, CPU/memory, audio buffer health in corner.",
+                    control: SettingControl::Toggle(self.debug_performance_overlay),
+                },
+                SettingRow {
+                    id: "debug_network",
+                    label: "Network Request Logging",
+                    description: "Log all HTTP requests/responses (YouTube, LRCLIB, metadata) with timing.",
+                    control: SettingControl::Toggle(self.debug_network_logging),
+                },
+                SettingRow {
+                    id: "debug_audio",
+                    label: "Audio Pipeline Diagnostics",
+                    description: "Log decoder state, buffer levels, underruns, sample rate changes, seek operations.",
+                    control: SettingControl::Toggle(self.debug_audio_diagnostics),
+                },
+                SettingRow {
+                    id: "debug_engine",
+                    label: "Engine State Inspection",
+                    description: "Log queue transitions, track loading, shuffle/repeat state, radio station switches.",
+                    control: SettingControl::Toggle(self.debug_engine_state),
+                },
+                SettingRow {
+                    id: "debug_viz",
+                    label: "Visualizer Raw Data",
+                    description: "Dump raw FFT magnitudes, band values, peak envelope per frame to log.",
+                    control: SettingControl::Toggle(self.debug_visualizer_raw),
+                },
+                SettingRow {
+                    id: "debug_cache",
+                    label: "Cache Statistics",
+                    description: "Log metadata cache hits/misses, eviction policy, LRU order, size on every access.",
+                    control: SettingControl::Toggle(self.debug_cache_stats),
+                },
+                SettingRow {
