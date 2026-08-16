@@ -27,6 +27,7 @@ pub mod audio;
 #[cfg(feature = "streaming")]
 pub mod config;
 #[cfg(feature = "streaming")]
+pub mod engine;
 #[cfg(feature = "streaming")]
 pub mod term;
 #[cfg(feature = "streaming")]

@@ -84,16 +84,15 @@ pub fn resolve(url_or_id: &str) -> Option<StreamInfo> {
 /// of rows across 15+ sequential API pages, 20s+ even on a healthy network
 /// (measured 2026-08-16) — and the app's radio deadline fires for what is
 /// really a too-greedy fetch. `--playlist-end` at this cap costs ~4s per mix.
-pub const RADIO_LIMIT: usize = 50;
-
-const RADIO_FETCH_LIMIT: usize = if RADIO_LIMIT < 40 {
-    RADIO_LIMIT
+const RADIO_FETCH_LIMIT: usize = if crate::engine::RADIO_LIMIT < 40 {
+    crate::engine::RADIO_LIMIT
 } else {
     40
 };
 // Compile-time pins of the coupling itself: the fetch cap must never exceed
 // the engine's station cap (else the mix fetch paginates back into the 20s+
 // crawl it exists to avoid) nor its own one-to-two-page ceiling.
+const _: () = assert!(RADIO_FETCH_LIMIT <= crate::engine::RADIO_LIMIT);
 const _: () = assert!(RADIO_FETCH_LIMIT <= 40);
 
 /// Candidate mix URLs for a seed video, in preference order: the canonical

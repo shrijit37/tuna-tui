@@ -63,7 +63,7 @@ streaming = [
     "dep:toml",
 ]
 
-# (The app binary + the probe example land with the engine / app shell.)
+# Dev tools, kept as examples (cargo run --example theme_demo / probe).
 [[example]]
 name = "theme_demo"
 path = "examples/theme_demo.rs"
@@ -72,6 +72,11 @@ path = "examples/theme_demo.rs"
 name = "txc_demo"
 path = "examples/txc_demo.rs"
 required-features = ["txc"]
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"
+required-features = ["streaming"]
 
 [profile.release]
 lto = true
