@@ -10,6 +10,7 @@ homepage = "https://github.com/shrijit37/tuna-tui"
 readme = "README.md"
 keywords = ["tui", "music", "player", "ratatui", "youtube"]
 categories = ["command-line-utilities", "multimedia::audio"]
+default-run = "tuna-tui"
 
 [dependencies]
 ratatui = "0.30.2"
@@ -62,6 +63,15 @@ streaming = [
     "dep:fs2",
     "dep:toml",
 ]
+
+# The one, fully-wired binary. `required-features` states what was already
+# true — `main.rs` is unconditionally wired to the streaming engine — so that
+# a protocol-only build (`--no-default-features --features txc`) skips the bin
+# instead of failing to compile it.
+[[bin]]
+name = "tuna-tui"
+path = "src/main.rs"
+required-features = ["streaming"]
 
 # Dev tools, kept as examples (cargo run --example theme_demo / probe).
 [[example]]
