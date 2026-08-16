@@ -1,0 +1,28 @@
+/target
+/result
+
+# local runtime caches (auth tokens, saved state)
+.cache/
+
+# copyrighted demo cover art (fetched at runtime, not shipped)
+assets/*.jpg
+assets/*.png
+
+# editor / os cruft
+**/*.rs.bk
+.DS_Store
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+.agents
+.beads
+.codex
+.claude
+.github.bak
+AGENTS.md
+CLAUDE.md
+v1.txt
+

@@ -1,0 +1,99 @@
+[package]
+name = "tuna-tui"
+version = "0.4.0"
+edition = "2021"
+description = "A lean, beautiful terminal music player"
+authors = ["Haseeb Khalid"]
+license = "MIT"
+repository = "https://github.com/shrijit37/tuna-tui"
+homepage = "https://github.com/shrijit37/tuna-tui"
+readme = "README.md"
+keywords = ["tui", "music", "player", "ratatui", "youtube"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+tui-textarea-2 = { version = "0.12", default-features = false, features = ["crossterm"] }
+image = "0.25"
+color-thief = "0.2"
+
+# --- streaming backend (on by default; the single `tuna-tui` binary needs it) ---
+# Phase 2: librespot is gone. Playback is yt-dlp → ffmpeg → rodio.
+rodio = { version = "0.22", optional = true, default-features = false, features = ["playback"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+flume = { version = "0.12", optional = true }
+rustfft = { version = "6", optional = true }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["blocking", "json", "native-tls"] }
+rand = { version = "0.9", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+anyhow = { version = "1", optional = true }
+fs2 = { version = "0.4", optional = true }
+souvlaki = { version = "0.8.3", default-features = false, features = ["pollster", "zbus", "zvariant"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde"], optional = true }
+log = { version = "0.4.33", features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-win = "3.0.0"
+
+# Macos-only
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30.13"
+
+[features]
+default = ["streaming", "txc"]
+
+# The tuna-tui color protocol (TXC, formerly MXC): pure data types + color
+# math, usable without the streaming backend so consumers can depend on the
+# protocol half alone.
+txc = ["dep:serde", "dep:serde_json"]
+streaming = [
+    "dep:rodio",
+    "dep:tokio",
+    "dep:flume",
+    "dep:rustfft",
+    "dep:reqwest",
+    "dep:rand",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:anyhow",
+    "dep:fs2",
+    "dep:toml",
+]
+
+# (The app binary + the probe example land with the engine / app shell.)
+[[example]]
+name = "theme_demo"
+path = "examples/theme_demo.rs"
+
+[[example]]
+name = "txc_demo"
+path = "examples/txc_demo.rs"
+required-features = ["txc"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Debian packaging (audit H7): the binary links libasound2 (rodio/cpal ALSA)
+# and libssl3 (reqwest native-tls), so the .deb must declare them or `dpkg -i`
+# installs a binary that fails to start with missing shared libraries.
+[package.metadata.deb]
+depends = "libasound2, libssl3"
+section = "sound"
+priority = "optional"
+assets = [
+    ["target/release/tuna-tui", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/tuna-tui/README.md", "644"],
+    ["LICENSE", "usr/share/doc/tuna-tui/LICENSE", "644"],
+    ["NOTICE", "usr/share/doc/tuna-tui/NOTICE", "644"],
+]

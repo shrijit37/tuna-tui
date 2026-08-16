@@ -1,0 +1,69 @@
+name: CI
+
+# Branch pushes are covered by `pull_request`; limiting `push` to main keeps a
+# commit on a PR branch from running the whole matrix twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes whatever was still running for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  nix-build:
+    name: Nix build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Check flake
+        run: nix flake check --no-update-lock-file --print-build-logs
+
+      - name: Build with Nix
+        run: nix build --no-update-lock-file --print-build-logs
+
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is a supported target (Cargo.toml has a cfg(windows) section
+        # and souvlaki ships a Windows backend), but it was never built in CI —
+        # which is exactly how an ungated `std::os::unix::net::UnixStream` in
+        # the TXC layer reached a PR. Building it here makes that class of
+        # regression impossible to merge.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # cpal's ALSA backend (rodio) and native-tls need these; macOS has them.
+      - name: Install Linux audio/TLS headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+      # The `#[ignore]`d live tests need network + yt-dlp, so they stay out of
+      # CI; everything else runs.
+      - name: Test
+        run: cargo test --all-features
