@@ -152,6 +152,19 @@ struct CurrentTrack {
     cancelled: Arc<AtomicBool>,
 }
 
+/// A paused track's stream stash: everything needed to restart the decoder on
+/// the SAME already-resolved URL (no network re-resolve) at a recorded
+/// position, after `Cmd::Pause` tore the stream down. Deliberately NOT
+/// [`Worker::recovery`] — `run` treats recovery as an in-flight rebuild and
+/// would rebuild the stream on the next command; a stash must be invisible to
+/// that logic.
+struct PausedTrack {
+    uri: String,
+    url: String,
+    duration_ms: Option<u32>,
+    position_ms: u32,
+}
+
 /// The cell the watchdog polls. Only `playing` + `last_progress` matter: a
 /// track that claims to play but hasn't advanced frames is a stall.
 struct Health {
@@ -404,6 +417,7 @@ pub fn run(
         client: crate::httpcache::blocking_client().clone(),
         pending: None,
         recovery: None,
+        paused: None,
     };
     std::thread::Builder::new()
         .name("tuna-engine".to_string())
@@ -482,6 +496,11 @@ struct Worker {
     /// watchdog and a pre-empted resume use it to re-enter the rebuild loop
     /// instead of losing the track.
     recovery: Option<(String, u32)>,
+    /// The paused track's stream, while `current` is nowhere: the URL stays
+    /// cached so a resume can restart without re-resolving. Cleared on every
+    /// transition out of the pause state (next/prev/stop/load/teardown) so it
+    /// can never resurrect a stale stream on a later resume.
+    paused: Option<PausedTrack>,
 }
 
 impl Worker {
@@ -593,7 +612,39 @@ impl Worker {
                 self.start_track_at(start, position_ms);
             }
             Cmd::Resume => {
-                if !self.state.playing && self.current.is_some() {
+                if !self.state.playing && self.current.is_none() {
+                    // Resume from the pause stash: restart the decoder on the
+                    // same already-resolved URL — no network re-resolve. The
+                    // stash is taken (cleared) on every outcome so a failed
+                    // restart can never resurrect it.
+                    let Some(p) = self.paused.take() else {
+                        return;
+                    };
+                    let pos = truncate_seconds(p.position_ms);
+                    match self.restart_stream(&p.url, &p.uri, p.duration_ms, pos, true) {
+                        Ok(()) => {
+                            self.state.playing = true;
+                            self.set_health(true);
+                            self.set_active(true);
+                            // A fresh post-resume decoder starts with a clean
+                            // slate, like seek_now and start_track_at give it —
+                            // the pre-pause streak must not count against it.
+                            self.drop_streak = 0;
+                            let _ = self.events.send(EngineEvent::Playing {
+                                uri: p.uri,
+                                position_ms: pos,
+                            });
+                        }
+                        Err(e) => {
+                            liblog(format!("engine: resume failed: {e}"));
+                            // `state.playing` is false while paused, so the
+                            // rebuild stays paused; after RECOVERY_ATTEMPTS
+                            // give_up_on skips the track — the audit's
+                            // prescribed fallback, recover_into unchanged.
+                            self.recover_into(p.uri, pos);
+                        }
+                    }
+                } else if !self.state.playing && self.current.is_some() {
                     self.player.play();
                     self.state.playing = true;
                     self.set_health(true);
@@ -616,6 +667,19 @@ impl Worker {
                         uri,
                         position_ms: pos,
                     });
+                    // Stash the resolved stream, then tear it down: ffmpeg and
+                    // its googlevideo connection must not stay resident for the
+                    // whole pause. Resume restarts from this stashed URL — no
+                    // re-resolve.
+                    if let Some(cur) = &self.current {
+                        self.paused = Some(PausedTrack {
+                            uri: cur.uri.clone(),
+                            url: cur.url.clone(),
+                            duration_ms: cur.duration_ms,
+                            position_ms: pos,
+                        });
+                    }
+                    self.shutdown_current();
                 }
             }
             Cmd::Toggle => {
@@ -627,12 +691,15 @@ impl Worker {
             }
             Cmd::Next => self.advance(),
             Cmd::Prev => {
+                // The stash counts as the current track: the >5s restart rule
+                // and the no-history restart-at-0 both apply to a paused
+                // track too (seek_now updates the stash, staying paused).
                 let pos = self.current_pos();
-                if self.current.is_some() && pos > 5_000 {
+                if (self.current.is_some() || self.paused.is_some()) && pos > 5_000 {
                     self.seek_now(0);
                 } else if let Some(prev) = self.state.history.pop() {
                     self.start_track_at(prev, 0);
-                } else if self.current.is_some() {
+                } else if self.current.is_some() || self.paused.is_some() {
                     self.seek_now(0);
                 }
             }
@@ -670,7 +737,10 @@ impl Worker {
     fn current_pos(&self) -> u32 {
         match &self.current {
             Some(c) => self.position_of(c),
-            None => 0,
+            // While paused the stash owns the playhead: `prev` consults it so
+            // the pre-teardown contract (restart the current track at 0 when
+            // past 5s, stay paused) survives the teardown.
+            None => self.paused.as_ref().map_or(0, |p| p.position_ms),
         }
     }
 
@@ -871,6 +941,7 @@ impl Worker {
     fn stop_playback(&mut self) {
         self.shutdown_current();
         self.recovery = None;
+        self.paused = None; // a stop during pause must not resurrect the stash
         if let Ok(mut q) = self.queue_snapshot.lock() {
             q.clear();
         }
@@ -889,6 +960,7 @@ impl Worker {
         self.set_health(false);
         self.set_active(false);
         self.reset_bands();
+        self.paused = None; // every stop tail is a transition out of pause
         let _ = self.events.send(EngineEvent::Stopped);
     }
 
@@ -916,6 +988,9 @@ impl Worker {
 
     /// Begin resolving, decoding and playing `tracks[idx]`.
     fn start_track_at(&mut self, idx: usize, pos: u32) {
+        // A new track supersedes any paused stash — it must not resurrect on a
+        // later resume.
+        self.paused = None;
         let Some(uri) = self.state.tracks.get(idx).cloned() else {
             return;
         };
@@ -949,7 +1024,7 @@ impl Worker {
     ) -> Result<()> {
         // `-ss` seeks on whole seconds; anchor the playhead at the truncated
         // position so the extrapolation doesn't run ahead of the decoder.
-        let pos = pos / 1000 * 1000;
+        let pos = truncate_seconds(pos);
         let (child, stdout) = spawn_ffmpeg(url, pos)?;
         let frames = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1023,6 +1098,13 @@ impl Worker {
 
     /// Seek: restart the decoder at `pos` on the current stream URL.
     fn seek_now(&mut self, pos: u32) {
+        // Scrub-while-paused: no stream is resident, so the target is recorded
+        // on the stash (whole-second truncated) and applied at the next resume
+        // — restart_stream anchors at the same truncation.
+        if let Some(p) = self.paused.as_mut() {
+            p.position_ms = truncate_seconds(pos);
+            return;
+        }
         let Some(mut cur) = self.current.take() else {
             return;
         };
@@ -1033,7 +1115,7 @@ impl Worker {
         let _ = cur.child.wait();
         // Same whole-second anchor restart_stream applies; needed here for the
         // correction event and the recovery fallback.
-        let pos = pos / 1000 * 1000;
+        let pos = truncate_seconds(pos);
         match self.restart_stream(&url, &uri, cur.duration_ms, pos, self.state.playing) {
             Ok(()) => {
                 // A fresh decoder starts with a clean slate (build_stream's
@@ -1058,6 +1140,7 @@ impl Worker {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
         }
+        self.paused = None;
         self.set_active(false);
         self.set_health(false);
     }
@@ -1099,6 +1182,13 @@ fn frames_to_position(start_ms: u32, frames: u64) -> u32 {
     (start_ms as u64)
         .saturating_add(frames.saturating_mul(1000) / 44_100)
         .min(u32::MAX as u64) as u32
+}
+
+/// Whole-second truncation for `-ss` seeks: the decoder starts at the
+/// truncated offset, so the playhead anchor, the stash and every position
+/// event must agree on it.
+fn truncate_seconds(pos: u32) -> u32 {
+    pos / 1000 * 1000
 }
 
 /// Build in-band metadata for a yt: track, fetching its cover + theme the
@@ -1174,6 +1264,35 @@ mod tests {
         assert_eq!(frames_to_position(0, 0), 0);
         // Huge counts clamp rather than wrap.
         assert_eq!(frames_to_position(0, u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn truncate_seconds_keeps_whole_seconds() {
+        // The decoder's `-ss` seeks land on whole seconds only; the anchor
+        // (and the pause stash, and every event) must match.
+        assert_eq!(truncate_seconds(0), 0);
+        assert_eq!(truncate_seconds(999), 0);
+        assert_eq!(truncate_seconds(1000), 1000);
+        assert_eq!(truncate_seconds(1500), 1000);
+        assert_eq!(truncate_seconds(59_999), 59_000);
+    }
+
+    #[test]
+    fn paused_stash_is_distinct_from_recovery() {
+        // `paused` must never be the recovery tuple: run()'s pre-empt re-entry
+        // treats `recovery` as an in-flight rebuild and would rebuild the
+        // stream on the next command. The real assertion is compile-time — the
+        // Worker field is typed `Option<PausedTrack>` beside
+        // `Option<(String, u32)>` — and this test pins the shape: a tuple has
+        // no `url`/`duration_ms` fields, so collapsing the stash into
+        // recovery's shape stops compiling right here.
+        let stash = PausedTrack {
+            uri: String::from("yt:video:x"),
+            url: String::from("https://example.test/x.m4a"),
+            duration_ms: Some(180_000),
+            position_ms: 30_000,
+        };
+        let _ = (stash.uri, stash.url, stash.duration_ms, stash.position_ms);
     }
 
     #[test]
