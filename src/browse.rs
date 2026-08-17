@@ -42,30 +42,15 @@ fn build_sections(store: &Store, tx: flume::Sender<(Section, Vec<LibItem>)>) {
         home.push(LibItem::header("nothing played yet — search for a song"));
     } else {
         home.push(LibItem::header("Recently Played"));
-        home.extend(
-            store
-                .history
-                .iter()
-                .take(6)
-                .map(|h| LibItem::track(h.title.clone(), h.artist.clone(), h.uri.clone())),
-        );
+        home.extend(history_rows(store.history.iter()).take(6));
         let mut top: Vec<&PlayedEntry> = store.history.iter().collect();
         top.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_ms.cmp(&a.last_ms)));
         home.push(LibItem::header("Top Tracks"));
-        home.extend(
-            top.into_iter()
-                .take(8)
-                .map(|h| LibItem::track(h.title.clone(), h.artist.clone(), h.uri.clone())),
-        );
+        home.extend(history_rows(top.into_iter()).take(8));
     }
     let _ = tx.send((Section::Home, home));
 
-    let recent: Vec<LibItem> = store
-        .history
-        .iter()
-        .take(50)
-        .map(|h| LibItem::track(h.title.clone(), h.artist.clone(), h.uri.clone()))
-        .collect();
+    let recent: Vec<LibItem> = history_rows(store.history.iter()).take(50).collect();
     let _ = tx.send((Section::Recent, recent));
 
     let playlists: Vec<LibItem> = store
@@ -167,57 +152,78 @@ pub(crate) fn fetch_detail_blocking(
     match kind {
         // A playlist whose contents have grown locally renders its own rows;
         // otherwise the network copy (flat-extracted) is the contents.
-        "playlist" if store.playlist_tracks(uri).is_some() => {
-            let rows = store.playlist_tracks(uri).expect("checked above");
-            items.extend(
+        "playlist" if let Some(rows) = store.playlist_tracks(uri) => {
+            append_or_hint(
+                &mut items,
                 rows.iter()
                     .map(|t| LibItem::track(t.name.clone(), t.subtitle.clone(), t.uri.clone())),
+                "empty playlist",
             );
-            if items.len() == 1 {
-                items.push(LibItem::header("empty playlist"));
-            }
         }
         "playlist" => {
-            let before = items.len();
-            items.extend(playlist_rows(&format!(
-                "https://www.youtube.com/playlist?list={id}"
-            )));
-            if items.len() == before {
-                items.push(LibItem::header("no tracks — empty or restricted"));
-            }
+            append_or_hint(
+                &mut items,
+                playlist_rows(&format!("https://www.youtube.com/playlist?list={id}")),
+                "no tracks — empty or restricted",
+            );
         }
         "channel" => {
-            let before = items.len();
-            items.extend(playlist_rows(&format!(
-                "https://www.youtube.com/channel/{id}/videos"
-            )));
-            if items.len() == before {
-                items.push(LibItem::header("no uploads — empty or restricted"));
-            }
+            append_or_hint(
+                &mut items,
+                playlist_rows(&format!("https://www.youtube.com/channel/{id}/videos")),
+                "no uploads — empty or restricted",
+            );
         }
         "album" => {
             // YouTube has no first-class albums; the saved slug searches.
-            let before = items.len();
-            items.extend(
+            append_or_hint(
+                &mut items,
                 yt::search(id, config::get().search_limit)
                     .into_iter()
                     .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                "nothing loaded — search failed",
             );
-            if items.len() == before {
-                items.push(LibItem::header("nothing loaded — search failed"));
-            }
         }
         "video" => {
-            if let Some(v) = yt::video_meta(id) {
-                items.push(LibItem::track(v.title, v.artist, v.uri));
-            } else {
-                items.push(LibItem::header("couldn't load — check the network"));
-            }
+            append_or_hint(
+                &mut items,
+                yt::video_meta(id)
+                    .into_iter()
+                    .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                "couldn't load — check the network",
+            );
         }
         _ => {}
     }
 
     (name.to_string(), items)
+}
+
+/// Extend `items` with `rows`; when the source yielded nothing (an empty or
+/// restricted playlist, a failed search), push a header `hint` instead.
+/// Returns whether rows were added.
+fn append_or_hint(
+    items: &mut Vec<LibItem>,
+    rows: impl IntoIterator<Item = LibItem>,
+    hint: &str,
+) -> bool {
+    let before = items.len();
+    items.extend(rows);
+    if items.len() == before {
+        items.push(LibItem::header(hint));
+        false
+    } else {
+        true
+    }
+}
+
+/// The history rows shared by Home's Recently Played / Top Tracks and the
+/// Recent section — one mapping so `PlayedEntry`'s shape stays in sync
+/// everywhere it renders.
+fn history_rows<'a>(
+    rows: impl Iterator<Item = &'a PlayedEntry> + 'a,
+) -> impl Iterator<Item = LibItem> + 'a {
+    rows.map(|h| LibItem::track(h.title.clone(), h.artist.clone(), h.uri.clone()))
 }
 
 /// The rows of a playlist / mix / channel-tab dump. Flat entries are
