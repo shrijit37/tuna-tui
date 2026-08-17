@@ -160,17 +160,28 @@ struct Health {
 }
 
 impl Engine {
+    /// The one `Cmd::Load` construction all play-entry points share.
+    fn load(
+        &self,
+        tracks: Vec<String>,
+        start_uri: Option<String>,
+        position_ms: u32,
+        shuffle: bool,
+    ) -> Result<()> {
+        self.send(Cmd::Load {
+            tracks,
+            start_uri,
+            position_ms,
+            shuffle,
+        })
+    }
+
     /// Start a context (playlist / album / artist / track URI). When
     /// `shuffle` is set, the whole expanded context shuffles locally.
     pub fn play_context(&self, context_uri: impl Into<String>, shuffle: bool) -> Result<()> {
         let uri = context_uri.into();
         let tracks = self.inner.expander.expand(&uri).map_err(|e| anyhow!(e))?;
-        self.send(Cmd::Load {
-            tracks,
-            start_uri: None,
-            position_ms: 0,
-            shuffle,
-        })
+        self.load(tracks, None, 0, shuffle)
     }
 
     /// Load a context and start at a specific track + position (context
@@ -187,12 +198,7 @@ impl Engine {
             .expander
             .expand(&context_uri)
             .map_err(|e| anyhow!(e))?;
-        self.send(Cmd::Load {
-            tracks,
-            start_uri: track_uri,
-            position_ms,
-            shuffle,
-        })
+        self.load(tracks, track_uri, position_ms, shuffle)
     }
 
     /// Play an explicit list of track URIs as a queue. `start_uri` picks the
@@ -208,23 +214,13 @@ impl Engine {
         if tracks.is_empty() {
             return Ok(());
         }
-        self.send(Cmd::Load {
-            tracks,
-            start_uri,
-            position_ms: start_position_ms,
-            shuffle,
-        })
+        self.load(tracks, start_uri, start_position_ms, shuffle)
     }
 
     /// Load a single track and start playing at `position_ms` — used to resume
     /// the last session's track when the user first hits play.
     pub fn play_track_at(&self, uri: String, position_ms: u32) -> Result<()> {
-        self.send(Cmd::Load {
-            tracks: vec![uri.clone()],
-            start_uri: Some(uri),
-            position_ms,
-            shuffle: false,
-        })
+        self.load(vec![uri.clone()], Some(uri), position_ms, false)
     }
 
     pub fn play(&self) -> Result<()> {
@@ -654,21 +650,7 @@ impl Worker {
                 }
                 self.state.tracks.extend(uris);
             }
-            Cmd::Stop => {
-                self.shutdown_current();
-                self.recovery = None;
-                if let Ok(mut q) = self.queue_snapshot.lock() {
-                    q.clear();
-                }
-                self.state.tracks.clear();
-                self.state.history.clear();
-                self.state.cursor = 0;
-                self.state.playing = false;
-                self.set_health(false);
-                self.set_active(false);
-                self.reset_bands();
-                let _ = self.events.send(EngineEvent::Stopped);
-            }
+            Cmd::Stop => self.stop_playback(),
             Cmd::Recover => self.recover(),
         }
     }
@@ -729,13 +711,10 @@ impl Worker {
         match self.advance_index() {
             Some(idx) => self.start_track_at(idx, 0),
             None => {
-                // Queue over, repeat off: stop cleanly, like the old endpoint.
+                // Queue over, repeat off: stop cleanly, like the old endpoint. The loaded
+                // queue is kept — prev/next still navigate the list after a stop.
                 self.shutdown_current();
-                self.state.playing = false;
-                self.set_health(false);
-                self.set_active(false);
-                self.reset_bands();
-                let _ = self.events.send(EngineEvent::Stopped);
+                self.stop_tail();
             }
         }
     }
@@ -822,13 +801,13 @@ impl Worker {
             "engine: giving up on {uri} after {MAX_EOF_DROPS} consecutive failed EOFs"
         ));
         if self.state.tracks.is_empty() {
-            self.give_up_stop();
+            self.stop_tail();
         } else if dead < self.state.tracks.len() {
             self.start_track_at(dead, 0);
         } else if self.state.repeat {
             self.start_track_at(0, 0);
         } else {
-            self.give_up_stop();
+            self.stop_tail();
         }
     }
 
@@ -888,10 +867,25 @@ impl Worker {
         self.give_up_on(uri);
     }
 
-    /// The queue is empty after a give-up: stop cleanly (EndOfTrack + Stopped)
-    /// instead of leaving `playing=true` with nothing current — a state no
-    /// command could escape.
-    fn give_up_stop(&mut self) {
+    /// Stop playback and reset every track-related state: cancel the current
+    /// child, clear the queue + mirror + history, and announce `Stopped`.
+    fn stop_playback(&mut self) {
+        self.shutdown_current();
+        self.recovery = None;
+        if let Ok(mut q) = self.queue_snapshot.lock() {
+            q.clear();
+        }
+        self.state.tracks.clear();
+        self.state.history.clear();
+        self.state.cursor = 0;
+        self.stop_tail();
+    }
+
+    /// The shared teardown tail of every stop path: mark the player stopped
+    /// (watchdog off, bands zeroed) and announce it. Callers run their own
+    /// prelude — shut down the current child, and (only [`stop_playback`])
+    /// clear the loaded queue.
+    fn stop_tail(&mut self) {
         self.state.playing = false;
         self.set_health(false);
         self.set_active(false);
