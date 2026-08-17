@@ -307,13 +307,15 @@ const MIN_EOF_POSITION_MS: u32 = 5_000;
 /// How many consecutive short-EOF drops on the same track before it is given
 /// up on (skipped or, at the queue tail with repeat off, stopped cleanly)
 /// instead of rebuilding forever.
-const MAX_EOF_DROPS: u32 = 8;
+///
+/// The same bound caps `recover_into`'s rebuild loop: both are "how hard do
+/// we keep retrying this track before walking away" — one number, so tuning
+/// it can't leave the two paths disagreeing about when to give up.
+const RECOVERY_ATTEMPTS: u32 = 8;
 /// First and last wait between failed recovery attempts, so an offline spell
 /// doesn't hammer the resolver every five seconds until dawn.
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(120);
-/// How many recovery attempts before the track is given up on.
-const RECOVER_ATTEMPTS: u32 = 8;
 /// Worker loop wakeup: drains commands, watches for EOF, emits position.
 const TICK: Duration = Duration::from_millis(100);
 /// How often the worker emits a [`EngineEvent::PositionCorrection`] while
@@ -470,7 +472,7 @@ struct Worker {
     current: Option<CurrentTrack>,
     health: Arc<Mutex<Health>>,
     /// Consecutive short-EOF drops on the current track (mirrors
-    /// [`MAX_EOF_DROPS`]); reset on a natural end or a new track.
+    /// [`RECOVERY_ATTEMPTS`]); reset on a natural end or a new track.
     drop_streak: u32,
     /// The last frame count seen (stall detection needs deltas).
     last_seen_frames: u64,
@@ -731,7 +733,7 @@ impl Worker {
     /// stream and rebuilt — except when the *track itself* is that short
     /// (`duration_ms` says its real end was reached), which is a genuine EOF.
     ///
-    /// Rebuilds are bounded by [`MAX_EOF_DROPS`]: each drop on the same track
+    /// Rebuilds are bounded by [`RECOVERY_ATTEMPTS`]: each drop on the same track
     /// counts up and the track is given up on (skipped/stopped) once the
     /// streak passes, so a persistently-dead stream can't churn forever.
     fn track_ended(&mut self) {
@@ -754,9 +756,9 @@ impl Worker {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
             self.drop_streak += 1;
-            if self.drop_streak >= MAX_EOF_DROPS {
+            if self.drop_streak >= RECOVERY_ATTEMPTS {
                 liblog(format!(
-                    "engine: giving up on {uri} after {MAX_EOF_DROPS} consecutive failed EOFs"
+                    "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
                 ));
                 self.give_up_on(uri);
                 return;
@@ -798,7 +800,7 @@ impl Worker {
         }
         *self.queue_snapshot.lock().unwrap() = self.state.tracks.clone();
         liblog(format!(
-            "engine: giving up on {uri} after {MAX_EOF_DROPS} consecutive failed EOFs"
+            "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
         ));
         if self.state.tracks.is_empty() {
             self.stop_tail();
@@ -813,7 +815,7 @@ impl Worker {
 
     /// A watchdog stall or a failing decoder: re-resolve and restart from the
     /// current position, with the old 5–120 s backoff. Gives up (skips the
-    /// track) after [`RECOVER_ATTEMPTS`].
+    /// track) after [`RECOVERY_ATTEMPTS`].
     fn recover(&mut self) {
         let (uri, pos) = self.current_ident();
         if uri.is_empty() {
@@ -835,7 +837,7 @@ impl Worker {
         self.recovery = Some((uri.clone(), pos));
 
         let mut backoff = RETRY_MIN;
-        for attempt in 0..RECOVER_ATTEMPTS {
+        for attempt in 0..RECOVERY_ATTEMPTS {
             if attempt > 0 {
                 let _ = self.events.send(EngineEvent::Reconnecting);
             }
@@ -849,7 +851,7 @@ impl Worker {
                 }
                 Err(e) => {
                     liblog(format!("engine: recover {uri} attempt {attempt}: {e}"));
-                    if attempt + 1 >= RECOVER_ATTEMPTS {
+                    if attempt + 1 >= RECOVERY_ATTEMPTS {
                         break;
                     }
                     if let Some(pre) = self.interruptible_sleep(backoff) {

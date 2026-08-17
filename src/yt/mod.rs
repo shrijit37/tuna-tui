@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 /// hung network must never wedge a worker thread forever; the app's own
 /// radio/playback deadlines sit above this (see `RADIO_TIMEOUT_SECS`).
 const SOCKET_TIMEOUT_SECS: u32 = 10;
+/// Extra headroom added to [`SOCKET_TIMEOUT_SECS`] when sizing the process
+/// deadline: yt-dlp's own retry/internal handling can outlive one socket
+/// timeout by a few seconds, and a stalled worker must still give up.
+const DEADLINE_MARGIN_SECS: u32 = 5;
 
 /// One playable YouTube video: a search result, a playlist entry, or a resolved
 /// single video. Rows that cannot be played (no video id) are dropped by the
@@ -333,7 +337,8 @@ fn yt_stdout(base: &[&str], extra: &[&str]) -> Option<String> {
     let mut stderr = child.stderr.take();
     let stdout_reader = std::thread::spawn(move || drain(&mut stdout));
     let stderr_reader = std::thread::spawn(move || drain(&mut stderr));
-    let deadline = Instant::now() + Duration::from_secs(SOCKET_TIMEOUT_SECS as u64 + 5);
+    let deadline =
+        Instant::now() + Duration::from_secs((SOCKET_TIMEOUT_SECS + DEADLINE_MARGIN_SECS) as u64);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
