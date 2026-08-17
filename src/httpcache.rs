@@ -50,12 +50,29 @@ fn dir() -> Option<&'static Path> {
 /// the timeout is the shared policy — a stalled network must not wedge a
 /// worker thread forever. The `unwrap_or_default` fallback keeps the
 /// (unusual) builder failure from taking the whole fetch path down.
+///
+/// Building a blocking client creates — and drops — reqwest's own inner
+/// runtime, which tokio refuses to do inside a live runtime. The once-cell
+/// plus [`warm_blocking_client`] (called before the app's runtime starts)
+/// keeps every later use, engine and lyrics alike, on the ready client.
 #[cfg(feature = "streaming")]
-pub fn blocking_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default()
+static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+#[cfg(feature = "streaming")]
+pub fn blocking_client() -> &'static reqwest::blocking::Client {
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// Construct the blocking client eagerly, outside any tokio runtime.
+/// Idempotent: a later call from inside the runtime is a no-op.
+#[cfg(feature = "streaming")]
+pub fn warm_blocking_client() {
+    let _ = blocking_client();
 }
 
 /// Drop entries nobody has asked for in a month. Runs once, on the first cache

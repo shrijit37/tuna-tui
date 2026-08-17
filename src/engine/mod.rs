@@ -399,7 +399,9 @@ pub fn run(
         drop_streak: 0,
         last_seen_frames: 0,
         last_correction: Instant::now(),
-        client: http_client(),
+        // Cloning the once-built blocking client (Arc-fee) — constructed by
+        // `httpcache::warm_blocking_client` before the runtime started.
+        client: crate::httpcache::blocking_client().clone(),
         pending: None,
         recovery: None,
     };
@@ -416,11 +418,6 @@ pub fn run(
             queue: queue_snapshot,
         }),
     })
-}
-
-/// The shared blocking client (see `httpcache::blocking_client`).
-fn http_client() -> reqwest::blocking::Client {
-    crate::httpcache::blocking_client()
 }
 
 /// Poll for a stuck stream and ask the worker to rebuild it.

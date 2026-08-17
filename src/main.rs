@@ -126,6 +126,11 @@ fn run_player(
     picker: Picker,
     media_platform_ready: bool,
 ) -> Result<()> {
+    // Building reqwest's blocking client creates and drops its own inner
+    // runtime, which tokio refuses inside a live runtime — construct it here,
+    // before ours starts (see `httpcache::blocking_client`).
+    tuna_tui::httpcache::warm_blocking_client();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

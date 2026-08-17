@@ -25,7 +25,7 @@ pub fn fetch_lyrics_blocking(
     album: &str,
     duration_ms: u32,
 ) -> (Vec<(u32, String)>, bool) {
-    let client = CLIENT.get_or_init(crate::httpcache::blocking_client);
+    let client = CLIENT.get_or_init(|| crate::httpcache::blocking_client().clone());
     let url = format!(
         "https://lrclib.net/api/get?artist_name={}&track_name={}&album_name={}&duration={}",
         urlencode(artist),
