@@ -81,8 +81,8 @@ pub(crate) fn render_lyrics(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
         } else {
             theme.muted()
         };
-        let txt = if text.is_empty() {
-            "♪︎".to_string()
+        let txt: std::borrow::Cow<'_, str> = if text.is_empty() {
+            "♪︎".into()
         } else {
             truncate(text, max)
         };

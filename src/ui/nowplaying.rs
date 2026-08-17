@@ -127,20 +127,20 @@ pub(crate) fn render_now_strip(
     render_volume(f, app, out, theme, rows[0]);
 
     // Seek/progress bar (bottom row). Record bar geometry for click-to-seek.
+    // The labels are formatted once here and handed to render_progress — the
+    // bar width derives from their exact lengths so the duration sits flush
+    // against the right edge (aligned with the volume meter above it).
     let pos = app.playback.position_ms();
-    let left_len = format!("{} ", fmt_ms(pos)).chars().count() as u16;
-    let right_len = format!(
-        " {}",
-        fmt_ms(
-            app.playback
-                .now
-                .as_ref()
-                .map(|n| n.duration_ms)
-                .unwrap_or(0)
-        )
-    )
-    .chars()
-    .count() as u16;
+    let dur = app
+        .playback
+        .now
+        .as_ref()
+        .map(|n| n.duration_ms)
+        .unwrap_or(0);
+    let left = format!("{} ", fmt_ms(pos));
+    let right = format!(" {}", fmt_ms(dur));
+    let left_len = left.chars().count() as u16;
+    let right_len = right.chars().count() as u16;
     let bar_w = rows[1].width.saturating_sub(left_len + right_len);
     out.hits.bar = Some(Rect {
         x: rows[1].x + left_len,
@@ -148,18 +148,21 @@ pub(crate) fn render_now_strip(
         width: bar_w,
         height: 1,
     });
-    render_progress(f, app, theme, rows[1]);
+    render_progress(f, app, theme, rows[1], left, right);
 }
 
-pub(crate) fn render_progress(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
+pub(crate) fn render_progress(
+    f: &mut Frame,
+    app: &App,
+    theme: Theme,
+    area: Rect,
+    left: String,
+    right: String,
+) {
     let (pos, dur) = match &app.playback.now {
         Some(n) => (app.playback.position_ms(), n.duration_ms.max(1)),
         None => (0, 1),
     };
-    // Compute the bar width from the exact label lengths so the duration sits
-    // flush against the right edge (aligned with the volume meter above it).
-    let left = format!("{} ", fmt_ms(pos));
-    let right = format!(" {}", fmt_ms(dur));
     let reserve = left.chars().count() + right.chars().count();
     let bar_w = (area.width as usize).saturating_sub(reserve);
     let filled = ((pos as f32 / dur as f32) * bar_w as f32) as usize;
@@ -184,7 +187,7 @@ pub(crate) fn render_volume(
     theme: Theme,
     area: Rect,
 ) {
-    const VLEV: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    const VLEV: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     let filled = (app.transport.volume as usize * VLEV.len() + 50) / 100;
     let mut vspans: Vec<Span> = Vec::with_capacity(VLEV.len() + 1);
     for (i, ch) in VLEV.iter().enumerate() {
@@ -193,10 +196,7 @@ pub(crate) fn render_volume(
         } else {
             theme.border_dimmest
         };
-        vspans.push(Span::styled(
-            ch.to_string(),
-            Style::default().fg(color.into()),
-        ));
+        vspans.push(Span::styled(*ch, Style::default().fg(color.into())));
     }
     vspans.push(Span::styled(
         format!(" {:>3}%", app.transport.volume),

@@ -4,14 +4,18 @@
 //! unit-tested without a terminal, a network, or an audio device.
 
 use ratatui::layout::Rect;
+use std::borrow::Cow;
 use std::time::Duration;
 
 /// Truncate to `max` characters, replacing the tail with an ellipsis.
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+///
+/// Borrows the input when it already fits (the common render-row case — no
+/// allocation); only the cut path builds a string.
+pub fn truncate<'a>(s: &'a str, max: usize) -> Cow<'a, str> {
+    if s.chars().count() <= max {
+        Cow::Borrowed(s)
     } else {
-        s.to_string()
+        Cow::Owned(s.chars().take(max.saturating_sub(1)).collect::<String>() + "…")
     }
 }
 
