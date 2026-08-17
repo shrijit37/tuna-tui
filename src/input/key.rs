@@ -210,27 +210,7 @@ pub(crate) fn handle_key(
                 }
                 app.session.radio_in_flight = true;
                 app.status = "starting radio…".to_string();
-                let engine = app.svc.engine.clone();
-                let tx = chans.radio.clone();
-                tokio::spawn(async move {
-                    let res = match tokio::time::timeout(
-                        Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
-                        async move {
-                            tokio::task::spawn_blocking(move || engine.radio_tracks(&uri))
-                                .await
-                                .map_err(|e| e.to_string())?
-                        },
-                    )
-                    .await
-                    {
-                        Ok(r) => r.map_err(|e| e.to_string()),
-                        Err(_) => Err("timed out (radio endpoint unresponsive)".to_string()),
-                    };
-                    let _ = tx.send(res.map(|uris| Radio {
-                        uris,
-                        start_position_ms: 0,
-                    }));
-                });
+                crate::spawn_radio(app.svc.engine.clone(), uri, 0, chans.radio.clone());
             }
             Activated::None => {}
         },

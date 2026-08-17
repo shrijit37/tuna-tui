@@ -758,6 +758,37 @@ fn push_transport_modes(app: &mut App) {
     let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
 }
 
+/// Kick off one radio fetch: resolve the seed on a blocking thread under a
+/// deadline, and land the station (or the timeout error) on `tx`. The
+/// in-flight guard and status text are the caller's job — both the fresh
+/// radio key and the resume path share this exact shape.
+fn spawn_radio(
+    engine: Engine,
+    seed: String,
+    start_position_ms: u32,
+    tx: flume::Sender<Result<Radio, String>>,
+) {
+    tokio::spawn(async move {
+        let res = match tokio::time::timeout(
+            Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
+            async move {
+                tokio::task::spawn_blocking(move || engine.radio_tracks(&seed))
+                    .await
+                    .map_err(|e| e.to_string())?
+            },
+        )
+        .await
+        {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(_) => Err("timed out (radio endpoint unresponsive)".to_string()),
+        };
+        let _ = tx.send(res.map(|uris| Radio {
+            uris,
+            start_position_ms,
+        }));
+    });
+}
+
 /// Resume the persisted playback source at the last track/position — the
 /// faithful reboot resume (real context ⇒ real queue continuation).
 fn resume_source(app: &mut App, radio_tx: &flume::Sender<Result<Radio, String>>) {
@@ -786,32 +817,11 @@ fn resume_source(app: &mut App, radio_tx: &flume::Sender<Result<Radio, String>>)
             }
         }
         PlaySource::Radio(seed) => {
-            let engine = app.svc.engine.clone();
-            let tx = radio_tx.clone();
             // Same in-flight guard the Enter path uses: a resumed station must
             // not race a fresh radio request into the same drain.
             app.session.radio_in_flight = true;
             app.status = "resuming radio…".to_string();
-            tokio::spawn(async move {
-                let res = match tokio::time::timeout(
-                    Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
-                    async move {
-                        tokio::task::spawn_blocking(move || engine.radio_tracks(&seed))
-                            .await
-                            .map_err(|e| e.to_string())?
-                    },
-                )
-                .await
-                {
-                    Ok(r) => r.map_err(|e| e.to_string()),
-                    Err(_) => Err("timed out (radio endpoint unresponsive)".to_string()),
-                };
-
-                let _ = tx.send(res.map(|uris| Radio {
-                    uris,
-                    start_position_ms: pos,
-                }));
-            });
+            spawn_radio(app.svc.engine.clone(), seed, pos, radio_tx.clone());
         }
         PlaySource::Liked if !app.browse.library.liked.is_empty() => {
             let uris: Vec<String> = app
