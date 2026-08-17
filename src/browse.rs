@@ -13,7 +13,7 @@
 
 use crate::app::*;
 use tuna_tui::config;
-use tuna_tui::util::{channel_videos_url, playlist_uri, uri_parts};
+use tuna_tui::util::uri_parts;
 use tuna_tui::yt;
 
 /// Fetch the library incrementally: fast sections first, all local. The
@@ -157,14 +157,14 @@ pub(crate) fn fetch_detail_blocking(
         "playlist" => {
             append_or_hint(
                 &mut items,
-                playlist_rows(&playlist_uri(id)),
+                kind_rows(&yt::resolve_kind(kind, id, config::get().search_limit)),
                 "no tracks — empty or restricted",
             );
         }
         "channel" => {
             append_or_hint(
                 &mut items,
-                playlist_rows(&channel_videos_url(id)),
+                kind_rows(&yt::resolve_kind(kind, id, config::get().search_limit)),
                 "no uploads — empty or restricted",
             );
         }
@@ -172,7 +172,7 @@ pub(crate) fn fetch_detail_blocking(
             // YouTube has no first-class albums; the saved slug searches.
             append_or_hint(
                 &mut items,
-                yt::search(id, config::get().search_limit)
+                yt::resolve_kind(kind, id, config::get().search_limit)
                     .into_iter()
                     .map(|v| LibItem::track(v.title, v.artist, v.uri)),
                 "nothing loaded — search failed",
@@ -220,15 +220,13 @@ fn history_rows<'a>(
     rows.map(|h| LibItem::track(h.title.clone(), h.artist.clone(), h.uri.clone()))
 }
 
-/// The rows of a playlist / mix / channel-tab dump. Flat entries are
-/// title-only — split "Artist - Title (…)" so the list isn't long pasted
-/// strings.
-fn playlist_rows(url: &str) -> Vec<LibItem> {
-    yt::playlist_entries(url)
-        .into_iter()
+/// Playlist / channel rows in local style: flat entries are title-only —
+/// split "Artist - Title (…)" so the list isn't long pasted strings.
+fn kind_rows(rows: &[yt::YtVideo]) -> Vec<LibItem> {
+    rows.iter()
         .map(|v| {
             let (name, subtitle) = title_artist_split(&v.title);
-            LibItem::track(name, subtitle, v.uri)
+            LibItem::track(name, subtitle, v.uri.clone())
         })
         .collect()
 }

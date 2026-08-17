@@ -195,6 +195,20 @@ pub fn playlist_entries(url: &str) -> Vec<YtVideo> {
     entries(&root)
 }
 
+/// The contents of a context kind. One table owns the kind → resource
+/// mapping every layer consumes: playback expansion and the drill-in view
+/// used to re-implement it separately and drifted on the channel URL shape.
+/// `video` is absent on purpose — a single track's contents are itself, and
+/// both callers already pass it through.
+pub fn resolve_kind(kind: &str, id: &str, limit: usize) -> Vec<YtVideo> {
+    match kind {
+        "playlist" => playlist_entries(&crate::util::playlist_uri(id)),
+        "channel" => playlist_entries(&crate::util::channel_videos_url(id)),
+        "album" => search(id, limit),
+        _ => Vec::new(),
+    }
+}
+
 /// `Videos` rows from any playlist-shaped `-J` dump (`entries:` array).
 fn entries(root: &serde_json::Value) -> Vec<YtVideo> {
     root["entries"]

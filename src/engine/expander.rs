@@ -17,7 +17,7 @@
 //! conventions); live behavior is exercised by `examples/probe`.
 
 use crate::config;
-use crate::util::{channel_videos_url, playlist_uri, track_id_from_uri, uri_parts};
+use crate::util::{track_id_from_uri, uri_parts};
 use crate::yt;
 
 /// One resolved, playable track: the direct stream URL plus the metadata that
@@ -65,15 +65,13 @@ impl Expander for YtExpander {
         };
         let uris = match kind {
             "video" => vec![uri.to_string()],
-            "playlist" => entries_of(&playlist_uri(id))?,
-            // YouTube has no first-class albums; a search-backed expansion is
-            // the honest approximation (artist/album pages are a later phase).
-            "album" => yt::search(id, config::get().search_limit)
+            // Playlists / channels / albums all resolve through the one
+            // kind table in yt; YouTube has no first-class albums — a
+            // search-backed expansion is the honest approximation.
+            kind => yt::resolve_kind(kind, id, config::get().search_limit)
                 .into_iter()
                 .map(|v| v.uri)
                 .collect(),
-            "channel" => entries_of(&channel_videos_url(id))?,
-            _ => return Err(format!("unsupported yt kind: {kind}")),
         };
         if uris.is_empty() {
             return Err(format!("{uri} expanded to nothing"));
@@ -117,14 +115,6 @@ fn station_from(seed: &str, rows: Vec<yt::YtVideo>) -> Result<Vec<String>, Strin
         return Err(format!("radio station for {seed} came back empty"));
     }
     Ok(uris)
-}
-
-fn entries_of(url: &str) -> Result<Vec<String>, String> {
-    let rows = yt::playlist_entries(url);
-    if rows.is_empty() {
-        return Err(format!("{url} yielded no entries"));
-    }
-    Ok(rows.into_iter().map(|r| r.uri).collect())
 }
 
 impl From<yt::StreamInfo> for ResolvedTrack {
