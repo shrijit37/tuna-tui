@@ -435,6 +435,7 @@ async fn boot(
             last_click: None,
             radio_in_flight: false,
             meta_cache: std::collections::HashMap::new(),
+            meta_order: std::collections::VecDeque::new(),
         },
         store: saved.store.clone(),
         store_dirty: false,
