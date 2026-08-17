@@ -6,19 +6,15 @@
 //! same query. This is the `src/api/lyrics.rs` body, relocated into the library
 //! so it outlives the bin-side api layer.
 
-use std::time::Duration;
+use std::sync::OnceLock;
 
 use crate::util::urlencode;
 
-/// A blocking HTTP client with a timeout so a stalled network can't wedge a
-/// worker thread forever (mirrors the api layer's `http_client`, which died
-/// with the Spotify port; the engine keeps its own copy for cover fetches).
-fn http_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default()
-}
+/// One client for the whole process: lrclib fetches are rare (one per track
+/// change) but each used to build a fresh client — TLS setup + connection
+/// pool per request. `reqwest::blocking::Client` is `Send + Sync`, so a
+/// shared instance is sound across the worker threads.
+static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 
 /// Fetch lyrics for a track from lrclib. Returns `(lines, synced)`; synced
 /// lines carry timestamps, plain text has none. An empty first half means no
@@ -29,7 +25,7 @@ pub fn fetch_lyrics_blocking(
     album: &str,
     duration_ms: u32,
 ) -> (Vec<(u32, String)>, bool) {
-    let client = http_client();
+    let client = CLIENT.get_or_init(crate::httpcache::blocking_client);
     let url = format!(
         "https://lrclib.net/api/get?artist_name={}&track_name={}&album_name={}&duration={}",
         urlencode(artist),

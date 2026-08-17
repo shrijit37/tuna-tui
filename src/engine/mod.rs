@@ -423,13 +423,9 @@ pub fn run(
     })
 }
 
-/// A blocking client for cover fetches (the api layer's helper lives bin-side
-/// and dies with phase 3; httpcache keeps the disk cache shared).
+/// The shared blocking client (see `httpcache::blocking_client`).
 fn http_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default()
+    crate::httpcache::blocking_client()
 }
 
 /// Poll for a stuck stream and ask the worker to rebuild it.

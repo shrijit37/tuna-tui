@@ -44,6 +44,20 @@ fn dir() -> Option<&'static Path> {
     .as_deref()
 }
 
+/// One blocking HTTP client for all small fetches (cover art, lyrics, meta).
+///
+/// The engine and the lyrics fetcher used to each carry this exact builder;
+/// the timeout is the shared policy — a stalled network must not wedge a
+/// worker thread forever. The `unwrap_or_default` fallback keeps the
+/// (unusual) builder failure from taking the whole fetch path down.
+#[cfg(feature = "streaming")]
+pub fn blocking_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+}
+
 /// Drop entries nobody has asked for in a month. Runs once, on the first cache
 /// hit of the session.
 fn sweep(dir: &Path, keep: Duration) {
