@@ -698,3 +698,303 @@ impl SettingsState {
                     control: SettingControl::Toggle(self.debug_cache_stats),
                 },
                 SettingRow {
+                    id: "debug_lyrics",
+                    label: "Lyrics Timing Debug",
+                    description: "Log sync timestamp parsing, line matching, scroll position, drift correction.",
+                    control: SettingControl::Toggle(self.debug_lyrics_timing),
+                },
+                SettingRow {
+                    id: "debug_search",
+                    label: "Search Query Logging",
+                    description: "Log every search query, suggestion request, result count, and latency.",
+                    control: SettingControl::Toggle(self.debug_search_queries),
+                },
+                SettingRow {
+                    id: "debug_log_file",
+                    label: "Write Debug Log to File",
+                    description: "Persist all debug output to ~/.cache/tuna-tui/debug.log (rotates at 10MB).",
+                    control: SettingControl::Toggle(self.debug_log_file),
+                },
+                SettingRow {
+                    id: "debug_log_level",
+                    label: "Debug Log Verbosity",
+                    description: "0=Errors only, 1=Warnings, 2=Info, 3=Debug, 4=Trace (noisiest).",
+                    control: SettingControl::Number {
+                        val: self.debug_log_level as i64,
+                        min: 0,
+                        max: 4,
+                        step: 1,
+                        suffix: "",
+                    },
+                },
+                SettingRow {
+                    id: "sep_cache",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Cache Management  ━━━"),
+                },
+                SettingRow {
+                    id: "clear_cache",
+                    label: "Clear All Caches",
+                    description: "Purge cached lyrics, album artwork, and API responses from ~/.cache/tuna-tui/.",
+                    control: SettingControl::Action("Clear Now"),
+                },
+                SettingRow {
+                    id: "cache_size",
+                    label: "Cache Size Limit",
+                    description: "Maximum disk space for caches. Older entries evicted first.",
+                    control: SettingControl::Choice {
+                        current: 0,
+                        options: vec![
+                            "50 MB".into(),
+                            "100 MB".into(),
+                            "250 MB".into(),
+                            "500 MB".into(),
+                            "1 GB".into(),
+                            "Unlimited".into(),
+                        ],
+                    },
+                },
+                SettingRow {
+                    id: "sep_diag",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Diagnostics  ━━━"),
+                },
+                SettingRow {
+                    id: "export_config",
+                    label: "Export Config to Clipboard",
+                    description: "Copy current settings as TOML for backup or sharing.",
+                    control: SettingControl::Action("Copy TOML"),
+                },
+                SettingRow {
+                    id: "reset_defaults",
+                    label: "Reset All to Defaults",
+                    description: "Restore every setting to factory defaults (requires confirmation).",
+                    control: SettingControl::Action("Reset"),
+                },
+            ],
+        }
+    }
+
+    pub fn current_rows(&self) -> Vec<SettingRow> {
+        self.rows_for_tab(self.tab)
+    }
+
+    pub fn next_tab(&mut self) {
+        let idx = SettingsTab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
+        let next_idx = (idx + 1) % SettingsTab::ALL.len();
+        self.tab = SettingsTab::ALL[next_idx];
+        self.selected = 0;
+        self.status_msg = None;
+    }
+
+    pub fn prev_tab(&mut self) {
+        let idx = SettingsTab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
+        let prev_idx = if idx == 0 {
+            SettingsTab::ALL.len() - 1
+        } else {
+            idx - 1
+        };
+        self.tab = SettingsTab::ALL[prev_idx];
+        self.selected = 0;
+        self.status_msg = None;
+    }
+
+    fn next_selectable(&self, from: usize, forward: bool) -> Option<usize> {
+        let rows = self.current_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let len = rows.len();
+        let mut idx = from;
+        for _ in 0..len {
+            idx = if forward {
+                (idx + 1) % len
+            } else if idx == 0 {
+                len - 1
+            } else {
+                idx - 1
+            };
+            if !matches!(rows[idx].control, SettingControl::Separator(_)) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    pub fn next_row(&mut self) {
+        if let Some(idx) = self.next_selectable(self.selected, true) {
+            self.selected = idx;
+        }
+        self.status_msg = None;
+    }
+
+    pub fn prev_row(&mut self) {
+        if let Some(idx) = self.next_selectable(self.selected, false) {
+            self.selected = idx;
+        }
+        self.status_msg = None;
+    }
+
+    pub fn cycle_value(&mut self, forward: bool) -> Option<SettingsAction> {
+        self.dirty = true;
+        self.status_msg = None;
+        let rows = self.current_rows();
+        let row = rows.get(self.selected)?;
+        if matches!(row.control, SettingControl::Separator(_)) {
+            return None;
+        }
+
+        match row.id {
+            "fps" => {
+                let options = [30, 60, 120, 240, 1000];
+                let current_idx = match self.animation_fps {
+                    fps if fps <= 30 => 0,
+                    fps if fps <= 60 => 1,
+                    fps if fps <= 120 => 2,
+                    fps if fps <= 240 => 3,
+                    _ => 4,
+                };
+                let next_idx = if forward {
+                    (current_idx + 1) % options.len()
+                } else if current_idx == 0 {
+                    options.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                self.animation_fps = options[next_idx];
+            }
+            "theme" => {
+                let options = [
+                    "Adaptive",
+                    "Tokyo Night",
+                    "Catppuccin Mocha",
+                    "Gruvbox Dark",
+                    "Nord",
+                    "Rosé Pine",
+                    "Dracula",
+                    "Monokai",
+                    "Solarized Dark",
+                ];
+                let current_idx = match self.theme_name.to_lowercase().as_str() {
+                    "tokyo night" | "tokyonight" => 1,
+                    "catppuccin" | "catppuccin mocha" => 2,
+                    "gruvbox" | "gruvbox dark" => 3,
+                    "nord" => 4,
+                    "rosé pine" | "rose pine" => 5,
+                    "dracula" => 6,
+                    "monokai" => 7,
+                    "solarized" | "solarized dark" => 8,
+                    _ => 0,
+                };
+                let next_idx = if forward {
+                    (current_idx + 1) % options.len()
+                } else if current_idx == 0 {
+                    options.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                self.theme_name = options[next_idx].to_string();
+            }
+            "theme_fade" => {
+                if forward && self.theme_fade_speed < 3000 {
+                    self.theme_fade_speed += 100;
+                } else if !forward && self.theme_fade_speed > 200 {
+                    self.theme_fade_speed -= 100;
+                }
+            }
+            "viz_style" => {
+                let all = VisualizerStyle::ALL;
+                let current_idx = all.iter().position(|s| *s == self.visualizer_style).unwrap_or(0);
+                let next_idx = if forward {
+                    (current_idx + 1) % all.len()
+                } else if current_idx == 0 {
+                    all.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                self.visualizer_style = all[next_idx];
+            }
+            "viz_smoothing" => {
+                let all = VisualizerSmoothing::ALL;
+                let current_idx = all.iter().position(|s| *s == self.visualizer_smoothing).unwrap_or(1);
+                let next_idx = if forward {
+                    (current_idx + 1) % all.len()
+                } else if current_idx == 0 {
+                    all.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                self.visualizer_smoothing = all[next_idx];
+            }
+            "viz_bar_width" => {
+                if forward && self.visualizer_bar_width < 4 {
+                    self.visualizer_bar_width += 1;
+                } else if !forward && self.visualizer_bar_width > 1 {
+                    self.visualizer_bar_width -= 1;
+                }
+            }
+            "viz_colors" => {
+                let max = 5;
+                if forward && self.visualizer_color_scheme < max {
+                    self.visualizer_color_scheme += 1;
+                } else if !forward && self.visualizer_color_scheme > 0 {
+                    self.visualizer_color_scheme -= 1;
+                }
+            }
+            "progress_style" => {
+                let max = 4;
+                if forward && self.progress_bar_style < max {
+                    self.progress_bar_style += 1;
+                } else if !forward && self.progress_bar_style > 0 {
+                    self.progress_bar_style -= 1;
+                }
+            }
+            "protocol" => {
+                let options = [None, Some("kitty"), Some("sixel"), Some("iterm2"), Some("halfblocks")];
+                let current_idx = match self.protocol.as_deref() {
+                    Some("kitty") => 1,
+                    Some("sixel") => 2,
+                    Some("iterm2") => 3,
+                    Some("halfblocks") => 4,
+                    _ => 0,
+                };
+                let next_idx = if forward {
+                    (current_idx + 1) % options.len()
+                } else if current_idx == 0 {
+                    options.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                self.protocol = options[next_idx].map(String::from);
+            }
+            "zen" => self.zen_default = !self.zen_default,
+
+            // Playback
+            "audio_quality" => {
+                let all = AudioQuality::ALL;
+                let current_idx = all.iter().position(|q| *q == self.audio_quality).unwrap_or(0);
+                let next_idx = if forward {
+                    (current_idx + 1) % all.len()
+                } else if current_idx == 0 {
+                    all.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                self.audio_quality = all[next_idx];
+            }
+            "buffer_duration" => {
+                if forward && self.buffer_duration_secs < 15 {
+                    self.buffer_duration_secs += 1;
+                } else if !forward && self.buffer_duration_secs > 1 {
+                    self.buffer_duration_secs -= 1;
+                }
+            }
+            "crossfade" => self.crossfade_enabled = !self.crossfade_enabled,
+            "crossfade_duration" => {
+                if forward && self.crossfade_duration_ms < 10000 {
+                    self.crossfade_duration_ms += 250;
+                } else if !forward && self.crossfade_duration_ms > 500 {
+                    self.crossfade_duration_ms -= 250;
+                }
