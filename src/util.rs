@@ -5,7 +5,9 @@
 
 use ratatui::layout::Rect;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Truncate to `max` characters, replacing the tail with an ellipsis.
@@ -70,6 +72,52 @@ pub fn ensure_cache_dir_0700() -> Option<PathBuf> {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
     Some(dir)
+}
+
+/// A unique temp sibling for [`write_atomic`]. One process-wide counter feeds
+/// every writer, so two overlapping saves (the un-awaited periodic tick and
+/// the awaited quit save) can never share a scratch name and rename a torn
+/// temp into place.
+fn tmp_sibling(path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    path.with_extension(format!("{}.tmp", SEQ.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// Write `bytes` to `path` atomically: a uniquely-named temp sibling, fsync,
+/// then rename over the destination. Returns true when the rename landed; on
+/// any failure the temp is removed and false is returned — a torn write can
+/// never become the visible file.
+///
+/// The rename-over-existing fallback covers Windows, where the rename can
+/// fail over a destination that is open or otherwise locked: the destination
+/// is removed and the rename retried once. The fallback deletes the old file
+/// before the second rename, so a failure there leaves `path` absent — the
+/// state.json caller keeps `.bak` to cover the gap; on unix the first rename
+/// replaces in place and the fallback is effectively unreachable.
+///
+/// `pub` because the persistence caller lives in the binary crate; only the
+/// lib crate's own modules could see a `pub(crate)` item.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
+    let tmp = tmp_sibling(path);
+    if std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        })
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if std::fs::rename(&tmp, path).is_ok() {
+        return true;
+    }
+    // Windows: rename cannot replace an existing destination.
+    if std::fs::remove_file(path).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    false
 }
 
 /// Split any `scheme:kind:id` URI into its three parts. The port's `yt:`
@@ -205,5 +253,47 @@ mod tests {
             Some("dQw4w9WgXcQ".into())
         );
         assert_eq!(track_id_from_uri("yt:playlist:PLabc"), None); // not a video
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tuna-tui-util-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_destination_and_leaves_no_tmp() {
+        let dir = scratch("write-atomic");
+        let path = dir.join("state.json");
+        assert!(write_atomic(&path, b"one"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+        assert!(write_atomic(&path, b"two"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("state.json")]);
+    }
+
+    #[test]
+    fn write_atomic_fails_on_an_unwritable_path_without_creating_anything() {
+        let dir = std::env::temp_dir().join("tuna-tui-util-write-atomic-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.json"); // parent never exists
+        assert!(!write_atomic(&path, b"one"));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn tmp_sibling_names_are_unique_per_call() {
+        let dir = scratch("tmp-sibling");
+        let path = dir.join("state.json");
+        let one = tmp_sibling(&path);
+        let two = tmp_sibling(&path);
+        assert_ne!(one, two);
+        assert_eq!(one.parent(), two.parent());
+        assert!(one.file_name().unwrap().to_string_lossy().ends_with(".tmp"));
     }
 }
