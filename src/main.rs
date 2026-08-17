@@ -24,6 +24,7 @@ mod input;
 mod ui;
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -780,10 +781,18 @@ fn spawn_radio(
     tx: flume::Sender<Result<Radio, String>>,
 ) {
     tokio::spawn(async move {
+        // F13: per-request cancellation. The 20s timeout cannot cancel the
+        // spawn_blocking closure — without the flag a radio chain would keep
+        // spawning yt-dlp for ~40s after the UI gave up, and a slow-but-alive
+        // chain's late Ok could even fire zombie playback. The flag is
+        // created HERE, once per request: a shared/stale flag would cancel
+        // unrelated later requests.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let inner_cancel = cancel.clone();
         let res = match tokio::time::timeout(
             Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
             async move {
-                tokio::task::spawn_blocking(move || engine.radio_tracks(&seed))
+                tokio::task::spawn_blocking(move || engine.radio_tracks(&seed, inner_cancel))
                     .await
                     .map_err(|e| e.to_string())?
             },
@@ -791,7 +800,14 @@ fn spawn_radio(
         .await
         {
             Ok(r) => r.map_err(|e| e.to_string()),
-            Err(_) => Err("timed out (radio endpoint unresponsive)".to_string()),
+            Err(_) => {
+                // Tell the worker to kill its chain, THEN send the existing
+                // "timed out" error — the drain clears radio_in_flight exactly
+                // as today. Never short-circuit the send: radio_in_flight
+                // would stick true and block every later radio request.
+                cancel.store(true, Ordering::Relaxed);
+                Err("timed out (radio endpoint unresponsive)".to_string())
+            }
         };
         let _ = tx.send(res.map(|uris| Radio {
             uris,

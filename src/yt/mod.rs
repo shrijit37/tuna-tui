@@ -16,7 +16,23 @@
 
 use crate::config;
 use crate::liblog::liblog;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{Semaphore, SemaphorePermit};
+
+/// A cap on concurrent yt-dlp children (F17): every app surface (engine
+/// per-track resolve, search thread, drill-in thread, radio chains) funnels a
+/// fresh `Command` through `yt_stdout`, and each child is a new ~50–80MB
+/// Python with a ~300–500ms startup. Two permits let two surfaces overlap
+/// without stacking a herd. Contention beyond the budget FAILS OPEN (see
+/// [`wait_for_permit`]) — never a spurious failure, which the engine would
+/// read as a dropped stream and burn a recovery retry on.
+///
+/// `tokio::sync::Semaphore` rather than `std`: no `std::sync::Semaphore`
+/// exists on the toolchain this crate builds with (rustc 1.97.1); tokio's is
+/// already a dependency of the `streaming` feature that gates this module.
+static YTDLP_PERMIT: Semaphore = Semaphore::const_new(2);
 
 /// How long a single yt-dlp socket can stall before the process gives up. A
 /// hung network must never wedge a worker thread forever; the app's own
@@ -57,7 +73,10 @@ pub struct StreamInfo {
 /// flat mode uses only the search API's own metadata, no per-video resolution.
 pub fn search(query: &str, limit: usize) -> Vec<YtVideo> {
     let limit = limit.max(1);
-    let Some(root) = yt_json(&["--flat-playlist", &format!("ytsearch{limit}:{query}")]) else {
+    let Some(root) = yt_json(
+        &["--flat-playlist", &format!("ytsearch{limit}:{query}")],
+        None,
+    ) else {
         return Vec::new();
     };
     entries(&root)
@@ -68,7 +87,7 @@ pub fn search(query: &str, limit: usize) -> Vec<YtVideo> {
 /// inside a mix from expanding into its whole playlist.
 pub fn video_meta(url_or_id: &str) -> Option<YtVideo> {
     let url = crate::util::video_url(url_or_id)?;
-    let root = yt_json(&["--no-playlist", &url])?;
+    let root = yt_json(&["--no-playlist", &url], None)?;
     video_from(&root)
 }
 
@@ -86,14 +105,17 @@ pub fn resolve(url_or_id: &str) -> Option<StreamInfo> {
     } else {
         format!("{configured}/best")
     };
-    let root = yt_json(&[
-        "--no-playlist",
-        "-f",
-        &format,
-        &url,
-        "--extractor-args",
-        &format!("youtube:player_client={STREAM_PLAYER_CLIENT}"),
-    ])?;
+    let root = yt_json(
+        &[
+            "--no-playlist",
+            "-f",
+            &format,
+            &url,
+            "--extractor-args",
+            &format!("youtube:player_client={STREAM_PLAYER_CLIENT}"),
+        ],
+        None,
+    )?;
     let video = video_from(&root)?;
     let stream = pick_url(&root, &configured)?;
     Some(StreamInfo {
@@ -141,10 +163,20 @@ fn radio_candidates(id: &str) -> Vec<String> {
 /// single-video dump (zero entries), which used to read as a hard radio
 /// failure. The pseudo-radio resolves the seed for its title, searches that
 /// flat, and drops the seed itself from the results.
-pub fn radio_entries(id: &str) -> Vec<YtVideo> {
+pub fn radio_entries(id: &str, cancel: Arc<AtomicBool>) -> Vec<YtVideo> {
     let limit = RADIO_FETCH_LIMIT.to_string();
     for url in radio_candidates(id) {
-        if let Some(root) = yt_json(&["--flat-playlist", "--playlist-end", &limit, &url]) {
+        // F13: check between chain steps — a cancelled request must not start
+        // the next candidate's child. An empty result is the cancelled
+        // request's signature; the caller (spawn_radio's timeout) has already
+        // reported the failure and only the drain resets need this to arrive.
+        if cancel.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        if let Some(root) = yt_json(
+            &["--flat-playlist", "--playlist-end", &limit, &url],
+            Some(cancel.clone()),
+        ) {
             let rows = entries(&root);
             if !rows.is_empty() {
                 return rows;
@@ -152,7 +184,11 @@ pub fn radio_entries(id: &str) -> Vec<YtVideo> {
             liblog(format!("yt: {url} served no playlist rows"));
         }
     }
-    pseudo_radio(id)
+    // F13: the pseudo-radio leg (two more children) is cancelled too.
+    if cancel.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    pseudo_radio(id, cancel)
 }
 
 /// Last-resort station: search the seed's own title when no mix exists.
@@ -162,20 +198,30 @@ pub fn radio_entries(id: &str) -> Vec<YtVideo> {
 /// player-level bot-gated ("Sign in to confirm"), while `ytsearchN:` stays
 /// open — so the seed's metadata is fetched by searching the id itself, and
 /// the station is a flat search on that title.
-fn pseudo_radio(id: &str) -> Vec<YtVideo> {
-    let Some(seed) = yt_json(&["--flat-playlist", &format!("ytsearch1:{id}")])
-        .and_then(|root| entries(&root).into_iter().next())
-    else {
+fn pseudo_radio(id: &str, cancel: Arc<AtomicBool>) -> Vec<YtVideo> {
+    let Some(seed) = yt_json(
+        &["--flat-playlist", &format!("ytsearch1:{id}")],
+        Some(cancel.clone()),
+    )
+    .and_then(|root| entries(&root).into_iter().next()) else {
         return Vec::new();
     };
+    // F13: check between the two legs — the search-backed station is two
+    // children; a cancelled request skips the second.
+    if cancel.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let query = pseudo_radio_query(&seed.title, &seed.artist);
     if query.is_empty() {
         return Vec::new();
     }
-    let Some(root) = yt_json(&[
-        "--flat-playlist",
-        &format!("ytsearch{}:{query}", RADIO_FETCH_LIMIT),
-    ]) else {
+    let Some(root) = yt_json(
+        &[
+            "--flat-playlist",
+            &format!("ytsearch{}:{query}", RADIO_FETCH_LIMIT),
+        ],
+        Some(cancel),
+    ) else {
         return Vec::new();
     };
     entries(&root)
@@ -204,7 +250,7 @@ fn pseudo_radio_query(title: &str, artist: &str) -> String {
 /// the playlist API's own metadata (title, id, duration when present) without
 /// per-video resolution — the cheap `-J --flat-playlist` used for browsing.
 pub fn playlist_entries(url: &str) -> Vec<YtVideo> {
-    let Some(root) = yt_json(&["--flat-playlist", url]) else {
+    let Some(root) = yt_json(&["--flat-playlist", url], None) else {
         return Vec::new();
     };
     // A bare `watch?v=` URL with no `list=` yields a single-video dump with no
@@ -282,9 +328,28 @@ fn largest_thumbnail(v: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// Wait up to `deadline` for one of `p`'s permits, polling every 50ms.
+/// `None` means the budget is exhausted: the caller MUST fail open (spawn
+/// anyway and block for a permit) — a permit-shaped `None` must never surface
+/// as a request failure, because `yt_stdout`'s `None` is a dropped stream to
+/// the engine. In production `None` only appears under pathological
+/// contention, where the fail-open fallback degrades to today's unbounded
+/// behavior.
+fn wait_for_permit(p: &Semaphore, deadline: Instant) -> Option<SemaphorePermit<'_>> {
+    loop {
+        if let Ok(permit) = p.try_acquire() {
+            return Some(permit);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Run `yt-dlp … -J` and parse its dumped JSON.
-fn yt_json(extra: &[&str]) -> Option<serde_json::Value> {
-    yt_stdout(&["-J"], extra).and_then(|s| serde_json::from_str(&s).ok())
+fn yt_json(extra: &[&str], cancel: Option<Arc<AtomicBool>>) -> Option<serde_json::Value> {
+    yt_stdout(&["-J"], extra, cancel).and_then(|s| serde_json::from_str(&s).ok())
 }
 
 /// The stream leg is resolved with the `android` player client. On this box
@@ -351,9 +416,41 @@ fn pick_url<'a>(root: &'a serde_json::Value, configured: &str) -> Option<&'a str
 /// (for `try_wait`/`kill`, which need `&mut`) and joins the readers once the
 /// process is gone. Killing guarantees EOF on both pipes, so the joins always
 /// return.
-fn yt_stdout(base: &[&str], extra: &[&str]) -> Option<String> {
+fn yt_stdout(base: &[&str], extra: &[&str], cancel: Option<Arc<AtomicBool>>) -> Option<String> {
     let bin = config::get().ytdlp_path.clone();
-    let mut child = std::process::Command::new(&bin)
+    yt_stdout_with_bin(&bin, base, extra, cancel)
+}
+
+/// The [`yt_stdout`] core with the binary injected — the config read stays at
+/// the public boundary so tests can point the seam at a fake binary and run
+/// the cancellability (F13) and concurrency-cap (F17) paths fully offline.
+fn yt_stdout_with_bin(
+    bin: &str,
+    base: &[&str],
+    extra: &[&str],
+    cancel: Option<Arc<AtomicBool>>,
+) -> Option<String> {
+    // F17: the RAII permit is held across the child's WHOLE life — spawn
+    // through both drain joins — and drops on every early-return path below.
+    // The bounded wait shares the child's own deadline; when the budget is
+    // exhausted the wait fails OPEN (spawn anyway once a permit frees),
+    // degrading to today's behavior instead of manufacturing a resolve
+    // failure the engine would treat as a dropped stream.
+    let deadline =
+        Instant::now() + Duration::from_secs((SOCKET_TIMEOUT_SECS + DEADLINE_MARGIN_SECS) as u64);
+    let _permit = match wait_for_permit(&YTDLP_PERMIT, deadline) {
+        Some(permit) => permit,
+        None => {
+            liblog("yt: yt-dlp budget exhausted — waiting beyond deadline (fail-open)");
+            loop {
+                if let Ok(permit) = YTDLP_PERMIT.try_acquire() {
+                    break permit;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let mut child = std::process::Command::new(bin)
         .args([
             "--no-warnings",
             "--socket-timeout",
@@ -382,13 +479,19 @@ fn yt_stdout(base: &[&str], extra: &[&str]) -> Option<String> {
     let mut stderr = child.stderr.take();
     let stdout_reader = std::thread::spawn(move || drain(&mut stdout));
     let stderr_reader = std::thread::spawn(move || drain(&mut stderr));
-    let deadline =
-        Instant::now() + Duration::from_secs((SOCKET_TIMEOUT_SECS + DEADLINE_MARGIN_SECS) as u64);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(_) => return None,
+        }
+        // F13: a per-request cancel (spawn_radio's timeout Err branch sets it)
+        // kills the child on the next 50ms poll instead of letting a radio
+        // chain keep spawning Python for ~40s after the UI has given up.
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            liblog(format!("yt: {bin} killed on cancellation"));
+            let _ = child.kill();
+            break child.wait().ok()?;
         }
         if Instant::now() >= deadline {
             liblog(format!("yt: {bin} killed after exceeding its deadline"));
@@ -702,5 +805,92 @@ mod tests {
         assert!(info.url.starts_with("http"));
         assert_eq!(info.video.duration_ms.unwrap_or(0), 213_000);
         assert_eq!(info.video.artist, "Rick Astley");
+    }
+
+    /// Write an executable fake yt-dlp into `temp_dir()` (tests may write
+    /// temp files — the httpcache scratch pattern) and return its path.
+    /// `body` is the shell script the fake runs; `exec`-style bodies keep the
+    /// child's pipes from being held by grandchildren after a kill.
+    fn fake_bin(tag: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuna-yt-dlp-fake-{tag}-{}.sh", std::process::id()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// F13: a cancelled `yt_stdout` call kills its child on the next 50ms
+    /// poll — not at the 15s deadline — and returns `None`; without a cancel
+    /// the same child runs into the deadline and is killed there.
+    #[test]
+    fn yt_stdout_cancel_kills_a_slow_child() {
+        let path = fake_bin("sleep", "exec sleep 30");
+        let bin = path.to_string_lossy().into_owned();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_t = cancel.clone();
+        let bin_t = bin.clone();
+        let t0 = Instant::now();
+        let handle =
+            std::thread::spawn(move || yt_stdout_with_bin(&bin_t, &["-J"], &[], Some(cancel_t)));
+        std::thread::sleep(Duration::from_millis(200));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(handle.join().expect("worker thread").is_none());
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "cancel must kill the child fast, took {:?}",
+            t0.elapsed()
+        );
+
+        let t1 = Instant::now();
+        assert!(yt_stdout_with_bin(&bin, &["-J"], &[], None).is_none());
+        assert!(
+            t1.elapsed() >= Duration::from_secs(10),
+            "an uncancelled child must hit the 15s deadline, returned after {:?}",
+            t1.elapsed()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F17: the bounded wait gives up (`None`) when the budget is exhausted —
+    /// the call site fails open, it never becomes a failure — and acquires
+    /// instantly when a permit is free. A local semaphore keeps the global
+    /// `YTDLP_PERMIT` untouched (tests run in parallel).
+    #[test]
+    fn wait_for_permit_bounds_the_wait_and_acquires_instantly_when_free() {
+        let p = Semaphore::new(1);
+        let _hold = p.try_acquire().expect("fresh semaphore has a permit");
+        assert!(
+            wait_for_permit(&p, Instant::now() - Duration::from_secs(1)).is_none(),
+            "a passed deadline must give up, not block"
+        );
+        drop(_hold);
+        assert!(
+            wait_for_permit(&p, Instant::now() + Duration::from_secs(5)).is_some(),
+            "a free permit must be acquired instantly"
+        );
+    }
+
+    /// F17: two sequential calls through the real `yt_stdout` core (fake
+    /// binary, exits 0) both complete — each acquires and releases the global
+    /// permit.
+    #[test]
+    fn two_sequential_yt_stdout_calls_complete() {
+        let path = fake_bin("echo", "printf ok");
+        let bin = path.to_str().expect("temp path is utf-8");
+        assert_eq!(
+            yt_stdout_with_bin(bin, &["-J"], &[], None).as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            yt_stdout_with_bin(bin, &["-J"], &[], None).as_deref(),
+            Some("ok")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

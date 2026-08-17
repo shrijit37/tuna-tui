@@ -48,8 +48,10 @@ fn live_playlist_drill_in_roundtrip() {
 #[ignore = "hits YouTube via yt-dlp"]
 fn live_radio_roundtrip() {
     use tuna_tui::engine::Expander as _;
+    // Never-set flag: a live smoke test must not cancel itself.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let uris = tuna_tui::engine::YtExpander
-        .radio("yt:video:dQw4w9WgXcQ")
+        .radio("yt:video:dQw4w9WgXcQ", cancel)
         .expect("radio station");
     assert!(uris.len() >= 2, "seed + at least one similar track");
     assert_eq!(uris[0], "yt:video:dQw4w9WgXcQ");
