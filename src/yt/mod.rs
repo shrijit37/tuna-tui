@@ -80,22 +80,25 @@ pub fn resolve(url_or_id: &str) -> Option<StreamInfo> {
     Some(StreamInfo { url, video })
 }
 
-/// How many entries the radio fetch asks for. Coupled to the engine's
-/// `RADIO_LIMIT` (the station caps there anyway) and pinned to one or two
-/// inner-pages at most: un-capped, yt-dlp paginates the whole mix — hundreds
-/// of rows across 15+ sequential API pages, 20s+ even on a healthy network
-/// (measured 2026-08-16) — and the app's radio deadline fires for what is
-/// really a too-greedy fetch. `--playlist-end` at this cap costs ~4s per mix.
+/// How long a radio request may take before the app gives up. The station
+/// fetch is capped to one inner-page (~4s), so this only covers the rare
+/// fallback chain (mix-id variants + a search-built station) and genuine
+/// network stalls — 12s was shorter than an un-capped mix's pagination alone
+/// (20s+), which made healthy-but-large mixes read as endpoint timeouts.
+pub const RADIO_TIMEOUT_SECS: u64 = 20;
+
+/// How many entries the radio fetch asks for — the engine's station cap,
+/// clipped to one or two inner-pages at most: un-capped, yt-dlp paginates the
+/// whole mix — hundreds of rows across 15+ sequential API pages, 20s+ even on
+/// a healthy network (measured 2026-08-16) — and the app's radio deadline
+/// fires for what is really a too-greedy fetch. `--playlist-end` at this cap
+/// costs ~4s per mix. The clip below is `min(station cap, 40)` — it can never
+/// paginate past the engine's station slice, so no pin is needed.
 const RADIO_FETCH_LIMIT: usize = if crate::engine::RADIO_LIMIT < 40 {
     crate::engine::RADIO_LIMIT
 } else {
     40
 };
-// Compile-time pins of the coupling itself: the fetch cap must never exceed
-// the engine's station cap (else the mix fetch paginates back into the 20s+
-// crawl it exists to avoid) nor its own one-to-two-page ceiling.
-const _: () = assert!(RADIO_FETCH_LIMIT <= crate::engine::RADIO_LIMIT);
-const _: () = assert!(RADIO_FETCH_LIMIT <= 40);
 
 /// Candidate mix URLs for a seed video, in preference order: the canonical
 /// `RD<id>` mix, then its autoplay-video variant `RDAMVM<id>`. The id cannot

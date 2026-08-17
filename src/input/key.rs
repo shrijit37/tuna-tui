@@ -214,7 +214,7 @@ pub(crate) fn handle_key(
                 let tx = chans.radio.clone();
                 tokio::spawn(async move {
                     let res = match tokio::time::timeout(
-                        Duration::from_secs(crate::RADIO_TIMEOUT_SECS),
+                        Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
                         async move {
                             tokio::task::spawn_blocking(move || engine.radio_tracks(&uri))
                                 .await

@@ -433,13 +433,6 @@ struct Radio {
     uris: Vec<String>,
 }
 
-/// How long a radio request may take before the app gives up. The station
-/// fetch is capped to one inner-page (~4s), so this only covers the rare
-/// fallback chain (mix-id variants + a search-built station) and genuine
-/// network stalls — 12s was shorter than an un-capped mix's pagination alone
-/// (20s+), which made healthy-but-large mixes read as endpoint timeouts.
-pub(crate) const RADIO_TIMEOUT_SECS: u64 = 20;
-
 /// Every `Sender` the UI loop hands to input handlers and spawned fetches.
 /// Receivers stay local to `run_ui` because `select!` needs them there.
 ///
@@ -801,7 +794,7 @@ fn resume_source(app: &mut App, radio_tx: &flume::Sender<Result<Radio, String>>)
             app.status = "resuming radio…".to_string();
             tokio::spawn(async move {
                 let res = match tokio::time::timeout(
-                    Duration::from_secs(RADIO_TIMEOUT_SECS),
+                    Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
                     async move {
                         tokio::task::spawn_blocking(move || engine.radio_tracks(&seed))
                             .await
