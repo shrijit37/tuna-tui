@@ -8,6 +8,31 @@
 use crate::app::*;
 use tuna_tui::util::{uri_parts, uri_to_url};
 
+/// The shared context tail — Play, Open (with the arm's own label), Copy Link —
+/// appended by the channel, album, and playlist arms. The video arm's
+/// Queue/AddToPlaylist tail stays inline: a single helper can't produce both
+/// orders.
+fn push_context_tail(items: &mut Vec<ActionItem>, uri: &str, name: &str, open_label: &str) {
+    items.push(ActionItem {
+        label: "▶︎  Play".into(),
+        kind: ActionKind::Play {
+            uri: uri.into(),
+            name: name.into(),
+        },
+    });
+    items.push(ActionItem {
+        label: open_label.into(),
+        kind: ActionKind::Open {
+            uri: uri.into(),
+            name: name.into(),
+        },
+    });
+    items.push(ActionItem {
+        label: "⧉  Copy Link".into(),
+        kind: ActionKind::CopyLink { uri: uri.into() },
+    });
+}
+
 /// Build the context menu for `item`, reading saved/followed state from the
 /// local store. Instant — no spawn, no enrichment round-trip.
 pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
@@ -87,24 +112,7 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
                     name: item.name.clone(),
                 },
             });
-            items.push(ActionItem {
-                label: "▶︎  Play".into(),
-                kind: ActionKind::Play {
-                    uri: uri.clone(),
-                    name: item.name.clone(),
-                },
-            });
-            items.push(ActionItem {
-                label: "→  Open".into(),
-                kind: ActionKind::Open {
-                    uri: uri.clone(),
-                    name: item.name.clone(),
-                },
-            });
-            items.push(ActionItem {
-                label: "⧉  Copy Link".into(),
-                kind: ActionKind::CopyLink { uri },
-            });
+            push_context_tail(&mut items, &uri, &item.name, "→  Open");
         }
         "album" => {
             let saved = store.contains(StoreKind::Album, &uri);
@@ -120,24 +128,7 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
                     subtitle: item.subtitle.clone(),
                 },
             });
-            items.push(ActionItem {
-                label: "▶︎  Play".into(),
-                kind: ActionKind::Play {
-                    uri: uri.clone(),
-                    name: item.name.clone(),
-                },
-            });
-            items.push(ActionItem {
-                label: "→  Open Album".into(),
-                kind: ActionKind::Open {
-                    uri: uri.clone(),
-                    name: item.name.clone(),
-                },
-            });
-            items.push(ActionItem {
-                label: "⧉  Copy Link".into(),
-                kind: ActionKind::CopyLink { uri },
-            });
+            push_context_tail(&mut items, &uri, &item.name, "→  Open Album");
         }
         "playlist" => {
             let saved = store.contains(StoreKind::Playlist, &uri);
@@ -153,24 +144,7 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
                     subtitle: item.subtitle.clone(),
                 },
             });
-            items.push(ActionItem {
-                label: "▶︎  Play".into(),
-                kind: ActionKind::Play {
-                    uri: uri.clone(),
-                    name: item.name.clone(),
-                },
-            });
-            items.push(ActionItem {
-                label: "→  Open".into(),
-                kind: ActionKind::Open {
-                    uri: uri.clone(),
-                    name: item.name.clone(),
-                },
-            });
-            items.push(ActionItem {
-                label: "⧉  Copy Link".into(),
-                kind: ActionKind::CopyLink { uri },
-            });
+            push_context_tail(&mut items, &uri, &item.name, "→  Open");
         }
         _ => {
             items.push(ActionItem {
@@ -196,6 +170,36 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
     }
 }
 
+/// Each store kind's lib-toggle status pair: (added, removed). One body serves
+/// all four toggle arms; only the wording differs per kind.
+fn toggle_msg(kind: StoreKind) -> (&'static str, &'static str) {
+    match kind {
+        StoreKind::Liked => (
+            "added to Liked \u{2665} (press r to refresh)",
+            "removed from Liked",
+        ),
+        StoreKind::Artist => ("following", "unfollowed"),
+        StoreKind::Album => ("saved album", "removed album"),
+        StoreKind::Playlist => ("added to library", "removed from library"),
+    }
+}
+
+/// Toggle `uri` in the given store kind and return its status message.
+fn apply_toggle(
+    app: &mut App,
+    kind: StoreKind,
+    uri: String,
+    name: String,
+    subtitle: String,
+) -> String {
+    let (added, removed) = toggle_msg(kind);
+    if app.store.toggle(kind, name, subtitle, uri) {
+        added.into()
+    } else {
+        removed.into()
+    }
+}
+
 /// Activate one menu entry against the app. Returns the status-line message.
 /// All effects are local — there is no "spawn and await a server".
 pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
@@ -204,13 +208,7 @@ pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
             uri,
             name,
             subtitle,
-        } => {
-            if app.store.toggle(StoreKind::Liked, name, subtitle, uri) {
-                "added to Liked \u{2665} (press r to refresh)".into()
-            } else {
-                "removed from Liked".into()
-            }
-        }
+        } => apply_toggle(app, StoreKind::Liked, uri, name, subtitle),
         ActionKind::Queue { uri } => {
             // The local queue: the engine's list is the authority, and the
             // transport mirrors it for the view. Dedupe so repeat presses
@@ -244,37 +242,18 @@ pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
             }
         }
         ActionKind::ToggleFollowArtist { uri, name } => {
-            if app
-                .store
-                .toggle(StoreKind::Artist, name, String::new(), uri)
-            {
-                "following".into()
-            } else {
-                "unfollowed".into()
-            }
+            apply_toggle(app, StoreKind::Artist, uri, name, String::new())
         }
         ActionKind::ToggleSaveAlbum {
             uri,
             name,
             subtitle,
-        } => {
-            if app.store.toggle(StoreKind::Album, name, subtitle, uri) {
-                "saved album".into()
-            } else {
-                "removed album".into()
-            }
-        }
+        } => apply_toggle(app, StoreKind::Album, uri, name, subtitle),
         ActionKind::FollowPlaylist {
             uri,
             name,
             subtitle,
-        } => {
-            if app.store.toggle(StoreKind::Playlist, name, subtitle, uri) {
-                "added to library".into()
-            } else {
-                "removed from library".into()
-            }
-        }
+        } => apply_toggle(app, StoreKind::Playlist, uri, name, subtitle),
         _ => String::new(),
     }
 }
