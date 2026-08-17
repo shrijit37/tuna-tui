@@ -263,6 +263,39 @@ pub fn playlist_entries(url: &str) -> Vec<YtVideo> {
     entries(&root)
 }
 
+/// How many rows the drill-in view may paginate for a playlist or channel
+/// page (F14). Playlists run hundreds of rows deep; the view is a browser,
+/// not the play queue — 200 rows is a generous screenful at one inner-page
+/// cost. Deliberately NOT applied to `resolve_kind` or the expand path: the
+/// PLAY queue (expander.rs:71) must stay whole (bead Myx-a4.8).
+pub const DRILLIN_FETCH_LIMIT: usize = 200;
+
+/// The `--playlist-end` value for a capped flat-extraction. Owned string: the
+/// args array must outlive the call. Pinned by a unit test so the cap never
+/// drifts from the argument the CLI actually receives.
+fn playlist_end_arg(limit: usize) -> String {
+    limit.to_string()
+}
+
+/// The entries of a playlist or channel tab, flat-extracted and capped to
+/// `limit` rows (F14). Same shape as [`playlist_entries`] plus
+/// `--playlist-end`, mirroring `radio_entries`'s station cap: the drill-in
+/// view must not paginate a whole multi-hundred-row playlist or channel.
+pub fn playlist_entries_capped(url: &str, limit: usize) -> Vec<YtVideo> {
+    let limit = playlist_end_arg(limit);
+    let Some(root) = yt_json(&["--flat-playlist", "--playlist-end", &limit, url], None) else {
+        return Vec::new();
+    };
+    // A bare `watch?v=` URL with no `list=` yields a single-video dump with no
+    // `entries`, which would otherwise read as an empty playlist. Say so
+    // rather than vanishing silently (the caller can't tell the difference).
+    if root["entries"].is_null() {
+        liblog(format!("yt: {url} is not a playlist dump; no entries"));
+        return Vec::new();
+    }
+    entries(&root)
+}
+
 /// The contents of a context kind. One table owns the kind → resource
 /// mapping every layer consumes: playback expansion and the drill-in view
 /// used to re-implement it separately and drifted on the channel URL shape.
@@ -892,5 +925,14 @@ mod tests {
             Some("ok")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// F14: the drill-in cap constant and the CLI arg it produces stay pinned
+    /// — a regression here silently un-caps the drill-in pagination.
+    #[test]
+    fn drillin_cap_is_200_and_arg_formats_for_the_cli() {
+        assert_eq!(DRILLIN_FETCH_LIMIT, 200);
+        assert_eq!(playlist_end_arg(DRILLIN_FETCH_LIMIT), "200");
+        assert_eq!(playlist_end_arg(30), "30");
     }
 }

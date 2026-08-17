@@ -155,16 +155,27 @@ pub(crate) fn fetch_detail_blocking(
             );
         }
         "playlist" => {
+            // Capped (F14): the drill-in view must not paginate a whole
+            // multi-hundred-row playlist. Deliberately NOT `search_limit`
+            // (defaults to 6 — would truncate a 30-track playlist with no
+            // hint) and NOT `resolve_kind`: that table feeds the PLAY path,
+            // which must stay un-capped (bead Myx-a4.8).
             append_or_hint(
                 &mut items,
-                kind_rows(&yt::resolve_kind(kind, id, config::get().search_limit)),
+                kind_rows(&yt::playlist_entries_capped(
+                    &tuna_tui::util::playlist_uri(id),
+                    yt::DRILLIN_FETCH_LIMIT,
+                )),
                 "no tracks — empty or restricted",
             );
         }
         "channel" => {
             append_or_hint(
                 &mut items,
-                kind_rows(&yt::resolve_kind(kind, id, config::get().search_limit)),
+                kind_rows(&yt::playlist_entries_capped(
+                    &tuna_tui::util::channel_videos_url(id),
+                    yt::DRILLIN_FETCH_LIMIT,
+                )),
                 "no uploads — empty or restricted",
             );
         }
