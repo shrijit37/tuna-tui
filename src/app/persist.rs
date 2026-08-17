@@ -218,12 +218,13 @@ impl SavedState {
             .unwrap_or_default()
     }
     pub(crate) fn save(&self) {
-        let Some(path) = Self::path() else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
+        // The dir is created (0700) by the shared helper — same one-time cost
+        // as the old create_dir_all, strictly more private on unix.
+        let Some(dir) = tuna_tui::util::ensure_cache_dir_0700() else {
+            return;
+        };
         if let Ok(json) = serde_json::to_string(self) {
-            let _ = std::fs::write(path, json);
+            let _ = std::fs::write(dir.join("state.json"), json);
         }
     }
 }

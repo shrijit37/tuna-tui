@@ -31,7 +31,9 @@ fn path_in(dir: &Path, url: &str) -> PathBuf {
 fn dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = crate::home_dir()?.join(".cache/tuna-tui/api");
+        // The parent goes through the shared 0700 helper (its own dir gets the
+        // same treatment below — the cache is per-user by construction).
+        let dir = crate::util::ensure_cache_dir_0700()?.join("api");
         fs::create_dir_all(&dir).ok()?;
         #[cfg(unix)]
         {

@@ -46,17 +46,10 @@ pub fn liblog(msg: impl AsRef<str>) {
     if std::env::var_os("TUNA_LOG").is_none() {
         return;
     }
-    let Some(home) = crate::home_dir() else {
+    let Some(dir) = crate::util::ensure_cache_dir_0700() else {
         return;
     };
-    let dir = home.join(".cache/tuna-tui");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
-    }
+    let dir = dir.as_path();
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]

@@ -5,6 +5,7 @@
 
 use ratatui::layout::Rect;
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Truncate to `max` characters, replacing the tail with an ellipsis.
@@ -47,6 +48,28 @@ pub fn center_v(area: Rect, height: u16) -> Rect {
         width: area.width,
         height: height.min(area.height),
     }
+}
+
+/// The app's cache directory (`~/.cache/tuna-tui`). Pure join — never creates:
+/// callers that need the dir on disk go through [`ensure_cache_dir_0700`]. Sites
+/// that can run before `config::migrate_legacy_paths()` must not create it
+/// eagerly, or the one-time legacy `.cache/myx` move could race a fresh tree.
+pub fn cache_dir() -> Option<PathBuf> {
+    crate::home_dir().map(|h| h.join(".cache/tuna-tui"))
+}
+
+/// Create the cache dir (mode 0700 on unix — idempotent) and return it. Only
+/// allowed from sites that are already past `migrate_legacy_paths()`: liblog,
+/// the single-instance lock, the http cache, and state.json persistence.
+pub fn ensure_cache_dir_0700() -> Option<PathBuf> {
+    let dir = cache_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
 }
 
 /// Split any `scheme:kind:id` URI into its three parts. The port's `yt:`
