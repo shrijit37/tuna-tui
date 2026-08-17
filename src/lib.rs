@@ -10,11 +10,13 @@ use std::path::PathBuf;
 pub mod anim;
 pub mod color;
 pub mod components;
+#[cfg(feature = "streaming")]
 pub mod cover;
 pub mod gradient;
 pub mod httpcache;
 pub mod liblog;
 pub mod lyrics;
+#[cfg(feature = "streaming")]
 pub mod reactive;
 pub mod theme;
 pub mod util;
