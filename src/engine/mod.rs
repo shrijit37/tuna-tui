@@ -285,6 +285,13 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// The length of the loaded list — the clone-free gate for the sync tick's
+    /// queue refresh (`refresh_needed` in the binary): a length change is
+    /// exactly when the Queue view's labels need re-formatting.
+    pub fn queue_len(&self) -> usize {
+        self.inner.queue.lock().map(|q| q.len()).unwrap_or_default()
+    }
+
     fn send(&self, cmd: Cmd) -> Result<()> {
         self.inner
             .cmds

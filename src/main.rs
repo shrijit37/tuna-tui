@@ -427,6 +427,8 @@ async fn boot(
             meta_cache: std::collections::HashMap::new(),
         },
         store: saved.store.clone(),
+        store_dirty: false,
+        queue_dirty: false,
         art_repaint: ArtRepaint::Idle,
     };
 
@@ -450,6 +452,18 @@ struct UiChannels {
     lyrics: flume::Sender<(Vec<(u32, String)>, bool)>,
     detail: flume::Sender<(String, String, Vec<LibItem>)>,
     radio: flume::Sender<Result<Radio, String>>,
+}
+
+/// Should the 24s sync tick re-run `refresh_local_queue`?
+///
+/// The refresh is the only mechanism that upgrades raw-URI queue rows to
+/// "title — artist" as `EngineMeta` lands one track at a time, and the only
+/// re-sync after recovery-removal and resume-restore — so it must run when
+/// the engine queue or the metadata cache changed length. The `usize::MAX`
+/// sentinel makes the first tick after launch always refresh (covering the
+/// resume-restore path, where the lengths can already be in steady state).
+fn refresh_needed(qlen: usize, mlen: usize, last_q: usize, last_m: usize) -> bool {
+    qlen != last_q || mlen != last_m
 }
 
 async fn run_ui(
@@ -517,6 +531,12 @@ async fn run_ui(
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_draw = Instant::now() - IDLE_REDRAW;
     let mut last_sync = Instant::now();
+    // Last observed engine-queue / metadata-cache lengths for the sync tick's
+    // refresh gate. The `usize::MAX` sentinel forces a refresh on the first
+    // tick after launch — the resume-restore path needs it even when the
+    // lengths are already in steady state.
+    let mut last_queue_len = usize::MAX;
+    let mut last_meta_len = usize::MAX;
     // Nothing is on screen yet, so the first tick must draw.
     let mut dirty = true;
     let mut last_layout = (app.view.mode, app.view.zen);
@@ -631,15 +651,39 @@ async fn run_ui(
                 }
                 if last_sync.elapsed() >= SYNC_EVERY {
                     last_sync = Instant::now();
+                    let qlen = app.svc.engine.queue_len();
+                    let mlen = app.session.meta_cache.len();
                     // Refresh the local queue from the engine while playing so
                     // the snapshot stays current, then persist it (survives
                     // reboot). The write runs on a blocking thread — serializing
                     // the store + fs-write must not freeze the render loop.
-                    if app.transport.playback_started {
+                    //
+                    // The refresh is gated on the queue / metadata-cache
+                    // lengths changing: it re-formats every label, so at idle
+                    // (nothing landing, no recovery-removal) it would only
+                    // re-clone and re-format the same rows every 24s. `refresh_needed`
+                    // fires on every metadata landing (label upgrade) and on
+                    // recovery-removal (the engine snapshot shrinks).
+                    if app.transport.playback_started
+                        && refresh_needed(qlen, mlen, last_queue_len, last_meta_len)
+                    {
                         app.refresh_local_queue();
                     }
-                    let snapshot = save_state(&app);
-                    tokio::task::spawn_blocking(move || snapshot.save());
+                    last_queue_len = qlen;
+                    last_meta_len = mlen;
+                    // Dirty gate for the save: at idle the snapshot only
+                    // changes while playing (position ticks) — and a playing
+                    // transport keeps the save cadence on its own. Store
+                    // mutations flag `store_dirty`; queue appends flag
+                    // `queue_dirty`. When both are clean and playback is
+                    // idle, skip the full-store clone + serialize + write.
+                    let transport_dirty = app.transport.playback_started || app.queue_dirty;
+                    if app.store_dirty || transport_dirty {
+                        app.store_dirty = false;
+                        app.queue_dirty = false;
+                        let snapshot = save_state(&app);
+                        tokio::task::spawn_blocking(move || snapshot.save());
+                    }
                 }
                 false
             }
