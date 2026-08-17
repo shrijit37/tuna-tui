@@ -934,16 +934,23 @@ impl Worker {
         }
     }
 
-    /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
-    /// when `play` is false, announce Paused and keep the mixer suspended (a
-    /// recovery rebuilding a track the user had paused must not force-play it).
-    fn build_stream(&mut self, uri: &str, pos: u32, play: bool) -> Result<()> {
-        let resolved = self.expander.resolve(uri).map_err(|e| anyhow!(e))?;
-        let url = resolved.url.clone();
+    /// Restart the decoder on `url` at whole-second `pos` — the shared mid-
+    /// section of `build_stream` (fresh track) and `seek_now` (seek on the
+    /// current stream). `play` says whether the new stream should be audible,
+    /// not the engine's playback state: callers own `state.playing` (a seek on
+    /// a paused track stays paused; a recovery rebuild keeps its saved state).
+    fn restart_stream(
+        &mut self,
+        url: &str,
+        uri: &str,
+        duration_ms: Option<u32>,
+        pos: u32,
+        play: bool,
+    ) -> Result<()> {
         // `-ss` seeks on whole seconds; anchor the playhead at the truncated
         // position so the extrapolation doesn't run ahead of the decoder.
         let pos = pos / 1000 * 1000;
-        let (child, stdout) = spawn_ffmpeg(&url, pos)?;
+        let (child, stdout) = spawn_ffmpeg(url, pos)?;
         let frames = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let source = FfmpegSource::new(
@@ -960,19 +967,29 @@ impl Worker {
         }
         self.current = Some(CurrentTrack {
             uri: uri.to_string(),
-            url,
+            url: url.to_string(),
             position_ms: pos,
-            duration_ms: resolved.duration_ms,
+            duration_ms,
             child,
             done,
             frames,
             cancelled,
         });
         self.last_seen_frames = 0;
-        self.state.playing = play;
         self.set_health(play);
         self.set_active(play);
         self.last_correction = Instant::now();
+        Ok(())
+    }
+
+    /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
+    /// when `play` is false, announce Paused and keep the mixer suspended (a
+    /// recovery rebuilding a track the user had paused must not force-play it).
+    fn build_stream(&mut self, uri: &str, pos: u32, play: bool) -> Result<()> {
+        let resolved = self.expander.resolve(uri).map_err(|e| anyhow!(e))?;
+        let url = resolved.url.clone();
+        self.restart_stream(&url, uri, resolved.duration_ms, pos, play)?;
+        self.state.playing = play;
         let _ = self.events.send(if play {
             EngineEvent::Playing {
                 uri: uri.to_string(),
@@ -1014,38 +1031,14 @@ impl Worker {
         cur.cancelled.store(true, Ordering::Relaxed);
         let _ = cur.child.kill();
         let _ = cur.child.wait();
-        // Same whole-second anchor as `build_stream` uses.
+        // Same whole-second anchor restart_stream applies; needed here for the
+        // correction event and the recovery fallback.
         let pos = pos / 1000 * 1000;
-        match spawn_ffmpeg(&url, pos) {
-            Ok((child, stdout)) => {
-                let frames = Arc::new(AtomicU64::new(0));
-                let cancelled = Arc::new(AtomicBool::new(false));
-                let source = FfmpegSource::new(
-                    stdout,
-                    Arc::clone(&frames),
-                    Arc::clone(&self.bands),
-                    Arc::clone(&cancelled),
-                );
-                let done = self.queue.append_with_signal(source);
-                self.current = Some(CurrentTrack {
-                    uri: uri.clone(),
-                    url,
-                    position_ms: pos,
-                    duration_ms: cur.duration_ms,
-                    child,
-                    done,
-                    frames,
-                    cancelled,
-                });
+        match self.restart_stream(&url, &uri, cur.duration_ms, pos, self.state.playing) {
+            Ok(()) => {
+                // A fresh decoder starts with a clean slate (build_stream's
+                // callers reset the streak before starting a new track).
                 self.drop_streak = 0;
-                self.last_seen_frames = 0;
-                // Keep the paused state a seek performed while paused.
-                self.set_health(self.state.playing);
-                self.set_active(self.state.playing);
-                self.last_correction = Instant::now();
-                if self.state.playing {
-                    self.player.play();
-                }
                 let _ = self.events.send(EngineEvent::PositionCorrection {
                     uri,
                     position_ms: pos,
