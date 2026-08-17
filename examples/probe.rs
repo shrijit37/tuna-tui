@@ -54,7 +54,6 @@ fn main() -> anyhow::Result<()> {
                 EngineEvent::Paused { uri, position_ms } => {
                     println!("⏸ paused    {uri} @ {position_ms}ms")
                 }
-                EngineEvent::EndOfTrack { uri } => println!("⏹ end       {uri}"),
                 EngineEvent::Stopped => println!("⏹ stopped"),
                 EngineEvent::Reconnecting => println!("⟳ stream lost, reconnecting"),
                 EngineEvent::Reconnected => println!("⟳ reconnected"),

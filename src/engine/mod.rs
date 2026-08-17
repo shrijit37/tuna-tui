@@ -55,9 +55,6 @@ pub enum EngineEvent {
     Reconnecting,
     /// Playback control works again; the stream was restarted from its position.
     Reconnected,
-    EndOfTrack {
-        uri: String,
-    },
     PositionCorrection {
         uri: String,
         position_ms: u32,
@@ -733,22 +730,18 @@ impl Worker {
             Some(idx) => self.start_track_at(idx, 0),
             None => {
                 // Queue over, repeat off: stop cleanly, like the old endpoint.
-                let uri = self.current_ident().0;
                 self.shutdown_current();
                 self.state.playing = false;
                 self.set_health(false);
                 self.set_active(false);
                 self.reset_bands();
-                if !uri.is_empty() {
-                    let _ = self.events.send(EngineEvent::EndOfTrack { uri });
-                }
                 let _ = self.events.send(EngineEvent::Stopped);
             }
         }
     }
 
-    /// The natural end of the current track (EOF): emit EndOfTrack and move
-    /// on; if the process died instead of ending, rebuild the stream.
+    /// The natural end of the current track (EOF): advance the queue; if the
+    /// process died instead of ending, rebuild the stream.
     ///
     /// A dropped stream is *not* an end of track: YouTube's transport (and
     /// this box's Wi-Fi, verified 2026-08-16) closes the connection mid-song,
@@ -801,7 +794,6 @@ impl Worker {
         }
         self.drop_streak = 0;
         drop(cur);
-        let _ = self.events.send(EngineEvent::EndOfTrack { uri });
         self.advance();
     }
 
@@ -830,13 +822,13 @@ impl Worker {
             "engine: giving up on {uri} after {MAX_EOF_DROPS} consecutive failed EOFs"
         ));
         if self.state.tracks.is_empty() {
-            self.give_up_stop(uri);
+            self.give_up_stop();
         } else if dead < self.state.tracks.len() {
             self.start_track_at(dead, 0);
         } else if self.state.repeat {
             self.start_track_at(0, 0);
         } else {
-            self.give_up_stop(uri);
+            self.give_up_stop();
         }
     }
 
@@ -899,12 +891,11 @@ impl Worker {
     /// The queue is empty after a give-up: stop cleanly (EndOfTrack + Stopped)
     /// instead of leaving `playing=true` with nothing current — a state no
     /// command could escape.
-    fn give_up_stop(&mut self, uri: String) {
+    fn give_up_stop(&mut self) {
         self.state.playing = false;
         self.set_health(false);
         self.set_active(false);
         self.reset_bands();
-        let _ = self.events.send(EngineEvent::EndOfTrack { uri });
         let _ = self.events.send(EngineEvent::Stopped);
     }
 

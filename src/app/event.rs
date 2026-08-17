@@ -89,7 +89,6 @@ pub(crate) fn handle_engine_event(app: &mut App, ev: EngineEvent) {
                 "reconnected".to_string()
             };
         }
-        EngineEvent::EndOfTrack { .. } => {}
     }
 }
 
