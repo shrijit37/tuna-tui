@@ -238,15 +238,14 @@ pub(crate) fn render_library(
             } else {
                 ("\u{258F}", theme.border_dimmest) // 1/8 block - track
             };
-            f.render_widget(
-                Paragraph::new(Span::styled(glyph, Style::default().fg(color.into()))),
-                Rect {
-                    x: sb_x,
-                    y,
-                    width: 1,
-                    height: 1,
-                },
-            );
+            // Direct cell writes — a 1x1 Paragraph per cell is pure overhead
+            // (sibling progress/visualizer renders do the same). set_fg only:
+            // the old Paragraph patched just fg, and partial-block glyphs show
+            // bg through, so set_bg would change the look.
+            if let Some(cell) = f.buffer_mut().cell_mut((sb_x, y)) {
+                cell.set_symbol(glyph);
+                cell.set_fg(color.into());
+            }
         }
         out.hits.scroll = Some(Rect {
             x: sb_x,
