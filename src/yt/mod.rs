@@ -16,7 +16,6 @@
 
 use crate::config;
 use crate::liblog::liblog;
-use crate::util::track_id_from_uri;
 use std::time::{Duration, Instant};
 
 /// How long a single yt-dlp socket can stall before the process gives up. A
@@ -64,7 +63,7 @@ pub fn search(query: &str, limit: usize) -> Vec<YtVideo> {
 /// `youtube.com/watch?v=` URL. `--no-playlist` keeps a video that happens to be
 /// inside a mix from expanding into its whole playlist.
 pub fn video_meta(url_or_id: &str) -> Option<YtVideo> {
-    let url = watch_url(url_or_id)?;
+    let url = crate::util::video_url(url_or_id)?;
     let root = yt_json(&["--no-playlist", &url])?;
     video_from(&root)
 }
@@ -240,22 +239,6 @@ fn largest_thumbnail(v: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Normalize a video id / `yt:video:` uri / watch URL to a watch URL.
-fn watch_url(url_or_id: &str) -> Option<String> {
-    if url_or_id.starts_with("http://") || url_or_id.starts_with("https://") {
-        return Some(url_or_id.to_string());
-    }
-    if let Some(id) = track_id_from_uri(url_or_id) {
-        return Some(format!("https://www.youtube.com/watch?v={id}"));
-    }
-    // A bare id — but only a bare one: a `yt:playlist:` or other non-video uri
-    // must not masquerade as a video id.
-    if url_or_id.contains(':') {
-        return None;
-    }
-    (!url_or_id.is_empty()).then(|| format!("https://www.youtube.com/watch?v={url_or_id}"))
-}
-
 /// Run `yt-dlp … -J` and parse its dumped JSON.
 fn yt_json(extra: &[&str]) -> Option<serde_json::Value> {
     yt_stdout(&["-J"], extra).and_then(|s| serde_json::from_str(&s).ok())
@@ -280,7 +263,7 @@ const STREAM_PLAYER_CLIENT: &str = "android";
 
 /// Run `yt-dlp … -g` and return the first printed line — the direct stream URL.
 fn yt_stream(url_or_id: &str) -> Option<String> {
-    let url = watch_url(url_or_id)?;
+    let url = crate::util::video_url(url_or_id)?;
     let configured = config::get().audio_format.clone();
     // `bestaudio/best` under the android client means `best` (the muxed
     // stream) — but a user who set `bestaudio` without a fallback must not
@@ -511,20 +494,21 @@ mod tests {
 
     #[test]
     fn watch_url_normalizes_id_uri_and_url() {
+        // The builder moved to util — its contract is owned there now.
         assert_eq!(
-            watch_url("yt:video:dQw4w9WgXcQ").as_deref(),
+            crate::util::video_url("yt:video:dQw4w9WgXcQ").as_deref(),
             Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         );
         assert_eq!(
-            watch_url("dQw4w9WgXcQ").as_deref(),
+            crate::util::video_url("dQw4w9WgXcQ").as_deref(),
             Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         );
         assert_eq!(
-            watch_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").as_deref(),
+            crate::util::video_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").as_deref(),
             Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         );
-        assert_eq!(watch_url("yt:playlist:PLabc"), None); // not a video
-        assert_eq!(watch_url(""), None);
+        assert_eq!(crate::util::video_url("yt:playlist:PLabc"), None); // not a video
+        assert_eq!(crate::util::video_url(""), None);
     }
 
     #[test]

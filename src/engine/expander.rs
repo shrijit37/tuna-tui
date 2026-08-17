@@ -17,7 +17,7 @@
 //! conventions); live behavior is exercised by `examples/probe`.
 
 use crate::config;
-use crate::util::{track_id_from_uri, uri_parts};
+use crate::util::{channel_videos_url, playlist_uri, track_id_from_uri, uri_parts};
 use crate::yt;
 
 /// One resolved, playable track: the direct stream URL plus the metadata that
@@ -58,15 +58,6 @@ pub trait Expander: Send + Sync {
 #[derive(Default)]
 pub struct YtExpander;
 
-impl YtExpander {
-    fn playlist_url(id: &str) -> String {
-        format!("https://www.youtube.com/playlist?list={id}")
-    }
-    fn channel_videos_url(id: &str) -> String {
-        format!("https://www.youtube.com/channel/{id}/videos")
-    }
-}
-
 impl Expander for YtExpander {
     fn expand(&self, uri: &str) -> Result<Vec<String>, String> {
         let Some(("yt", kind, id)) = uri_parts(uri) else {
@@ -74,14 +65,14 @@ impl Expander for YtExpander {
         };
         let uris = match kind {
             "video" => vec![uri.to_string()],
-            "playlist" => entries_of(&Self::playlist_url(id))?,
+            "playlist" => entries_of(&playlist_uri(id))?,
             // YouTube has no first-class albums; a search-backed expansion is
             // the honest approximation (artist/album pages are a later phase).
             "album" => yt::search(id, config::get().search_limit)
                 .into_iter()
                 .map(|v| v.uri)
                 .collect(),
-            "channel" => entries_of(&Self::channel_videos_url(id))?,
+            "channel" => entries_of(&channel_videos_url(id))?,
             _ => return Err(format!("unsupported yt kind: {kind}")),
         };
         if uris.is_empty() {

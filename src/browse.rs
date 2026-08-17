@@ -13,7 +13,7 @@
 
 use crate::app::*;
 use tuna_tui::config;
-use tuna_tui::util::uri_parts;
+use tuna_tui::util::{channel_videos_url, playlist_uri, uri_parts};
 use tuna_tui::yt;
 
 /// Fetch the library incrementally: fast sections first, all local. The
@@ -157,14 +157,14 @@ pub(crate) fn fetch_detail_blocking(
         "playlist" => {
             append_or_hint(
                 &mut items,
-                playlist_rows(&format!("https://www.youtube.com/playlist?list={id}")),
+                playlist_rows(&playlist_uri(id)),
                 "no tracks — empty or restricted",
             );
         }
         "channel" => {
             append_or_hint(
                 &mut items,
-                playlist_rows(&format!("https://www.youtube.com/channel/{id}/videos")),
+                playlist_rows(&channel_videos_url(id)),
                 "no uploads — empty or restricted",
             );
         }

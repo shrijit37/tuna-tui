@@ -60,16 +60,47 @@ pub fn uri_parts(uri: &str) -> Option<(&str, &str, &str)> {
 
 /// Convert a `yt:kind:id` URI to its youtube.com equivalent. Other schemes
 /// (the synthetic `tuna:action:` rows) have no shareable URL and return "".
+/// The video/playlist shapes delegate to the single-owner builders below;
+/// the channel card (`/channel/{id}`) stays distinct from the uploads tab
+/// ([`channel_videos_url`]) that drill-ins expand.
 pub fn uri_to_url(uri: &str) -> String {
     let Some((scheme, kind, id)) = uri_parts(uri) else {
         return String::new();
     };
     match (scheme, kind) {
-        ("yt", "video") => format!("https://www.youtube.com/watch?v={id}"),
-        ("yt", "playlist") => format!("https://www.youtube.com/playlist?list={id}"),
+        ("yt", "video") => video_url(uri).unwrap_or_default(),
+        ("yt", "playlist") => playlist_uri(id),
         ("yt", "channel") => format!("https://www.youtube.com/channel/{id}"),
         _ => String::new(),
     }
+}
+
+/// Normalize a video id / `yt:video:` uri / watch URL to a watch URL. These
+/// builders own the canonical youtube.com shapes, so every layer (the yt
+/// resolver, the expander, browse) shares one spelling.
+pub fn video_url(url_or_id: &str) -> Option<String> {
+    if url_or_id.starts_with("http://") || url_or_id.starts_with("https://") {
+        return Some(url_or_id.to_string());
+    }
+    if let Some(id) = track_id_from_uri(url_or_id) {
+        return Some(format!("https://www.youtube.com/watch?v={id}"));
+    }
+    // A bare id — but only a bare one: a `yt:playlist:` or other non-video uri
+    // must not masquerade as a video id.
+    if url_or_id.contains(':') {
+        return None;
+    }
+    (!url_or_id.is_empty()).then(|| format!("https://www.youtube.com/watch?v={url_or_id}"))
+}
+
+/// The canonical playlist URL.
+pub fn playlist_uri(id: &str) -> String {
+    format!("https://www.youtube.com/playlist?list={id}")
+}
+
+/// The canonical channel uploads tab — what a `yt:channel:` drill-in expands.
+pub fn channel_videos_url(id: &str) -> String {
+    format!("https://www.youtube.com/channel/{id}/videos")
 }
 
 /// Pull the id out of a `yt:video:<id>` URI.
