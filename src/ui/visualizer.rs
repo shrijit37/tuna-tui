@@ -2,20 +2,21 @@
 
 use crate::*;
 
-pub(crate) fn render_visualizer(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
-    let active = app
-        .svc
-        .engine
-        .bands
-        .try_lock()
-        .map(|g| g.is_active)
-        .unwrap_or(false);
-    if !active {
-        return;
-    }
+pub(crate) fn render_visualizer(
+    f: &mut Frame,
+    app: &App,
+    out: &mut FrameOut,
+    theme: Theme,
+    area: Rect,
+) {
+    // One try_lock covers the activity probe and the data read — the earliest
+    // lock also decides whether we draw at all (non-blocking on both).
     let Ok(guard) = app.svc.engine.bands.try_lock() else {
         return;
     };
+    if !guard.is_active {
+        return;
+    }
     let values: [f32; NUM_BANDS] = guard.values;
     let peak = guard.peak_envelope.max(1e-6);
     drop(guard);
@@ -40,7 +41,8 @@ pub(crate) fn render_visualizer(f: &mut Frame, app: &App, theme: Theme, area: Re
     }
 
     // 1. Box-average the bands into each column (anti-aliasing vs. single-pick).
-    let mut cols = vec![0.0f32; w];
+    let cols = &mut out.scratch.cols;
+    cols.resize(w, 0.0);
     for (x, c) in cols.iter_mut().enumerate() {
         let lo = x * NUM_BANDS / w;
         let hi = (((x + 1) * NUM_BANDS / w).max(lo + 1)).min(NUM_BANDS);
@@ -52,8 +54,10 @@ pub(crate) fn render_visualizer(f: &mut Frame, app: &App, theme: Theme, area: Re
 
     // 2. Spatial smoothing — a couple of weighted passes so the envelope flows
     //    instead of spiking. This is what kills the "chopped" look.
+    let src = &mut out.scratch.src;
     for _ in 0..2 {
-        let src = cols.clone();
+        src.clear();
+        src.extend_from_slice(cols);
         for x in 0..w {
             let l = src[x.saturating_sub(1)];
             let r = src[(x + 1).min(w - 1)];
@@ -61,12 +65,12 @@ pub(crate) fn render_visualizer(f: &mut Frame, app: &App, theme: Theme, area: Re
         }
     }
 
-    // 3. Render with an eighth-block sub-cell tip and a vertical color gradient
-    //    (info at the base → primary → accent at the peaks) for a smooth wash.
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    // 3. Paint cells directly: each column is one char at a row color, so a
+    //    Span/Line/Paragraph pile is pure overhead. The grid is single-char so
+    //    buffer writes render identically to the widget.
+    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     let stops = [theme.info, theme.primary, theme.accent];
-
-    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    let buf = f.buffer_mut();
     for row in 0..h {
         let from_bottom = (h - 1 - row) as f32;
         let vfrac = if h > 1 {
@@ -75,23 +79,21 @@ pub(crate) fn render_visualizer(f: &mut Frame, app: &App, theme: Theme, area: Re
             0.0
         };
         let color: ratatui::style::Color = gradient::interpolate(&stops, vfrac).into();
-        let mut spans: Vec<Span> = Vec::with_capacity(w);
-        for &v in &cols {
+        for (x, &v) in cols.iter().enumerate() {
             let filled = v * h as f32 - from_bottom;
-            let ch = if filled >= 1.0 {
-                '█'
+            let ch: &str = if filled >= 1.0 {
+                "█"
             } else if filled <= 0.0 {
-                ' '
+                " "
             } else {
                 LEVELS[((filled * 8.0) as usize).clamp(1, 8) - 1]
             };
-            if ch == ' ' {
-                spans.push(Span::raw(" "));
-            } else {
-                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+            // In-bounds by construction: vrect is clamped to `area`, which the
+            // renderer sizes from the frame.
+            if let Some(cell) = buf.cell_mut((vrect.x + x as u16, vrect.y + row as u16)) {
+                cell.set_symbol(ch);
+                cell.set_fg(color);
             }
         }
-        lines.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(lines), vrect);
 }

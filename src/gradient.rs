@@ -87,16 +87,26 @@ pub fn interpolate(stops: &[Rgb], t: f32) -> Rgb {
 
 /// Sample `n` evenly-spaced colors across a gradient. Handy for coloring `n`
 /// visualizer bars or an `n`-cell progress bar in one shot.
+///
+/// Falls back to [`sample_into`] with a fresh buffer; per-frame callers (the
+/// progress bar) reuse one via [`sample_into`] to skip the allocation.
 pub fn sample(stops: &[Rgb], n: usize) -> Vec<Rgb> {
+    let mut out = Vec::with_capacity(n);
+    sample_into(stops, n, &mut out);
+    out
+}
+
+/// Like [`sample`], but appends to the caller's buffer (cleared + reused).
+pub fn sample_into(stops: &[Rgb], n: usize, out: &mut Vec<Rgb>) {
+    out.clear();
     if n == 0 {
-        return Vec::new();
+        return;
     }
     if n == 1 {
-        return vec![interpolate(stops, 0.0)];
+        out.push(interpolate(stops, 0.0));
+        return;
     }
-    (0..n)
-        .map(|i| interpolate(stops, i as f32 / (n - 1) as f32))
-        .collect()
+    out.extend((0..n).map(|i| interpolate(stops, i as f32 / (n - 1) as f32)));
 }
 
 #[cfg(test)]

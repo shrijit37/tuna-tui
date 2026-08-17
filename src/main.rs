@@ -47,7 +47,7 @@ use browse::*;
 use input::*;
 use tuna_tui::anim::ThemeFade;
 use tuna_tui::audio::NUM_BANDS;
-use tuna_tui::components::{gradient_line, gradient_progress, left_bar_block};
+use tuna_tui::components::{gradient_line, left_bar_block};
 use tuna_tui::cover::Cover;
 use tuna_tui::engine::{self, Engine, EngineEvent};
 use tuna_tui::gradient::{self};

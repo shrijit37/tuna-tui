@@ -7,6 +7,7 @@ use crate::*;
 pub(crate) fn render_nowplaying_view(
     f: &mut Frame,
     app: &App,
+    out: &mut FrameOut,
     theme: Theme,
     area: Rect,
     repaint: ArtRepaint,
@@ -109,7 +110,7 @@ pub(crate) fn render_nowplaying_view(
         );
     }
 
-    render_visualizer(f, app, theme, viz_area);
+    render_visualizer(f, app, out, theme, viz_area);
 }
 
 /// Slim persistent bottom strip: play state + track, then the progress bar.
@@ -148,12 +149,13 @@ pub(crate) fn render_now_strip(
         width: bar_w,
         height: 1,
     });
-    render_progress(f, app, theme, rows[1], left, right);
+    render_progress(f, app, out, theme, rows[1], left, right);
 }
 
 pub(crate) fn render_progress(
     f: &mut Frame,
     app: &App,
+    out: &mut FrameOut,
     theme: Theme,
     area: Rect,
     left: String,
@@ -167,15 +169,33 @@ pub(crate) fn render_progress(
     let bar_w = (area.width as usize).saturating_sub(reserve);
     let filled = ((pos as f32 / dur as f32) * bar_w as f32) as usize;
 
-    let mut spans = vec![Span::styled(left, theme.muted())];
-    spans.extend(gradient_progress(
-        bar_w,
-        filled,
-        &[theme.primary, theme.accent],
-        theme.border_dimmest,
-    ));
-    spans.push(Span::styled(right, theme.muted()));
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Direct cell writes — the bar is a single-char run with one color per
+    // cell (plus the two labels), so span/paragraph plumbing is pure overhead.
+    let buf = f.buffer_mut();
+    buf.set_stringn(area.x, area.y, &left, left.chars().count(), theme.muted());
+    let colors = &mut out.scratch.bar_colors;
+    gradient::sample_into(&[theme.primary, theme.accent], bar_w, colors);
+    for (i, &color) in colors.iter().enumerate() {
+        let fg = if i < filled {
+            color.into()
+        } else {
+            theme.border_dimmest.into()
+        };
+        // In-bounds by construction: bar_w and the labels are derived from
+        // `area` itself, which the renderer sizes from the frame.
+        if let Some(cell) = buf.cell_mut((area.x + reserve as u16 + i as u16, area.y)) {
+            cell.set_symbol("▬");
+            cell.set_fg(fg);
+        }
+    }
+    let right_x = area.x + (reserve + bar_w) as u16;
+    buf.set_stringn(
+        right_x,
+        area.y,
+        &right,
+        right.chars().count(),
+        theme.muted(),
+    );
 }
 
 /// The volume meter — a graduated ramp + percentage, right-aligned in `area`.

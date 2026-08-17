@@ -24,6 +24,18 @@ pub(crate) struct HitRects {
     pub(crate) lib: Option<Rect>,
 }
 
+/// Per-frame scratch buffers, reused instead of re-allocated. Owned by
+/// `run_ui` (inside [`FrameOut`]) so capacity survives across frames; every
+/// consumer clears + refills its slice each frame it draws.
+#[derive(Default)]
+pub(crate) struct RenderScratch {
+    /// Visualizer column levels + the smoothing pass's source snapshot.
+    pub(crate) cols: Vec<f32>,
+    pub(crate) src: Vec<f32>,
+    /// Progress-bar gradient colors (one per bar cell).
+    pub(crate) bar_colors: Vec<gradient::Rgb>,
+}
+
 /// Everything the renderer writes, kept out of `App` so every render function
 /// can take `&App`.
 #[derive(Default)]
@@ -34,6 +46,8 @@ pub(crate) struct FrameOut {
     /// stores the result back, which is what makes scrolling sticky. Owned by
     /// `run_ui` so it survives across frames.
     pub(crate) lib_offset: usize,
+    /// Reused buffers for the per-frame drawing paths (visualizer, progress).
+    pub(crate) scratch: RenderScratch,
 }
 
 /// What the album art box owes the next frame.
