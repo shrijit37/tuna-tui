@@ -228,8 +228,12 @@ impl SavedState {
     }
 }
 
-/// Snapshot the current session to disk (volume, last track, position, queue).
-pub(crate) fn save_state(app: &App) {
+/// Snapshot the current session (volume, last track, position, queue).
+///
+/// Building the snapshot is cheap (strings + the store clone); the caller
+/// writes it off the UI thread — serializing a few hundred KB and fs-writing
+/// on `save()` must not freeze the render loop.
+pub(crate) fn save_state(app: &App) -> SavedState {
     let last_played = app.playback.now.as_ref().map(|now| LastPlayed {
         uri: now.uri.clone(),
         title: now.title.clone(),
@@ -239,7 +243,7 @@ pub(crate) fn save_state(app: &App) {
         position_ms: app.playback.position_ms(),
     });
 
-    let s = SavedState {
+    SavedState {
         volume: app.transport.volume,
         shuffle: app.transport.shuffle,
         repeat: app.transport.repeat,
@@ -249,6 +253,5 @@ pub(crate) fn save_state(app: &App) {
         source: app.transport.source.clone(),
         source_name: app.transport.source_name.clone(),
         store: app.store.clone(),
-    };
-    s.save();
+    }
 }

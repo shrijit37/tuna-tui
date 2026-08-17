@@ -628,11 +628,13 @@ async fn run_ui(
                     last_sync = Instant::now();
                     // Refresh the local queue from the engine while playing so
                     // the snapshot stays current, then persist it (survives
-                    // reboot).
+                    // reboot). The write runs on a blocking thread — serializing
+                    // the store + fs-write must not freeze the render loop.
                     if app.transport.playback_started {
                         app.refresh_local_queue();
                     }
-                    save_state(&app);
+                    let snapshot = save_state(&app);
+                    tokio::task::spawn_blocking(move || snapshot.save());
                 }
                 false
             }
@@ -646,14 +648,18 @@ async fn run_ui(
                     Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         let quit = handle_key(&mut app, key.code, key.modifiers, &chans);
                         if quit {
-                            save_state(&app);
+                            // The last save must land before exit — await it.
+                            let snapshot = save_state(&app);
+                            let _ = tokio::task::spawn_blocking(move || snapshot.save()).await;
                             break;
                         }
                     }
                     Ok(Event::Mouse(m)) => {
                         let quit = handle_mouse(&mut app, &out, m, &chans);
                         if quit {
-                            save_state(&app);
+                            // The last save must land before exit — await it.
+                            let snapshot = save_state(&app);
+                            let _ = tokio::task::spawn_blocking(move || snapshot.save()).await;
                             break;
                         }
                     }
