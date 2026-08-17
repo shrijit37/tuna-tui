@@ -67,6 +67,9 @@ pub(crate) struct FfmpegSource {
     /// audio): the pump blocks on a full queue — on *its own* thread, never on
     /// the audio callback — instead of letting a burst decode flood memory.
     chunks: flume::Receiver<Vec<u8>>,
+    /// Reused s16 decode buffer, one pump chunk in size (4096 i16 = READ_BYTES).
+    /// `fold` decodes into it instead of allocating a Vec per chunk.
+    scratch: Vec<i16>,
 }
 
 impl FfmpegSource {
@@ -114,6 +117,7 @@ impl FfmpegSource {
             cancelled,
             started: false,
             chunks,
+            scratch: vec![0i16; READ_BYTES / 2],
         }
     }
 
@@ -133,13 +137,18 @@ impl FfmpegSource {
         while self.pending.len() < PREBUFFER_SAMPLES {
             match self.chunks.try_recv() {
                 Ok(chunk) if !chunk.is_empty() => {
-                    let ints: Vec<i16> = chunk
-                        .chunks_exact(2)
-                        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-                        .collect();
-                    self.visualizer.feed_interleaved(&ints);
-                    self.pending
-                        .extend(ints.iter().map(|&s| s as f32 * (1.0 / 32768.0)));
+                    // Decode into the reused scratch (chunks_exact drops a
+                    // trailing odd byte the same way the old collect did).
+                    let n = chunk.len() / 2;
+                    for (i, pair) in chunk.chunks_exact(2).enumerate() {
+                        self.scratch[i] = i16::from_le_bytes([pair[0], pair[1]]);
+                    }
+                    self.visualizer.feed_interleaved(&self.scratch[..n]);
+                    self.pending.extend(
+                        self.scratch[..n]
+                            .iter()
+                            .map(|&s| s as f32 * (1.0 / 32768.0)),
+                    );
                 }
                 Ok(_) => {
                     // The empty end-marker: pipe closed, no more audio. It is
