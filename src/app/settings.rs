@@ -998,3 +998,239 @@ impl SettingsState {
                 } else if !forward && self.crossfade_duration_ms > 500 {
                     self.crossfade_duration_ms -= 250;
                 }
+            }
+            "gapless" => self.gapless_playback = !self.gapless_playback,
+            "replay_gain" => self.replay_gain = !self.replay_gain,
+            "volume_step" => {
+                if forward && self.volume_step < 25 {
+                    self.volume_step += 1;
+                } else if !forward && self.volume_step > 1 {
+                    self.volume_step -= 1;
+                }
+            }
+            "restore_on_startup" => self.restore_on_startup = !self.restore_on_startup,
+            "next_track_prefetch" => self.next_track_prefetch = !self.next_track_prefetch,
+
+            // Lyrics
+            "lyrics_align" => {
+                let all = LyricsAlignment::ALL;
+                let current_idx = all.iter().position(|a| *a == self.lyrics_alignment).unwrap_or(0);
+                let next_idx = if forward {
+                    (current_idx + 1) % all.len()
+                } else if current_idx == 0 {
+                    all.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                self.lyrics_alignment = all[next_idx];
+            }
+            "lyrics_font_size" => {
+                if forward && self.lyrics_font_size < 150 {
+                    self.lyrics_font_size += 10;
+                } else if !forward && self.lyrics_font_size > 80 {
+                    self.lyrics_font_size -= 10;
+                }
+            }
+            "lyrics_highlight" => {
+                let max = 4;
+                if forward && self.lyrics_highlight_color < max {
+                    self.lyrics_highlight_color += 1;
+                } else if !forward && self.lyrics_highlight_color > 0 {
+                    self.lyrics_highlight_color -= 1;
+                }
+            }
+            "lyrics_auto_scroll" => self.lyrics_auto_scroll = !self.lyrics_auto_scroll,
+            "lyrics_transliterate" => self.lyrics_transliterate = !self.lyrics_transliterate,
+
+            // Interface
+            "search_limit" => {
+                if forward && self.search_limit < 50 {
+                    self.search_limit += 5;
+                } else if !forward && self.search_limit > 5 {
+                    self.search_limit -= 5;
+                }
+            }
+            "scrolloff" => {
+                if forward && self.scrolloff < 15 {
+                    self.scrolloff += 1;
+                } else if !forward && self.scrolloff > 0 {
+                    self.scrolloff -= 1;
+                }
+            }
+            "ui_density" => {
+                let max = 2;
+                if forward && self.ui_density < max {
+                    self.ui_density += 1;
+                } else if !forward && self.ui_density > 0 {
+                    self.ui_density -= 1;
+                }
+            }
+            "show_art_queue" => self.show_album_art_in_queue = !self.show_album_art_in_queue,
+            "show_progress_footer" => self.show_progress_in_footer = !self.show_progress_in_footer,
+            "footer_clock" => {
+                let max = 3;
+                if forward && self.footer_clock_format < max {
+                    self.footer_clock_format += 1;
+                } else if !forward && self.footer_clock_format > 0 {
+                    self.footer_clock_format -= 1;
+                }
+            }
+            "sidebar_width" => {
+                if forward && self.sidebar_width_pct < 50 {
+                    self.sidebar_width_pct += 5;
+                } else if !forward && self.sidebar_width_pct > 20 {
+                    self.sidebar_width_pct -= 5;
+                }
+            }
+
+            // System
+            "mpris" => self.mpris_enabled = !self.mpris_enabled,
+
+            // Debug
+            "debug_mode" => self.debug_mode = !self.debug_mode,
+            "debug_verbose" => self.debug_verbose_logging = !self.debug_verbose_logging,
+            "debug_perf" => self.debug_performance_overlay = !self.debug_performance_overlay,
+            "debug_network" => self.debug_network_logging = !self.debug_network_logging,
+            "debug_audio" => self.debug_audio_diagnostics = !self.debug_audio_diagnostics,
+            "debug_engine" => self.debug_engine_state = !self.debug_engine_state,
+            "debug_viz" => self.debug_visualizer_raw = !self.debug_visualizer_raw,
+            "debug_cache" => self.debug_cache_stats = !self.debug_cache_stats,
+            "debug_lyrics" => self.debug_lyrics_timing = !self.debug_lyrics_timing,
+            "debug_search" => self.debug_search_queries = !self.debug_search_queries,
+            "debug_log_file" => self.debug_log_file = !self.debug_log_file,
+            "debug_log_level" => {
+                if forward && self.debug_log_level < 4 {
+                    self.debug_log_level += 1;
+                } else if !forward && self.debug_log_level > 0 {
+                    self.debug_log_level -= 1;
+                }
+            },
+            "clear_cache" => return Some(SettingsAction::ClearCache),
+            "cache_size" => {
+                let max = 5;
+                if forward && self.visualizer_color_scheme < max {
+                    // cycle cache size option forward
+                } else if !forward && self.visualizer_color_scheme > 0 {
+                    // cycle cache size option backward
+                }
+            }
+            "export_config" => {
+                self.status_msg = Some("Config exported to clipboard (not yet implemented)".to_string());
+            }
+            "reset_defaults" => {
+                self.status_msg = Some("Reset requires confirmation (not yet implemented)".to_string());
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub fn apply_to_config(&self, c: &mut Config) {
+        // Visuals
+        c.animation_fps = self.animation_fps;
+        c.visualizer_style = self.visualizer_style;
+        c.visualizer_smoothing = self.visualizer_smoothing;
+        c.visualizer_bar_width = self.visualizer_bar_width;
+        c.visualizer_color_scheme = self.visualizer_color_scheme;
+        c.progress_bar_style = self.progress_bar_style;
+        c.protocol = self.protocol.clone();
+        c.zen_default = self.zen_default;
+        c.theme_name = self.theme_name.clone();
+        c.theme_fade_speed = self.theme_fade_speed;
+
+        // Playback
+        c.audio_quality = self.audio_quality;
+        c.buffer_duration_secs = self.buffer_duration_secs;
+        c.volume_step = self.volume_step;
+        c.crossfade_enabled = self.crossfade_enabled;
+        c.crossfade_duration_ms = self.crossfade_duration_ms;
+        c.gapless_playback = self.gapless_playback;
+        c.restore_on_startup = self.restore_on_startup;
+        c.next_track_prefetch = self.next_track_prefetch;
+        c.replay_gain = self.replay_gain;
+
+        // Lyrics
+        c.lyrics_alignment = self.lyrics_alignment;
+        c.lyrics_transliterate = self.lyrics_transliterate;
+        c.lyrics_auto_scroll = self.lyrics_auto_scroll;
+        c.lyrics_font_size = self.lyrics_font_size;
+        c.lyrics_highlight_color = self.lyrics_highlight_color;
+
+        // Interface
+        c.search_limit = self.search_limit;
+        c.scrolloff = self.scrolloff;
+        c.ui_density = self.ui_density;
+        c.show_album_art_in_queue = self.show_album_art_in_queue;
+        c.show_progress_in_footer = self.show_progress_in_footer;
+        c.footer_clock_format = self.footer_clock_format;
+        c.sidebar_width_pct = self.sidebar_width_pct;
+
+        // System
+        c.mpris_enabled = self.mpris_enabled;
+
+        // Debug
+        c.debug_mode = self.debug_mode;
+        c.debug_verbose_logging = self.debug_verbose_logging;
+        c.debug_performance_overlay = self.debug_performance_overlay;
+        c.debug_network_logging = self.debug_network_logging;
+        c.debug_audio_diagnostics = self.debug_audio_diagnostics;
+        c.debug_engine_state = self.debug_engine_state;
+        c.debug_visualizer_raw = self.debug_visualizer_raw;
+        c.debug_cache_stats = self.debug_cache_stats;
+        c.debug_lyrics_timing = self.debug_lyrics_timing;
+        c.debug_search_queries = self.debug_search_queries;
+        c.debug_log_file = self.debug_log_file;
+        c.debug_log_level = self.debug_log_level;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_state_initializes_and_cycles_tabs() {
+        let config = Config::default();
+        let mut state = SettingsState::init_from_config(&config);
+        assert_eq!(state.tab, SettingsTab::Visuals);
+
+        state.next_tab();
+        assert_eq!(state.tab, SettingsTab::Playback);
+        state.next_tab();
+        assert_eq!(state.tab, SettingsTab::Lyrics);
+        state.next_tab();
+        assert_eq!(state.tab, SettingsTab::Interface);
+        state.next_tab();
+        assert_eq!(state.tab, SettingsTab::System);
+        state.next_tab();
+        assert_eq!(state.tab, SettingsTab::Visuals);
+
+        // Navigation between rows
+        let rows = state.current_rows();
+        assert!(!rows.is_empty());
+        state.next_row();
+        assert_eq!(state.selected, 1);
+        state.prev_row();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn settings_state_cycles_values_and_applies() {
+        let mut config = Config::default();
+        let mut state = SettingsState::init_from_config(&config);
+
+        // Row 0 is FPS (30 -> 60 -> 120 -> 240 -> 1000)
+        state.selected = 0;
+        state.cycle_value(true);
+        assert_eq!(state.animation_fps, 240);
+
+        // Row 1 is Theme
+        state.selected = 1;
+        state.cycle_value(true);
+        assert_eq!(state.theme_name, "Tokyo Night");
+
+        state.apply_to_config(&mut config);
+        assert_eq!(config.animation_fps, 240);
+        assert_eq!(config.theme_name, "Tokyo Night");
+    }
+}
