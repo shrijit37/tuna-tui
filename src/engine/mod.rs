@@ -13,7 +13,12 @@
 //! the ffmpeg child, and answers commands off a flume channel. A watchdog
 //! thread polls a shared health cell (5 s cadence) and asks the worker to
 //! re-resolve + restart on a stalled or failed stream, with the same 5–120 s
-//! backoff the old reconnect loop used. The engine needs no tokio runtime.
+//! backoff the old reconnect loop used. A third thread ("tuna-meta") is the
+//! single metadata worker: it drains a bounded FIFO of per-track meta jobs
+//! (the worker drops the oldest job when the queue saturates, so the current
+//! track's job always lands), fetches cover + theme and ships `EngineMeta` to
+//! the app over a bounded channel with the same drop-oldest rule, then exits
+//! when the engine goes away. The engine needs no tokio runtime.
 
 pub mod expander;
 mod ffmpeg_source;
@@ -129,6 +134,18 @@ struct PlayerState {
     repeat: bool,
     volume: f32,
     playing: bool,
+}
+
+/// A queued metadata job: fetch cover + theme for `uri` and ship `EngineMeta`
+/// for it. `fresh` distinguishes a newly-started track (must ship) from a
+/// recovery rebuild of an already-delivered one — the worker drops
+/// `fresh: false` jobs without running `engine_meta`, because the app already
+/// applied that track's meta on the first delivery and re-applying it would
+/// re-run `record_played` (Home-count inflation).
+struct MetaJob {
+    uri: String,
+    info: ResolvedTrack,
+    fresh: bool,
 }
 
 /// One playing (or paused) track: the ffmpeg child and the bookkeeping the
@@ -339,6 +356,12 @@ const RECOVERY_ATTEMPTS: u32 = 8;
 /// doesn't hammer the resolver every five seconds until dawn.
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(120);
+/// The bounded FIFO of pending metadata jobs (F6). 16 is headroom for a
+/// skip-burst at one job per track; the tuna-meta worker drains it at
+/// network+decode speed, and drop-oldest keeps the current track's job from
+/// ever waiting behind saturated work.
+const META_JOBS_CAP: usize = 16;
+
 /// Worker loop wakeup: drains commands, watches for EOF, emits position.
 const TICK: Duration = Duration::from_millis(100);
 /// How often the worker emits a [`EngineEvent::PositionCorrection`] while
@@ -381,11 +404,15 @@ fn open_output() -> Result<(
 
 /// Start the engine. Synchronous (it needs no runtime); the worker + watchdog
 /// threads are spawned here. `expander` resolves uris into streams; `events`
-/// receives the EngineEvent stream; `meta_tx` receives in-band metadata for
-/// yt: tracks.
+/// receives the EngineEvent stream; `meta_tx`/`meta_rx` are the app's
+/// in-band metadata channel (bounded, drop-oldest) — the engine keeps a
+/// sending clone for its single "tuna-meta" worker and mirrors the receiver
+/// so a saturated channel sheds its oldest message instead of piling up
+/// multi-MB images.
 pub fn run(
     events: flume::Sender<EngineEvent>,
     meta_tx: flume::Sender<EngineMeta>,
+    meta_rx: flume::Receiver<EngineMeta>,
     initial_volume_pct: u8,
     expander: Arc<dyn Expander>,
 ) -> Result<Engine> {
@@ -398,13 +425,25 @@ pub fn run(
     }));
 
     let queue_snapshot = Arc::new(Mutex::new(Vec::new()));
+    // The single persistent metadata worker (F6): one "tuna-meta" thread
+    // drains the bounded FIFO job queue and ships EngineMeta with
+    // drop-oldest — replacing a detached thread per track start and per
+    // recovery rebuild.
+    let (meta_jobs_tx, meta_jobs_rx) = flume::bounded::<MetaJob>(META_JOBS_CAP);
+    spawn_tuna_meta(meta_jobs_rx.clone(), meta_tx.clone(), meta_rx);
     let worker = Worker {
         sink,
         player,
         queue,
         bands: Arc::clone(&bands),
         events,
+        // Keep-alive only: build_stream hands jobs to the tuna-meta worker,
+        // which holds the sending clone. While this sender lives the meta
+        // channel cannot disconnect, so a worker that dies mid-session
+        // degrades to "no meta" — never a busy-spin on the app's select arm.
         meta_tx,
+        meta_jobs: meta_jobs_tx,
+        meta_jobs_rx,
         cmds: cmds_rx,
         expander: Arc::clone(&expander),
         queue_snapshot: Arc::clone(&queue_snapshot),
@@ -422,9 +461,6 @@ pub fn run(
         drop_streak: 0,
         last_seen_frames: 0,
         last_correction: Instant::now(),
-        // Cloning the once-built blocking client (Arc-fee) — constructed by
-        // `httpcache::warm_blocking_client` before the runtime started.
-        client: crate::httpcache::blocking_client().clone(),
         pending: None,
         recovery: None,
         paused: None,
@@ -474,6 +510,67 @@ fn spawn_watchdog(health: Arc<Mutex<Health>>, cmds: flume::Sender<Cmd>) {
         });
 }
 
+/// Send `msg` without ever blocking; a saturated bounded channel sheds its
+/// OLDEST queued message to make room (drop-oldest), then retries until the
+/// send lands or there is nothing left to shed. The porch rule for the meta
+/// pipeline: the current track's message must always land, older tracks'
+/// messages are disposable (the app's `meta_is_current` guard makes a dropped
+/// message invisible beyond that track's fallback), and a blocking send would
+/// park one thread per stuck message — each holding a multi-MB image.
+fn send_drop_oldest<T>(tx: &flume::Sender<T>, rx: &flume::Receiver<T>, mut msg: T) {
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => return,
+            Err(flume::TrySendError::Full(m)) => {
+                msg = m;
+                if rx.try_recv().is_err() {
+                    // Queue drained concurrently, or the receiver is gone:
+                    // give up rather than churn.
+                    return;
+                }
+            }
+            Err(flume::TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
+
+/// The one metadata worker (F6): drains the bounded FIFO [`MetaJob`] queue,
+/// computes in-band metadata for each fresh job and ships it over the bounded
+/// meta channel (drop-oldest on saturation) — one thread instead of a
+/// detached thread per track start and per recovery rebuild. `fresh: false`
+/// jobs (recovery re-deliveries of an already-delivered track) are skipped:
+/// re-applying would re-run `record_played`, inflating Home counts. Known
+/// edge (documented in the PR): a recovery that fires before the first
+/// meta delivery for a track — e.g. the very first `build_stream` fails and
+/// a recovery rebuild succeeds — skips meta for that track, which then falls
+/// back to the bare-URI defaults until it is replayed. Exits when the engine
+/// drops its job sender (the queue disconnects).
+fn spawn_tuna_meta(
+    jobs: flume::Receiver<MetaJob>,
+    meta_tx: flume::Sender<EngineMeta>,
+    meta_rx: flume::Receiver<EngineMeta>,
+) {
+    // Cloning the once-built blocking client (Arc-fee) — constructed by
+    // `httpcache::warm_blocking_client` before the runtime started.
+    let client = crate::httpcache::blocking_client().clone();
+    if std::thread::Builder::new()
+        .name("tuna-meta".to_string())
+        .spawn(move || {
+            while let Ok(job) = jobs.recv() {
+                if !job.fresh {
+                    // Recovery rebuild of an already-delivered track.
+                    continue;
+                }
+                let meta = engine_meta(&job.uri, &job.info, &client);
+                send_drop_oldest(&meta_tx, &meta_rx, meta);
+            }
+        })
+        .is_err()
+    {
+        liblog("engine: failed to spawn tuna-meta worker");
+    }
+}
+
 struct Worker {
     /// Held alive for the worker's whole life: dropping it stops the device.
     #[allow(dead_code)] // the guard's whole job is to be held, never read
@@ -484,7 +581,15 @@ struct Worker {
     queue: Arc<rodio::queue::SourcesQueueInput>,
     bands: Arc<Mutex<VisBands>>,
     events: flume::Sender<EngineEvent>,
+    /// Keep-alive for the app's in-band metadata channel — see `run`.
+    /// The actual sending clone lives on the tuna-meta worker thread.
+    #[allow(dead_code)] // the guard's whole job is to be held, never read
     meta_tx: flume::Sender<EngineMeta>,
+    /// The bounded FIFO feeding the single tuna-meta worker (F6). Jobs are
+    /// queued by `build_stream` with drop-oldest on saturation; the receiver
+    /// half is how the oldest queued job is shed.
+    meta_jobs: flume::Sender<MetaJob>,
+    meta_jobs_rx: flume::Receiver<MetaJob>,
     cmds: flume::Receiver<Cmd>,
     expander: Arc<dyn Expander>,
     /// The public mirror of the loaded list (`Engine::queue`).
@@ -498,7 +603,6 @@ struct Worker {
     /// The last frame count seen (stall detection needs deltas).
     last_seen_frames: u64,
     last_correction: Instant,
-    client: reqwest::blocking::Client,
     /// A user command that pre-empted a recovery retry-sleep; handled before
     /// anything queued behind it.
     pending: Option<Cmd>,
@@ -918,7 +1022,7 @@ impl Worker {
             if attempt > 0 {
                 let _ = self.events.send(EngineEvent::Reconnecting);
             }
-            match self.build_stream(&uri, pos, play) {
+            match self.build_stream(&uri, pos, play, false) {
                 Ok(()) => {
                     if attempt > 0 {
                         let _ = self.events.send(EngineEvent::Reconnected);
@@ -1013,7 +1117,7 @@ impl Worker {
             .events
             .send(EngineEvent::TrackChanged { uri: uri.clone() });
 
-        if let Err(e) = self.build_stream(&uri, pos, true) {
+        if let Err(e) = self.build_stream(&uri, pos, true, true) {
             liblog(format!("engine: start {uri} failed: {e}"));
             self.recover_into(uri, pos);
         }
@@ -1070,7 +1174,11 @@ impl Worker {
     /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
     /// when `play` is false, announce Paused and keep the mixer suspended (a
     /// recovery rebuilding a track the user had paused must not force-play it).
-    fn build_stream(&mut self, uri: &str, pos: u32, play: bool) -> Result<()> {
+    /// `fresh` marks a newly-started track: recovery rebuilds of the same
+    /// track pass `false`, so the tuna-meta worker skips the re-delivery
+    /// (its meta was already applied — see [`spawn_tuna_meta`] for the
+    /// first-delivery edge).
+    fn build_stream(&mut self, uri: &str, pos: u32, play: bool, fresh: bool) -> Result<()> {
         let resolved = self.expander.resolve(uri).map_err(|e| anyhow!(e))?;
         let url = resolved.url.clone();
         self.restart_stream(&url, uri, resolved.duration_ms, pos, play)?;
@@ -1086,23 +1194,23 @@ impl Worker {
                 position_ms: pos,
             }
         });
-        // In-band metadata for every resolved track (the app has no other metadata
-        // source since the Web API died). Sent on a detached thread — the cover
-        // fetch + theme derive must not block the worker's state machine while
-        // a slow request stalls.
-        let metatx = self.meta_tx.clone();
-        let client = self.client.clone();
-        let u = uri.to_string();
-        let info = resolved.clone();
-        if std::thread::Builder::new()
-            .name("tuna-meta".into())
-            .spawn(move || {
-                let _ = metatx.send(engine_meta(&u, &info, &client));
-            })
-            .is_err()
-        {
-            liblog("engine: failed to spawn meta thread");
-        }
+        // In-band metadata for every resolved track (the app has no other
+        // metadata source since the Web API died). Handed to the single
+        // persistent "tuna-meta" worker (F6) — one thread fetches cover +
+        // theme for the FIFO as it drains, instead of a detached thread per
+        // track start AND per recovery rebuild (each re-fetching and
+        // re-decoding the unchanged cover). The send is never blocking: a
+        // saturated job queue drops the OLDEST job, so the current track's
+        // always lands.
+        send_drop_oldest(
+            &self.meta_jobs,
+            &self.meta_jobs_rx,
+            MetaJob {
+                uri: uri.to_string(),
+                info: resolved,
+                fresh,
+            },
+        );
         Ok(())
     }
 
@@ -1215,7 +1323,7 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
     let mut theme = None;
     if let Some(url) = &r.thumbnail {
         if let Some(bytes) = fetch_cover(client, url) {
-            if let Ok(img) = image::load_from_memory(&bytes) {
+            if let Some(img) = decode_cover(&bytes) {
                 theme = Some(crate::reactive::derive_theme(&img, "album ✦"));
                 image = Some(img);
             }
@@ -1230,6 +1338,24 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
         image_url: r.thumbnail.clone(),
         image,
         theme,
+    }
+}
+
+/// Decode cover bytes and downscale to at most 320x320 (F15). The art box is
+/// hard-capped at 14 rows (~280–336 px) and only two pixel consumers exist
+/// (`derive_theme`, `Cover::from_image`) — one downscale feeds both, saving
+/// ~10–15 MB of decode/clone traffic per track at full-res thumbnails.
+/// Small fallback thumbnails pass through unchanged: on image 0.25.10
+/// `thumbnail` has NO no-upscale guard (the 0.24 `nwidth >= width` early
+/// return is gone — it unconditionally resizes), so the size check here is
+/// what guarantees "never upscales". Corrupt bytes take the existing `None`
+/// path.
+fn decode_cover(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let img = image::load_from_memory(bytes).ok()?;
+    if img.width() > 320 || img.height() > 320 {
+        Some(img.thumbnail(320, 320))
+    } else {
+        Some(img)
     }
 }
 
@@ -1325,6 +1451,60 @@ mod tests {
             .collect();
         let i = args.iter().position(|a| a == "-ss").expect("-ss present");
         assert_eq!(args[i + 1], "5");
+    }
+
+    #[test]
+    fn send_drop_oldest_keeps_newest() {
+        // Non-full path: a plain send, nothing shed.
+        let (tx, rx) = flume::bounded::<u32>(2);
+        assert!(tx.send(1).is_ok());
+        send_drop_oldest(&tx, &rx, 2);
+        let got: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got, vec![1, 2]);
+
+        // Full channel: the OLDEST message is shed so the newest lands, and
+        // the channel stays at capacity.
+        let (tx, rx) = flume::bounded::<u32>(2);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        send_drop_oldest(&tx, &rx, 3);
+        let got: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(got, vec![2, 3], "drop-oldest must evict 1, keep the newest");
+    }
+
+    #[test]
+    fn decode_cover_thumbnails() {
+        // Full-res art (the largest YouTube thumbnail size) must come back at
+        // or below the 320 px target — the whole point of F15.
+        let mut buf = image::RgbaImage::new(1280, 720);
+        for (x, y, px) in buf.enumerate_pixels_mut() {
+            *px = image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255]);
+        }
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("png encode");
+        let img = decode_cover(&bytes).expect("cover decodes");
+        let (w, h) = (img.width(), img.height());
+        assert!(w <= 320 && h <= 320, "downscale failed: {w}x{h}");
+
+        // thumbnail never upscales: a small fallback passes through unchanged.
+        let mut small = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            64,
+            64,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut small),
+            image::ImageFormat::Png,
+        )
+        .expect("png encode");
+        let img = decode_cover(&small).expect("small cover decodes");
+        assert_eq!((img.width(), img.height()), (64, 64), "no upscale");
     }
 
     /// Oracle for the playback chain on the ACTUAL machine: does a known 1 s
