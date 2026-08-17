@@ -27,25 +27,13 @@ pub(crate) fn handle_engine_event(app: &mut App, ev: EngineEvent) {
             if let Some(n) = app.playback.now.as_mut() {
                 n.is_playing = true;
             }
-            app.playback.set_local_position(position_ms, true);
-            refresh_stall(app);
-            if let Some(controls) = app.media_controls.as_mut() {
-                let _ = controls.set_playback(MediaPlayback::Playing {
-                    progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                });
-            }
+            apply_position(app, position_ms, Some(true));
         }
         EngineEvent::Paused { position_ms, .. } => {
             if let Some(n) = app.playback.now.as_mut() {
                 n.is_playing = false;
             }
-            app.playback.set_local_position(position_ms, true);
-            refresh_stall(app);
-            if let Some(controls) = app.media_controls.as_mut() {
-                let _ = controls.set_playback(MediaPlayback::Paused {
-                    progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                });
-            }
+            apply_position(app, position_ms, Some(false));
         }
         EngineEvent::Stopped => {
             app.playback.now = None;
@@ -59,22 +47,8 @@ pub(crate) fn handle_engine_event(app: &mut App, ev: EngineEvent) {
             }
         }
         EngineEvent::PositionCorrection { position_ms, .. } => {
-            app.playback.set_local_position(position_ms, true);
-            refresh_stall(app);
-            if let (Some(n), Some(controls)) =
-                (app.playback.now.as_ref(), app.media_controls.as_mut())
-            {
-                let playback = if n.is_playing {
-                    MediaPlayback::Playing {
-                        progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                    }
-                } else {
-                    MediaPlayback::Paused {
-                        progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                    }
-                };
-                let _ = controls.set_playback(playback);
-            }
+            let is_playing = app.playback.now.as_ref().map(|n| n.is_playing);
+            apply_position(app, position_ms, is_playing);
         }
         EngineEvent::Reconnecting => {
             app.status = "connection dropped — reconnecting…".to_string();
@@ -90,6 +64,25 @@ pub(crate) fn handle_engine_event(app: &mut App, ev: EngineEvent) {
             };
         }
     }
+}
+
+/// The shared tail of the position-carrying events: pin the playhead, refresh
+/// the stall detector, and mirror the playback state to the system media
+/// controls (MPRIS). `is_playing = None` (only from [`EngineEvent::PositionCorrection`]
+/// before any track exists) updates the position but leaves the controls alone.
+fn apply_position(app: &mut App, position_ms: u32, is_playing: Option<bool>) {
+    app.playback.set_local_position(position_ms, true);
+    refresh_stall(app);
+    let (Some(is_playing), Some(controls)) = (is_playing, app.media_controls.as_mut()) else {
+        return;
+    };
+    let progress = Some(MediaPosition(Duration::from_millis(position_ms as u64)));
+    let playback = if is_playing {
+        MediaPlayback::Playing { progress }
+    } else {
+        MediaPlayback::Paused { progress }
+    };
+    let _ = controls.set_playback(playback);
 }
 
 /// Keep the status line honest during a stream stall: once playback claims to
