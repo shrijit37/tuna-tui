@@ -227,7 +227,7 @@ where
             }
         }
         std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(BACKOFF_CAP);
+        backoff = crate::util::backoff_step(backoff, BACKOFF_CAP);
     }
 }
 

@@ -4,6 +4,7 @@
 //! unit-tested without a terminal, a network, or an audio device.
 
 use ratatui::layout::Rect;
+use std::time::Duration;
 
 /// Truncate to `max` characters, replacing the tail with an ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
@@ -23,6 +24,14 @@ pub fn fmt_ms(ms: u32) -> String {
 /// Convert a 0..=100 percentage to the engine's 0..=65535 volume range.
 pub fn vol_u16(pct: u8) -> u16 {
     (pct as u32 * 65535 / 100) as u16
+}
+
+/// One step of an exponential retry: double the current wait, capped.
+///
+/// Shared by the engine's recovery loop and the txc subscriber's reconnect
+/// loop — each keeps its own start/cap policy, only the shape is common.
+pub fn backoff_step(current: Duration, cap: Duration) -> Duration {
+    (current * 2).min(cap)
 }
 
 /// Vertically center a `height`-row rect inside `area`.

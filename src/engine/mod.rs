@@ -328,7 +328,7 @@ const TICK: Duration = Duration::from_millis(100);
 const POSITION_EVERY: Duration = Duration::from_secs(1);
 
 fn next_backoff(current: Duration) -> Duration {
-    (current * 2).min(RETRY_MAX)
+    crate::util::backoff_step(current, RETRY_MAX)
 }
 
 /// Open the output device and build the player + the per-track sound queue.
