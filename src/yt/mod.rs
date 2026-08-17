@@ -73,11 +73,33 @@ pub fn video_meta(url_or_id: &str) -> Option<YtVideo> {
 }
 
 /// The direct audio stream URL for one video, plus the metadata resolution
-/// needed to play it (title, duration, thumbnail, artist).
+/// needed to play it (title, duration, thumbnail, artist) — one `-J` call
+/// carries both (the `-f`/extractor-args policy below, then [`pick_url`]).
 pub fn resolve(url_or_id: &str) -> Option<StreamInfo> {
-    let video = video_meta(url_or_id)?;
-    let url = yt_stream(&video.uri)?;
-    Some(StreamInfo { url, video })
+    let url = crate::util::video_url(url_or_id)?;
+    let configured = config::get().audio_format.clone();
+    // `bestaudio/best` under the android client means `best` (the muxed
+    // stream) — but a user who set `bestaudio` without a fallback must not
+    // hard-fail resolution, so always carry the `/best` tail.
+    let format = if configured.contains('/') {
+        configured.clone()
+    } else {
+        format!("{configured}/best")
+    };
+    let root = yt_json(&[
+        "--no-playlist",
+        "-f",
+        &format,
+        &url,
+        "--extractor-args",
+        &format!("youtube:player_client={STREAM_PLAYER_CLIENT}"),
+    ])?;
+    let video = video_from(&root)?;
+    let stream = pick_url(&root, &configured)?;
+    Some(StreamInfo {
+        url: stream.to_string(),
+        video,
+    })
 }
 
 /// How long a radio request may take before the app gives up. The station
@@ -271,8 +293,7 @@ fn yt_json(extra: &[&str]) -> Option<serde_json::Value> {
 /// 15 s, while the `android` client's URL flows instantly (~180 ms to first
 /// PCM, 3/3 runs vs 0/9 for the others). A stalled URL starves the engine's
 /// prebuffer → silent playback, ALSA underrun errors, frozen position and
-/// visualizer, and watchdog rebuild loops. Only the `-g` leg takes the
-/// override; the metadata `-J` legs resolve fine on the default client.
+/// visualizer, and watchdog rebuild loops.
 ///
 /// Trade-off: the android client exposes no audio-only itags — `-f bestaudio`
 /// hard-fails under it, so the `/best` fallback below always lands on the
@@ -282,28 +303,35 @@ fn yt_json(extra: &[&str]) -> Option<serde_json::Value> {
 /// appending `/best` rather than letting resolution fail.
 const STREAM_PLAYER_CLIENT: &str = "android";
 
-/// Run `yt-dlp … -g` and return the first printed line — the direct stream URL.
-fn yt_stream(url_or_id: &str) -> Option<String> {
-    let url = crate::util::video_url(url_or_id)?;
-    let configured = config::get().audio_format.clone();
-    // `bestaudio/best` under the android client means `best` (the muxed
-    // stream) — but a user who set `bestaudio` without a fallback must not
-    // hard-fail resolution, so always carry the `/best` tail.
-    let format = if configured.contains('/') {
-        configured
-    } else {
-        format!("{configured}/best")
-    };
-    yt_stdout(
-        &["-g", "-f", &format],
-        &[
-            "--no-playlist",
-            &url,
-            "--extractor-args",
-            &format!("youtube:player_client={STREAM_PLAYER_CLIENT}"),
-        ],
-    )
-    .and_then(|s| s.lines().next().map(String::from))
+/// Pull the direct stream URL out of a `-J` info dump — the same pick the old
+/// `-g -f <configured>/best` leg made, now from the dump's own data:
+/// 1. a `formats[]` entry whose `format_id` equals a bare `configured` (a
+///    user's `audio_format = "251"` must select that exact itag);
+/// 2. otherwise the *last playable* entry — the android dump appends
+///    storyboard entries (`sb*`, both codecs "none") after the real stream,
+///    so the naive "last entry" would hand back a storyboard URL;
+/// 3. finally the info dict's own top-level `url` — which with `-f` active is
+///    exactly the format `-g` would have printed.
+fn pick_url<'a>(root: &'a serde_json::Value, configured: &str) -> Option<&'a str> {
+    if let Some(entries) = root["formats"].as_array() {
+        if !configured.contains('/') {
+            if let Some(f) = entries
+                .iter()
+                .find(|f| f["format_id"].as_str() == Some(configured))
+                .and_then(|f| f["url"].as_str())
+            {
+                return Some(f);
+            }
+        }
+        if let Some(f) = entries.iter().rev().find(|f| {
+            let playable = f["vcodec"].as_str().is_some_and(|v| v != "none")
+                || f["acodec"].as_str().is_some_and(|a| a != "none");
+            playable && f["url"].as_str().is_some()
+        }) {
+            return f["url"].as_str();
+        }
+    }
+    root["url"].as_str()
 }
 
 /// Run the configured yt-dlp binary with `base + extra` args and capture
@@ -450,6 +478,25 @@ mod tests {
         ]
     }"#;
 
+    /// A real `-J` dump from the android player client (captured 2026-08-17,
+    /// same shape `resolve` consumes), trimmed and with the signed stream URLs
+    /// replaced by placeholders. The structure is the point: the storyboard
+    /// entry (`sb*`, both codecs "none") comes *after* the only playable mux,
+    /// so a naive "last formats entry" pick would hand back a storyboard URL.
+    const ANDROID_JSON: &str = r#"{
+        "_type": "video", "id": "dQw4w9WgXcQ",
+        "title": "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)",
+        "duration": 213, "channel": "Rick Astley",
+        "thumbnails": [
+            {"url": "https://i.ytimg.com/vi_webp/dQw4w9WgXcQ/maxresdefault.webp", "preference": 0, "id": "37"}
+        ],
+        "url": "https://googlevideo.example/videoplayback?itag=18",
+        "formats": [
+            {"format_id": "sb1", "url": "https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L1", "vcodec": "none", "acodec": "none"},
+            {"format_id": "18", "url": "https://googlevideo.example/videoplayback?itag=18", "vcodec": "avc1.42001E", "acodec": "mp4a.40.2"}
+        ]
+    }"#;
+
     #[test]
     fn search_entries_parse_and_inherit_channel_as_artist() {
         let root: serde_json::Value = serde_json::from_str(SEARCH_JSON).unwrap();
@@ -531,6 +578,50 @@ mod tests {
         );
         assert_eq!(crate::util::video_url("yt:playlist:PLabc"), None); // not a video
         assert_eq!(crate::util::video_url(""), None);
+    }
+
+    #[test]
+    fn pick_url_skips_storyboards_and_takes_the_last_playable() {
+        let root: serde_json::Value = serde_json::from_str(ANDROID_JSON).unwrap();
+        // Default `bestaudio/best` (has a '/') → the last playable entry, not
+        // the trailing sb1 storyboard.
+        let url = pick_url(&root, "bestaudio/best").expect("mux url");
+        assert!(url.contains("itag=18"));
+        assert!(!url.contains("storyboard"));
+    }
+
+    #[test]
+    fn pick_url_prefers_a_bare_format_id_match() {
+        let root: serde_json::Value = serde_json::from_str(ANDROID_JSON).unwrap();
+        let url = pick_url(&root, "18").expect("exact itag");
+        assert!(url.contains("itag=18"));
+        // A configured id with no formats[] match falls through to the last
+        // playable entry too — never to the storyboard.
+        let url = pick_url(&root, "251").expect("fallback mux");
+        assert!(url.contains("itag=18"));
+    }
+
+    #[test]
+    fn pick_url_falls_back_to_the_top_level_url() {
+        let root: serde_json::Value =
+            serde_json::from_str(r#"{"id": "x", "url": "https://googlevideo.example/plain"}"#)
+                .unwrap();
+        assert_eq!(
+            pick_url(&root, "bestaudio/best"),
+            Some("https://googlevideo.example/plain")
+        );
+        // No url anywhere — nothing to play.
+        let root: serde_json::Value = serde_json::from_str(r#"{"id": "x"}"#).unwrap();
+        assert_eq!(pick_url(&root, "bestaudio/best"), None);
+    }
+
+    #[test]
+    fn android_dump_feeds_video_from_the_same_metadata_leg() {
+        let root: serde_json::Value = serde_json::from_str(ANDROID_JSON).unwrap();
+        let v = video_from(&root).expect("video row");
+        assert_eq!(v.uri, "yt:video:dQw4w9WgXcQ");
+        assert_eq!(v.artist, "Rick Astley");
+        assert_eq!(v.duration_ms, Some(213_000));
     }
 
     #[test]
