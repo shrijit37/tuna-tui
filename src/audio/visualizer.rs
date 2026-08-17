@@ -100,17 +100,6 @@ impl Visualizer {
         &self.bands
     }
 
-    /// Zero the displayed bands — e.g. when playback stops. Keeps `is_active`
-    /// (the engine drives that from playback state, not from audio flow).
-    pub fn reset(&mut self) {
-        if let Ok(mut g) = self.bands.lock() {
-            g.values.fill(0.0);
-            g.peak_envelope = 1e-6;
-            g.updated_at = Instant::now();
-        }
-        self.sample_buf.clear();
-    }
-
     /// Feed one chunk of interleaved stereo s16 PCM (whatever the decoder
     /// produced); the FFT bands update in place.
     pub fn feed_interleaved(&mut self, samples: &[i16]) {

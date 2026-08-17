@@ -28,9 +28,8 @@ const SOCKET_TIMEOUT_SECS: u32 = 10;
 /// single video. Rows that cannot be played (no video id) are dropped by the
 /// parsers rather than surfaced as empty rows.
 pub struct YtVideo {
-    /// The 11-char video id.
-    pub id: String,
-    /// Canonical internal uri: `yt:video:<id>`.
+    /// Canonical internal uri: `yt:video:<id>` — the id itself is derivable
+    /// (`track_id_from_uri`), so rows carry only the uri.
     pub uri: String,
     pub title: String,
     /// Best-known performer name: `artist` when MusicBrainz-tagged, else the
@@ -151,7 +150,10 @@ fn pseudo_radio(id: &str) -> Vec<YtVideo> {
     ]) else {
         return Vec::new();
     };
-    entries(&root).into_iter().filter(|v| v.id != id).collect()
+    entries(&root)
+        .into_iter()
+        .filter(|v| v.uri != format!("yt:video:{id}"))
+        .collect()
 }
 
 /// The search query a pseudo-radio station is built from: `artist - title`
@@ -200,7 +202,7 @@ fn entries(root: &serde_json::Value) -> Vec<YtVideo> {
 /// One `entries[]` row -> `YtVideo`. `None` drops rows with no video id — the
 /// flat-playlist equivalent of `api/library.rs`'s region-locked-row skip.
 fn video_from(v: &serde_json::Value) -> Option<YtVideo> {
-    let id = v["id"].as_str()?.to_string();
+    let id = v["id"].as_str()?;
     let title = v["title"].as_str().unwrap_or("").to_string();
     let artist = v["artist"]
         .as_str()
@@ -218,7 +220,6 @@ fn video_from(v: &serde_json::Value) -> Option<YtVideo> {
     let thumbnail = largest_thumbnail(v);
     let uri = format!("yt:video:{id}");
     Some(YtVideo {
-        id,
         uri,
         title,
         artist,
@@ -449,7 +450,7 @@ mod tests {
         let root: serde_json::Value = serde_json::from_str(SEARCH_JSON).unwrap();
         let vids = entries(&root);
         assert_eq!(vids.len(), 2);
-        assert_eq!(vids[0].id, "fJ9rUzIMcZQ");
+        assert_eq!(vids[0].uri, "yt:video:fJ9rUzIMcZQ");
         assert_eq!(vids[0].uri, "yt:video:fJ9rUzIMcZQ");
         assert_eq!(
             vids[0].title,
@@ -478,14 +479,14 @@ mod tests {
         .unwrap();
         let vids = entries(&root);
         assert_eq!(vids.len(), 1);
-        assert_eq!(vids[0].id, "abc123");
+        assert_eq!(vids[0].uri, "yt:video:abc123");
     }
 
     #[test]
     fn single_video_parses_full_meta_and_prefers_largest_thumbnail() {
         let root: serde_json::Value = serde_json::from_str(VIDEO_JSON).unwrap();
         let v = video_from(&root).expect("video row");
-        assert_eq!(v.id, "dQw4w9WgXcQ");
+        assert_eq!(v.uri, "yt:video:dQw4w9WgXcQ");
         assert_eq!(v.artist, "Rick Astley");
         assert_eq!(v.duration_ms, Some(213_000));
         assert_eq!(v.album, None);
@@ -504,7 +505,7 @@ mod tests {
         // Flat archive rows carry no channel — artist is empty, not fabricated.
         assert_eq!(vids[0].artist, "");
         assert_eq!(vids[0].duration_ms, Some(213_000));
-        assert_eq!(vids[1].id, "l9nh1l8ZIJQ");
+        assert_eq!(vids[1].uri, "yt:video:l9nh1l8ZIJQ");
         assert_eq!(vids[1].thumbnail, None);
     }
 
@@ -534,7 +535,7 @@ mod tests {
         // loses the duration rather than wrapping.
         let v = video_from(&root).unwrap();
         assert_eq!(v.duration_ms, None);
-        assert_eq!(v.id, "x");
+        assert_eq!(v.uri, "yt:video:x");
     }
 
     #[test]
@@ -546,7 +547,7 @@ mod tests {
                 .unwrap();
         let v = video_from(&root).unwrap();
         assert_eq!(v.duration_ms, None);
-        assert_eq!(v.id, "y");
+        assert_eq!(v.uri, "yt:video:y");
     }
 
     #[test]
@@ -592,7 +593,7 @@ mod tests {
     fn live_search_roundtrip() {
         let vids = search("bohemian rhapsody queen", 3);
         assert!(!vids.is_empty(), "expected at least one video");
-        assert!(vids.iter().all(|v| v.id.len() == 11));
+        assert!(vids.iter().all(|v| v.uri.starts_with("yt:video:")));
         assert!(vids.iter().any(|v| !v.artist.is_empty()));
     }
 

@@ -7,9 +7,9 @@
 //! spawns a worker thread, hands plain data back over channels, never touches
 //! `App` or the render tree.
 //!
-//! The channel contracts (`(Section, Vec<LibItem>)` + a done bool; search and
-//! detail replies) are unchanged from the Spotify era — only the fetchers and
-//! their call sites know they stopped being HTTP.
+//! The channel contracts (`(Section, Vec<LibItem>)`, search and detail
+//! replies) are unchanged from the Spotify era — only the fetchers and their
+//! call sites know they stopped being HTTP.
 
 use crate::app::*;
 use tuna_tui::config;
@@ -17,21 +17,15 @@ use tuna_tui::util::uri_parts;
 use tuna_tui::yt;
 
 /// Fetch the library incrementally: fast sections first, all local. The
-/// `(Section, Vec<LibItem>)` chunks + done bool match the old Spotify fetch —
-/// the bool is always `true` now: there is nothing that can fail at the
-/// transport, an empty store is a legitimate (fresh) state, and the reload
-/// path re-spawns with a fresh store snapshot.
-pub(crate) fn spawn_library_fetch(
-    store: Store,
-    tx: flume::Sender<(Section, Vec<LibItem>)>,
-    done_tx: flume::Sender<bool>,
-) {
+/// `(Section, Vec<LibItem>)` chunks match the old Spotify fetch; there is no
+/// done signal anymore — nothing can fail at the transport, an empty store is
+/// a legitimate (fresh) state, and the reload path re-spawns with a fresh
+/// store snapshot. (The app clears its loading status once the last section
+/// of a drain lands.)
+pub(crate) fn spawn_library_fetch(store: Store, tx: flume::Sender<(Section, Vec<LibItem>)>) {
     std::thread::Builder::new()
         .name("tuna-library".to_string())
-        .spawn(move || {
-            build_sections(&store, tx.clone());
-            let _ = done_tx.send(true);
-        })
+        .spawn(move || build_sections(&store, tx))
         .expect("spawn library worker");
 }
 

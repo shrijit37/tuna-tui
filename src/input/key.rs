@@ -133,7 +133,7 @@ pub(crate) fn handle_key(
         KeyCode::Char('r') => {
             app.status = "loading library…".to_string();
             app.browse.library.reset_loading();
-            spawn_library_fetch(app.store.clone(), chans.lib.clone(), chans.libdone.clone());
+            spawn_library_fetch(app.store.clone(), chans.lib.clone());
         }
         KeyCode::Char('o') => {
             app.browse.sort = app.browse.sort.next();

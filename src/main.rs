@@ -452,7 +452,6 @@ struct UiChannels {
     lyrics: flume::Sender<(Vec<(u32, String)>, bool)>,
     detail: flume::Sender<(String, String, Vec<LibItem>)>,
     radio: flume::Sender<Result<Radio, String>>,
-    libdone: flume::Sender<bool>,
 }
 
 async fn run_ui(
@@ -477,7 +476,6 @@ async fn run_ui(
     let (lyrics_tx, lyrics_rx) = flume::unbounded::<(Vec<(u32, String)>, bool)>();
     let (detail_tx, detail_rx) = flume::unbounded::<(String, String, Vec<LibItem>)>();
     let (radio_tx, radio_rx) = flume::unbounded::<Result<Radio, String>>();
-    let (libdone_tx, libdone_rx) = flume::unbounded::<bool>();
     let (souvlaki_tx, souvlaki_rx) = flume::unbounded::<MediaControlEvent>();
     let chans = UiChannels {
         lib: lib_tx,
@@ -485,9 +483,8 @@ async fn run_ui(
         lyrics: lyrics_tx,
         detail: detail_tx,
         radio: radio_tx,
-        libdone: libdone_tx,
     };
-    spawn_library_fetch(app.store.clone(), chans.lib.clone(), chans.libdone.clone());
+    spawn_library_fetch(app.store.clone(), chans.lib.clone());
 
     if app.playback.now.is_some() {
         resume_source(&mut app, &chans.radio);
@@ -539,9 +536,11 @@ async fn run_ui(
                 // Drain library updates deterministically before rendering. Keeping
                 // this solely as a select arm could starve under a hot player-event
                 // stream / 60fps visualizer — which looked like a frozen library.
+                let mut landed = false;
                 while let Ok((section, mut items)) = lib_rx.try_recv() {
                     let count = items.len();
                     dirty = true;
+                    landed = true;
                     liblog(format!("ui: received {} rows for {}", count, section.label()));
                     for (i, it) in items.iter_mut().enumerate() {
                         it.order = i as u32;
@@ -554,10 +553,11 @@ async fn run_ui(
                     app.status = format!("loaded {}", section.label());
                 }
                 // Local delivery cannot fail (the store is on disk, the sections are
-                // built from it), so the done signal only clears the loading
-                // status — there is no retry or failure path anymore.
-                while libdone_rx.try_recv().is_ok() {
-                    dirty = true;
+                // built from it), so once the last section of a drain lands the
+                // loading status clears — there is no retry or failure path anymore.
+                // (The interim "loaded <section>" lines never render; the clear
+                // happens in the same tick, before the frame is drawn.)
+                if landed {
                     app.status.clear();
                 }
                 // Radio results are drained here (not as a `select!` arm) for the

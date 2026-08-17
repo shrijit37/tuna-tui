@@ -8,7 +8,7 @@
 fn live_search_roundtrip() {
     let vids = tuna_tui::yt::search("bohemian rhapsody queen", 6);
     assert!(!vids.is_empty(), "expected at least one video");
-    assert!(vids.iter().all(|v| v.id.len() == 11));
+    assert!(vids.iter().all(|v| v.uri.starts_with("yt:video:")));
     assert!(vids.iter().any(|v| !v.artist.is_empty()));
 }
 

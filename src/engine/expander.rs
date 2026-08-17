@@ -24,9 +24,6 @@ use crate::yt;
 /// playback events and the NowPlaying pipeline consume.
 #[derive(Clone)]
 pub struct ResolvedTrack {
-    /// The canonical uri events and metadata carry (`spotify:track:…` /
-    /// `yt:video:…`). The engine echoes it untouched — it is the app's key.
-    pub uri: String,
     /// A direct audio URL, valid for the session (re-resolve on recovery).
     pub url: String,
     pub title: String,
@@ -142,7 +139,6 @@ fn entries_of(url: &str) -> Result<Vec<String>, String> {
 impl From<yt::StreamInfo> for ResolvedTrack {
     fn from(s: yt::StreamInfo) -> Self {
         ResolvedTrack {
-            uri: s.video.uri,
             url: s.url,
             title: s.video.title,
             artist: s.video.artist,
@@ -161,7 +157,6 @@ mod tests {
     fn radio_prepends_the_seed_and_caps_the_slice() {
         let seed = "yt:video:dQw4w9WgXcQ".to_string();
         let row = |id: &str| yt::YtVideo {
-            id: id.to_string(),
             uri: format!("yt:video:{id}"),
             title: String::new(),
             artist: String::new(),
@@ -191,7 +186,6 @@ mod tests {
     fn radio_caps_at_radio_limit_and_rejects_empty_stations() {
         let seed = "yt:video:dQw4w9WgXcQ".to_string();
         let row = |i: u32| yt::YtVideo {
-            id: format!("a{i:010}"),
             uri: format!("yt:video:a{i:010}"),
             title: String::new(),
             artist: String::new(),
@@ -207,7 +201,6 @@ mod tests {
         // Nothing but the seed itself → an empty station is an error, not a
         // one-track station.
         let rows = vec![yt::YtVideo {
-            id: "dQw4w9WgXcQ".to_string(),
             uri: seed.clone(),
             title: String::new(),
             artist: String::new(),
