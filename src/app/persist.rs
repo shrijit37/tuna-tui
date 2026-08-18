@@ -234,7 +234,8 @@ impl SavedState {
             Err(_) => {
                 let bak = path.with_extension("json.bak");
                 tuna_tui::liblog::liblog(format!(
-                    "state.json corrupt ({bak:?}); recovering from state.json.bak"
+                    "{} corrupt; recovering from {bak:?}",
+                    path.display()
                 ));
                 std::fs::read_to_string(&bak)
                     .ok()
