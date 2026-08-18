@@ -341,7 +341,11 @@ mod tests {
     }
 
     /// Take up to `max` pops. Returns (zeros, real pops, frames at the end,
-    /// ended).
+    /// ended). Use only where the pump's delivery state is already settled
+    /// (pre-release silence, or a channel drained after the supplied data
+    /// was consumed): a fixed pop budget races the pump thread otherwise —
+    /// on a loaded box the drive can finish before the pump's first chunk or
+    /// its end-marker lands, misreading a good source as "zero audio".
     fn drive(src: &mut FfmpegSource, frames: &AtomicU64, max: usize) -> (usize, usize, u64, bool) {
         let mut zeros = 0;
         let mut real = 0;
@@ -364,6 +368,58 @@ mod tests {
         (zeros, real, frames.load(Ordering::Relaxed), ended)
     }
 
+    /// Drive pops until the source ends or `timeout` elapses — the pump
+    /// thread delivers chunks asynchronously, so the caller must WAIT for
+    /// the end-marker, not race it with a pop budget. Returns (zeros, real
+    /// pops, frames at the end, ended). The timeout only bounds a genuinely
+    /// broken source; a healthy pump lands its marker in milliseconds.
+    fn drive_until_ended(
+        src: &mut FfmpegSource,
+        frames: &AtomicU64,
+        timeout: Duration,
+    ) -> (usize, usize, u64, bool) {
+        let deadline = Instant::now() + timeout;
+        let (mut zeros, mut real) = (0, 0);
+        loop {
+            match src.next() {
+                Some(s) if s == 0.0 => zeros += 1,
+                Some(_) => real += 1,
+                None => return (zeros, real, frames.load(Ordering::Relaxed), true),
+            }
+            if Instant::now() >= deadline {
+                return (zeros, real, frames.load(Ordering::Relaxed), false);
+            }
+        }
+    }
+
+    /// Drive pops until `expected` real samples were popped, the source
+    /// ended, or `timeout` elapsed. Returns (real pops, frames, ended) —
+    /// used where the gate's POOL opening is the invariant and no EOF ever
+    /// comes (the pipe stays open for the gap phase, so "ended" stays
+    /// false by design).
+    fn drive_until_real(
+        src: &mut FfmpegSource,
+        frames: &AtomicU64,
+        expected_real: usize,
+        timeout: Duration,
+    ) -> (usize, u64, bool) {
+        let deadline = Instant::now() + timeout;
+        let mut real = 0;
+        loop {
+            match src.next() {
+                Some(s) if s == 0.0 => {}
+                Some(_) => real += 1,
+                None => return (real, frames.load(Ordering::Relaxed), true),
+            }
+            if real >= expected_real {
+                return (real, frames.load(Ordering::Relaxed), false);
+            }
+            if Instant::now() >= deadline {
+                return (real, frames.load(Ordering::Relaxed), false);
+            }
+        }
+    }
+
     /// The gate holds back real audio until the pending pool reaches the
     /// threshold — and when the pipe can never fill it, EOF opens the gate
     /// early so a short stream completes instead of hanging in silence.
@@ -381,9 +437,11 @@ mod tests {
         assert!(z0 > 0, "the gate should have played some silence");
 
         // Release: the pipe delivers + closes. EOF opens the gate below the
-        // threshold; every sample is popped, then the source ends.
+        // threshold; every sample is popped, then the source ends. The
+        // end-marker lands on the pump thread's schedule — wait for it
+        // (bounded), never race it with a pop budget.
         release.store(true, Ordering::SeqCst);
-        let (_, real, f, ended) = drive(&mut src, &frames, 50_000);
+        let (_, real, f, ended) = drive_until_ended(&mut src, &frames, Duration::from_secs(5));
         assert_eq!(real, 4096, "all delivered audio is played");
         assert_eq!(f, 2048, "only real pops count as stereo frames");
         assert!(ended, "the short stream must end after EOF");
@@ -405,7 +463,7 @@ mod tests {
         let (mut src, frames, _sourced, release) = gated_source(8 * 1024, pcm(4096), false);
 
         release.store(true, Ordering::SeqCst);
-        let (_, real, f, ended) = drive(&mut src, &frames, 50_000);
+        let (real, f, ended) = drive_until_real(&mut src, &frames, 8192, Duration::from_secs(5));
         assert_eq!(real, 8192, "gate opens on the filled pool, no EOF needed");
         assert_eq!(f, 4096, "4096 stereo frames popped");
         assert!(!ended, "a gap is silence, not EOF");
@@ -488,7 +546,7 @@ mod tests {
         let (mut src, frames, _sourced, release) = gated_source(16 * 1024, pcm(8192), false);
 
         release.store(true, Ordering::SeqCst);
-        let (_, real, f, _) = drive(&mut src, &frames, 50_000);
+        let (real, f, _) = drive_until_real(&mut src, &frames, 16_384, Duration::from_secs(5));
         assert_eq!(real, 16_384, "the full 16k-sample pool is popped");
         assert_eq!(f, 8192, "8192 stereo frames");
     }
