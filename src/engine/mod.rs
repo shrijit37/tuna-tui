@@ -1676,9 +1676,44 @@ fn truncate_seconds(pos: u32) -> u32 {
 /// Build in-band metadata for a yt: track, fetching its cover + theme the
 /// same way the api layer did (httpcache-keyed, 24 h TTL).
 fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client) -> EngineMeta {
+    // Spotify canonical metadata enriches the YouTube-derived row: the
+    // query is the raw resolved title ("Artist — Title" flat rows parse
+    // straight in), a hit wins for title/artist/album, and its duration
+    // also corrects the YouTube-length drift that makes lrclib exact-
+    // duration matching miss (Myx-a4e.7). A miss degrades silently — the
+    // keyless route can be throttled at any time and nothing depends on it.
+    let spot = {
+        let query = if r.artist.is_empty() {
+            r.title.clone()
+        } else {
+            format!("{} {}", r.artist, r.title)
+        };
+        crate::spotify::search_track(client, &query)
+    };
+    let (title, artist, album, duration_ms) = match &spot {
+        Some(s) => (
+            s.title.clone(),
+            s.artists.join(", "),
+            s.album.clone(),
+            s.duration_ms,
+        ),
+        None => (
+            r.title.clone(),
+            r.artist.clone(),
+            r.album.clone().unwrap_or_default(),
+            r.duration_ms.unwrap_or(0),
+        ),
+    };
+    // Cover: the YouTube thumbnail is the primary source; when the track
+    // row has none (flat playlist rows often lack one), the Spotify hit's
+    // album art fills the gap — better covers, better themes, same cache.
+    let cover_url = r
+        .thumbnail
+        .as_deref()
+        .or(spot.as_ref().and_then(|s| s.image_url.as_deref()));
     let mut image = None;
     let mut theme = None;
-    if let Some(url) = &r.thumbnail {
+    if let Some(url) = cover_url {
         if let Some(bytes) = fetch_cover(client, url) {
             if let Ok(img) = image::load_from_memory(&bytes) {
                 theme = Some(crate::reactive::derive_theme(&img, "album ✦"));
@@ -1688,11 +1723,11 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
     }
     EngineMeta {
         uri: uri.to_string(),
-        title: r.title.clone(),
-        artist: r.artist.clone(),
-        album: r.album.clone().unwrap_or_default(),
-        duration_ms: r.duration_ms.unwrap_or(0),
-        image_url: r.thumbnail.clone(),
+        title,
+        artist,
+        album,
+        duration_ms,
+        image_url: cover_url.map(str::to_owned),
         image,
         theme,
     }
