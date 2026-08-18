@@ -48,7 +48,7 @@
               ]
               ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
                 pkgs.libiconv
-              ]
+              ];
 
             strictDeps = true;
 
