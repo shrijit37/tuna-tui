@@ -23,3 +23,11 @@ jobs:
           jules_api_key: ${{ secrets.JULES_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           fail_on: blocking
+
+# --- Known limitation (accepted 2026-08-18, decision: document + accept) ---
+# The action skips fork PRs by default (skip_forks: true, anti prompt-injection) and sets
+# no status for them. With branch protection requiring jules/review on master, fork PRs can
+# never merge (no status ever appears on their head commit). Accepted for this solo repo.
+# Escape hatch if a fork PR ever needs merging: temporarily drop the required check via
+#   gh api -X DELETE repos/shrijit37/tuna-tui/branches/master/protection/required_status_checks
+# merge after a human review, then re-add it (PUT .../protection with the same body).
