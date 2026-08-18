@@ -327,6 +327,12 @@ const STALL_AFTER: Duration = Duration::from_secs(15);
 /// connections die a few hundred ms in and ffmpeg exits 0, indistinguishable
 /// from a natural end by exit code alone. 5 s is well under any real song.
 const MIN_EOF_POSITION_MS: u32 = 5_000;
+/// A clean EOF whose delivered playhead ends more than this far short of the
+/// known `duration_ms` is a stream that died near the end (googlevideo closes
+/// mid-stream on this box), not a finished track — rebuild it from `pos`.
+/// Above the 3 s `short_track` allowance (decode jitter, resume anchors),
+/// well under the ~30 s symptom that motivated it.
+const EOF_SHORTFALL_MS: u32 = 10_000;
 /// How many consecutive short-EOF drops on the same track before it is given
 /// up on (skipped or, at the queue tail with repeat off, stopped cleanly)
 /// instead of rebuilding forever.
@@ -762,9 +768,11 @@ impl Worker {
             return None;
         }
         if self.state.shuffle && n > 1 {
-            use rand::Rng as _;
-            let other: Vec<usize> = (0..n).filter(|&i| i != self.state.cursor).collect();
-            let pick = other[rand::rng().random_range(0..other.len())];
+            let pick = shuffle_pick(self.state.cursor, n, &mut rand::rng());
+            // Push-history-then-assign-cursor, unconditionally (binding F8
+            // safe fix). `start_track_at` bounds-checks `tracks.get(idx)`, so
+            // even the degenerate `cursor == n` state `give_up_on` can leave
+            // replays as a safe no-op, never a panic.
             self.state.history.push(self.state.cursor);
             self.state.cursor = pick;
             return Some(pick);
@@ -819,40 +827,81 @@ impl Worker {
         };
         let uri = cur.uri.clone();
         let pos = self.position_of(&cur);
-        let failed = cur
-            .child
-            .try_wait()
-            .ok()
-            .flatten()
-            .is_some_and(|s| s.code() != Some(0));
-        let short_track = cur
-            .duration_ms
-            .is_some_and(|d| pos.saturating_add(3_000) >= d);
-        let dropped = !failed && pos < MIN_EOF_POSITION_MS && !short_track;
+        // Capture the child's status ONCE, before any kill: a post-kill
+        // `wait()` reports `code()==None`, which would flip every natural end
+        // into a failed stream and trigger spurious recover_into rebuilds.
+        let exited = cur.child.try_wait().ok().flatten();
+        let (failed, dropped) = classify_end(exited, pos, cur.duration_ms);
         if failed || dropped {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
-            self.drop_streak += 1;
-            if self.drop_streak >= RECOVERY_ATTEMPTS {
-                liblog(format!(
-                    "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
-                ));
-                self.give_up_on(uri);
-                return;
-            }
             if dropped {
-                liblog(format!(
-                    "engine: stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms); rebuilding"
-                ));
+                // Distinguish the two drop kinds in the log: a late transport
+                // death (EOF far short of the known duration) versus a stream
+                // that died inside the start-up window.
+                let why = match cur.duration_ms.map(|d| d.saturating_sub(pos)) {
+                    Some(short) if short > EOF_SHORTFALL_MS => {
+                        format!("stream ended {short}ms short of duration for {uri}")
+                    }
+                    _ => format!("stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms)"),
+                };
+                self.rebuild_after_eof(uri, pos, why);
             } else {
-                liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
+                let why = format!("decoder died for {uri}");
+                self.rebuild_after_eof(uri, pos, why);
             }
-            self.recover_into(uri, pos);
             return;
         }
         self.drop_streak = 0;
+        // Natural end: the child may still be mid-shutdown. With no SIGCHLD
+        // reaper anywhere and `Child::drop` not waiting, an exit a moment
+        // later would leave a zombie until process end — kill+wait closes the
+        // window (the same pattern the failed/seek/shutdown/teardown paths
+        // already use). A child stuck in an unkillable state (D-state) lets
+        // this wait block the worker's advance — the same tradeoff the other
+        // four kill+wait sites already accept, and audio at EOF has ceased
+        // anyway. The classification stays strictly on the pre-kill
+        // `try_wait` (binding F8 regression caution): the status of a child
+        // we killed ourselves (`code()==None` over signal death) must not
+        // reclassify a natural end into a failed stream.
+        if exited.is_none() {
+            // A kill that fails (ESRCH) means the child exited in the window
+            // since the try_wait above — wait() then reports the REAL status
+            // (no signal was delivered), and a mid-song decoder crash racing
+            // the EOF must rebuild instead of advancing. The post-successful-
+            // kill wait stays discarded: code()==None over signal death is
+            // the signal we sent, never a classification (binding F8).
+            if cur.child.kill().is_err() {
+                // Signal deaths count as crashes (a segfaulting decoder has
+                // `code()==None`, non-failed by the `.and_then` form) — same
+                // predicate as the primary `failed` check.
+                let crashed = cur.child.wait().ok().is_some_and(|s| s.code() != Some(0));
+                if crashed {
+                    let why = format!("decoder died for {uri} at EOF");
+                    self.rebuild_after_eof(uri, pos, why);
+                    return;
+                }
+            } else {
+                let _ = cur.child.wait();
+            }
+        }
         drop(cur);
         self.advance();
+    }
+
+    /// Shared tail of the failed/dropped/crashed-at-EOF paths: bounded
+    /// retries, then a rebuild of the current stream from `pos`.
+    fn rebuild_after_eof(&mut self, uri: String, pos: u32, why: String) {
+        self.drop_streak += 1;
+        if self.drop_streak >= RECOVERY_ATTEMPTS {
+            liblog(format!(
+                "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
+            ));
+            self.give_up_on(uri);
+            return;
+        }
+        liblog(format!("engine: {why}; rebuilding"));
+        self.recover_into(uri, pos);
     }
 
     /// The track is given up on after too many consecutive failures: remove it
@@ -1208,6 +1257,48 @@ fn truncate_seconds(pos: u32) -> u32 {
     pos / 1000 * 1000
 }
 
+/// Pick a random index in `0..n` excluding `cursor` — a rejection loop that
+/// replaces the per-track `Vec<usize>` of all other indices (F11), the only
+/// per-track allocation in the queue logic. `n > 1` guarantees termination;
+/// pure for testing. Deliberately NOT the `random_range(0..n-1)` + offset map
+/// variant: it diverges for one advance in the degenerate `cursor == len`
+/// state `give_up_on` can leave, where this loop simply breaks on the first
+/// draw — identical in every reachable state.
+fn shuffle_pick(cursor: usize, n: usize, rng: &mut impl rand::Rng) -> usize {
+    loop {
+        let i = rng.random_range(0..n);
+        if i != cursor {
+            break i;
+        }
+    }
+}
+
+/// Classify an EOF as `(failed, dropped)` — mirrors the inline math
+/// `track_ended` used before F8. `failed` must be judged from the PRE-kill
+/// `try_wait` value: a post-kill `wait()` reports `code()==None` and would
+/// mislabel every natural end as a failed stream. `dropped` is a clean end
+/// with fewer than [`MIN_EOF_POSITION_MS`] of delivered playhead, unless the
+/// track itself is genuinely that short (`duration_ms` says its real end was
+/// reached) — or a clean end whose playhead ends more than
+/// [`EOF_SHORTFALL_MS`] short of the known duration: a transport that died
+/// near the end (googlevideo closes mid-stream on this box) reads as a
+/// finished track otherwise, and the song "ends" early. Known gap,
+/// pre-existing: when the resolver's `duration_ms` is unknown (None), a
+/// genuinely short clean track reads as a drop and gets rebuilt once — the
+/// `short_track` exemption needs the known length. Pure for testing.
+fn classify_end(
+    exited: Option<std::process::ExitStatus>,
+    pos: u32,
+    duration_ms: Option<u32>,
+) -> (bool, bool) {
+    let failed = exited.is_some_and(|s| s.code() != Some(0));
+    let short_track = duration_ms.is_some_and(|d| pos.saturating_add(3_000) >= d);
+    let truncated =
+        !failed && duration_ms.is_some_and(|d| pos.saturating_add(EOF_SHORTFALL_MS) < d);
+    let dropped = (!failed && pos < MIN_EOF_POSITION_MS && !short_track) || truncated;
+    (failed, dropped)
+}
+
 /// Build in-band metadata for a yt: track, fetching its cover + theme the
 /// same way the api layer did (httpcache-keyed, 24 h TTL).
 fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client) -> EngineMeta {
@@ -1281,6 +1372,89 @@ mod tests {
         assert_eq!(frames_to_position(0, 0), 0);
         // Huge counts clamp rather than wrap.
         assert_eq!(frames_to_position(0, u64::MAX), u32::MAX);
+    }
+
+    /// An `ExitStatus` fixture from a raw exit code, portable across the CI
+    /// matrix (no stable plain constructor exists, and spawning `true`/`false`
+    /// would not work on Windows).
+    #[cfg(unix)]
+    fn status_from_code(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // wait(2) stores the exit code in the high byte of the raw status
+        // word (WEXITSTATUS); passing it bare decodes as a signal
+        // termination (code() == None), not "exited with code N".
+        std::process::ExitStatus::from_raw((code & 0xff) << 8)
+    }
+
+    /// Windows stores the exit code directly in the raw status word.
+    #[cfg(windows)]
+    fn status_from_code(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+
+    /// F8: classification MUST run on the PRE-kill try_wait value — a
+    /// post-kill `wait()` reports `code()==None` and would flip every natural
+    /// end into a failed stream, triggering spurious recover_into rebuilds.
+    #[test]
+    fn classify_end_uses_pre_kill_exit() {
+        let ok = status_from_code(0);
+        let err = status_from_code(1);
+        // Natural end past the 5 s drop threshold: neither failed nor dropped.
+        assert_eq!(classify_end(Some(ok), 10_000, None), (false, false));
+        // Clean exit but only 500 ms delivered on a 200 s track: dropped.
+        assert_eq!(classify_end(Some(ok), 500, Some(200_000)), (false, true));
+        // Non-zero exit: failed, whatever the position.
+        assert_eq!(classify_end(Some(err), 10_000, None), (true, false));
+        // No captured status (child mid-shutdown at try_wait): natural end —
+        // the caller then kills + waits, never a rebuild.
+        assert_eq!(classify_end(None, 10_000, None), (false, false));
+        // A genuinely short track (2 s duration) ending at pos 0: the
+        // short-track exemption keeps it a natural end.
+        assert_eq!(classify_end(Some(ok), 0, Some(2_000)), (false, false));
+        // No status, only 500 ms delivered: dropped.
+        assert_eq!(classify_end(None, 500, None), (false, true));
+        // A clean EOF 30 s short of a 200 s track: the transport died near
+        // the end — dropped, rebuilt from pos (the early-end bug).
+        assert_eq!(
+            classify_end(Some(ok), 170_000, Some(200_000)),
+            (false, true)
+        );
+        // A clean EOF 5 s short: within the 10 s shortfall allowance — a
+        // natural end (decode jitter, resume anchors).
+        assert_eq!(
+            classify_end(Some(ok), 195_000, Some(200_000)),
+            (false, false)
+        );
+        // Unknown duration: the shortfall clause can't apply — behavior
+        // unchanged for resolver gaps.
+        assert_eq!(classify_end(Some(ok), 170_000, None), (false, false));
+        // Failed AND truncated: failed wins the classification.
+        assert_eq!(
+            classify_end(Some(err), 170_000, Some(200_000)),
+            (true, false)
+        );
+    }
+
+    /// F11: the rejection loop must stay in `0..n` and never return the
+    /// cursor — including the degenerate `cursor == n` state `give_up_on` can
+    /// leave, where the offset-map variant diverges.
+    #[test]
+    fn shuffle_pick_never_returns_the_cursor() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x53EED);
+        for n in 2..=10usize {
+            for cursor in 0..=n {
+                for _ in 0..500 {
+                    let pick = shuffle_pick(cursor, n, &mut rng);
+                    assert!(
+                        pick < n,
+                        "pick {pick} out of range for n={n}, cursor={cursor}"
+                    );
+                    assert_ne!(pick, cursor, "pick == cursor {cursor} for n={n}");
+                }
+            }
+        }
     }
 
     #[test]
