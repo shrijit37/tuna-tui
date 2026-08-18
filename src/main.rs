@@ -114,7 +114,13 @@ where
                     _ => None,
                 },
             };
-            buffer = value.and_then(|s| s.parse::<u8>().ok());
+            // The documented contract is 1..=30 (the template's own comment).
+            // Out-of-range values — 0 (buffer silently off) and 31..=255 —
+            // fall back to the config file, same policy as the lenient
+            // config reader.
+            buffer = value
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|v| (1..=30).contains(v));
             continue;
         }
         rest.push(arg);

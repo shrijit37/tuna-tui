@@ -232,8 +232,13 @@ impl Config {
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(d.search_limit),
             cookies_file: text("cookies_file").or(d.cookies_file),
+            // Documented contract is 1..=30 (the template's own comment): 0
+            // would silently switch the prebuffer off and 31..=255 are
+            // typos — out-of-range falls back to the default, same as any
+            // other wrong value.
             buffer_duration_secs: int("buffer_duration_secs")
                 .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (1..=30).contains(v))
                 .unwrap_or(d.buffer_duration_secs),
         }
     }
@@ -381,6 +386,24 @@ mod tests {
         assert_eq!(c.buffer_duration_secs, 2, "float for u8 falls back");
         let c = Config::parse("buffer_duration_secs = \"5\"").expect("valid toml");
         assert_eq!(c.buffer_duration_secs, 2, "string for u8 falls back");
+    }
+
+    #[test]
+    fn an_out_of_range_buffer_secs_defaults_its_key() {
+        // The template documents 1..30. 0 would silently switch the
+        // prebuffer off; 31..=255 are typos. All fall back to the default,
+        // while the documented endpoints survive.
+        for bad in [0u8, 31, 200, 255] {
+            let c = Config::parse(&format!("buffer_duration_secs = {bad}")).expect("valid toml");
+            assert_eq!(
+                c.buffer_duration_secs, 2,
+                "{bad} is outside the documented 1..30 and must default"
+            );
+        }
+        for good in [1u8, 30] {
+            let c = Config::parse(&format!("buffer_duration_secs = {good}")).expect("valid toml");
+            assert_eq!(c.buffer_duration_secs, good, "{good} is in range");
+        }
     }
 
     #[test]

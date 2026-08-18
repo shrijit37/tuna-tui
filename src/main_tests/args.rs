@@ -71,3 +71,31 @@ fn out_of_range_value_falls_back_to_config() {
     assert_eq!(buffer, None);
     assert_eq!(rest, Vec::<String>::new());
 }
+
+#[test]
+fn outside_the_documented_range_falls_back_to_config() {
+    // The template documents 1..30: 0 (prebuffer silently off) and 31..=255
+    // (typos) must not reach the engine. The flag is still consumed — the
+    // value slot exists — but the knob falls back to the config file.
+    for bad in ["0", "31", "200", "255"] {
+        let (rest, buffer) = p(&["--buffer-duration", bad]);
+        assert_eq!(buffer, None, "{bad} is outside 1..30");
+        assert_eq!(rest, Vec::<String>::new(), "flag + value both consumed");
+        let (rest, buffer) = p(&[&format!("--buffer-duration={bad}")]);
+        assert_eq!(buffer, None, "inline {bad} is outside 1..30");
+        assert_eq!(rest, Vec::<String>::new());
+    }
+    // The documented endpoints survive, space-separated and inline.
+    for good in ["1", "30"] {
+        let (rest, buffer) = p(&["--buffer-duration", good]);
+        assert_eq!(buffer, Some(good.parse().unwrap()), "{good} is in range");
+        assert_eq!(rest, Vec::<String>::new());
+        let (rest, buffer) = p(&[&format!("--buffer-duration={good}")]);
+        assert_eq!(
+            buffer,
+            Some(good.parse().unwrap()),
+            "inline {good} in range"
+        );
+        assert_eq!(rest, Vec::<String>::new());
+    }
+}
