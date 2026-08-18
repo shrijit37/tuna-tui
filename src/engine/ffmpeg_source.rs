@@ -39,6 +39,16 @@ use crate::audio::{VisBands, Visualizer};
 
 /// Bytes per pump read (16 KiB = 4096 stereo frames ≈ 93 ms).
 const READ_BYTES: usize = 16 * 1024;
+/// Float samples per pump chunk (one s16 read = 8192 floats). `fold` pulls
+/// whole chunks, so the pump channel must hold *at least* the whole pre-roll
+/// in chunks — rounding down leaves the gate a chunk short of its threshold
+/// and the source playing silence one pop past the moment it could start.
+fn prebuffer_capacity(prebuffer_samples: usize) -> usize {
+    // Round UP: any pre-roll that isn't an exact chunk multiple needs the
+    // partial chunk's worth of depth too. The 8-chunk floor keeps the legacy
+    // depth for tiny buffers.
+    prebuffer_samples.div_ceil(READ_BYTES / 2).max(8)
+}
 
 /// The rodio source for one ffmpeg child. Cheap to build; the expensive pipe
 /// I/O happens on the pump thread started inside [`FfmpegSource::new`].
@@ -73,6 +83,12 @@ pub(crate) struct FfmpegSource {
     /// the pull bound in `fold()`, and the `pending` capacity. Threaded in
     /// from `config.buffer_duration_secs` by the engine.
     prebuffer_samples: usize,
+    /// Stereo frames DECODED from the pump (fold), as opposed to delivered
+    /// (`frames`). While the gate holds pops, only this counter moves — the
+    /// engine's watchdog treats "either counter advancing" as liveness, so a
+    /// slow-but-working link filling a deep pre-roll is never mistaken for a
+    /// stall and torn down.
+    sourced: Arc<AtomicU64>,
 }
 
 impl FfmpegSource {
@@ -84,16 +100,15 @@ impl FfmpegSource {
     pub(crate) fn new<R: Read + Send + 'static>(
         stdout: R,
         frames: Arc<AtomicU64>,
+        sourced: Arc<AtomicU64>,
         bands: Arc<Mutex<VisBands>>,
         cancelled: Arc<AtomicBool>,
         prebuffer_samples: usize,
     ) -> Self {
-        // The channel must hold at least the whole pre-roll (in s16 bytes) —
+        // The channel must hold at least the whole pre-roll in chunks —
         // otherwise `fold` drains it once, stays below the gate, and the
-        // source plays silence until EOF: a startup deadlock. Floor of 8
-        // keeps the legacy depth for tiny buffers.
-        let capacity = (prebuffer_samples * 2 / READ_BYTES).max(8);
-        let (tx, chunks) = flume::bounded(capacity);
+        // source plays silence until EOF: a startup deadlock.
+        let (tx, chunks) = flume::bounded(prebuffer_capacity(prebuffer_samples));
         // The pump: blocking `read`s live here, never on cpal's callback
         // thread. It ends when the pipe closes (natural EOF or a killed
         // child), or when the source (and so `tx`) goes away.
@@ -129,6 +144,7 @@ impl FfmpegSource {
             chunks,
             scratch: vec![0i16; READ_BYTES / 2],
             prebuffer_samples,
+            sourced,
         }
     }
 
@@ -155,6 +171,11 @@ impl FfmpegSource {
                         self.scratch[i] = i16::from_le_bytes([pair[0], pair[1]]);
                     }
                     self.visualizer.feed_interleaved(&self.scratch[..n]);
+                    // Decode-side progress: the playhead authority is pops,
+                    // but the watchdog's liveness signal is "is the decoder
+                    // producing" — count what the pump delivered, so a deep
+                    // pre-roll filling slowly is alive, not stalled.
+                    self.sourced.fetch_add((n / 2) as u64, Ordering::Relaxed);
                     self.pending.extend(
                         self.scratch[..n]
                             .iter()
@@ -243,6 +264,7 @@ impl Source for FfmpegSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// Interleaved s16 stereo PCM: `frames` stereo frames of nonzero samples
     /// (`i + 1` skips zero so no real pop is ever classified as silence, and
@@ -293,8 +315,14 @@ mod tests {
         prebuffer_samples: usize,
         data: Vec<u8>,
         eof: bool,
-    ) -> (FfmpegSource, Arc<AtomicU64>, Arc<AtomicBool>) {
+    ) -> (
+        FfmpegSource,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicBool>,
+    ) {
         let frames = Arc::new(AtomicU64::new(0));
+        let sourced = Arc::new(AtomicU64::new(0));
         let release = Arc::new(AtomicBool::new(false));
         let src = FfmpegSource::new(
             GatedReader {
@@ -304,11 +332,12 @@ mod tests {
                 eof,
             },
             Arc::clone(&frames),
+            Arc::clone(&sourced),
             VisBands::shared(),
             Arc::new(AtomicBool::new(false)),
             prebuffer_samples,
         );
-        (src, frames, release)
+        (src, frames, sourced, release)
     }
 
     /// Take up to `max` pops. Returns (zeros, real pops, frames at the end,
@@ -342,7 +371,7 @@ mod tests {
     fn gate_holds_below_threshold_and_eof_opens_it() {
         // 2048 stereo frames = 4096 float samples against a 8192-sample gate:
         // the pool can never fill it — only the end-marker can open the gate.
-        let (mut src, frames, release) = gated_source(8 * 1024, pcm(2048), true);
+        let (mut src, frames, sourced, release) = gated_source(8 * 1024, pcm(2048), true);
 
         // With the pipe shut, pops are silence — and uncounted.
         let (z0, r0, f0, e0) = drive(&mut src, &frames, 1000);
@@ -359,6 +388,11 @@ mod tests {
         assert_eq!(f, 2048, "only real pops count as stereo frames");
         assert!(ended, "the short stream must end after EOF");
         assert_eq!(src.next(), None, "the iterator stays ended");
+        assert_eq!(
+            sourced.load(Ordering::Relaxed),
+            2048,
+            "decode progress counts every delivered frame"
+        );
     }
 
     /// Once the pool reaches the threshold the gate opens on its own — no EOF
@@ -368,7 +402,7 @@ mod tests {
     fn gate_opens_on_filled_pool_then_gap_plays_silence() {
         // One full chunk (8192 float samples) exactly fills an 8192-sample
         // gate; the pipe then never closes.
-        let (mut src, frames, release) = gated_source(8 * 1024, pcm(4096), false);
+        let (mut src, frames, _sourced, release) = gated_source(8 * 1024, pcm(4096), false);
 
         release.store(true, Ordering::SeqCst);
         let (_, real, f, ended) = drive(&mut src, &frames, 50_000);
@@ -384,12 +418,74 @@ mod tests {
         assert!(!ended2, "gap silence is not EOF");
     }
 
+    /// Decode-side progress (the watchdog's liveness signal) advances while
+    /// the gate still holds pops: one chunk decoded into a two-chunk gate
+    /// moves `sourced` without a single delivered frame — the exact "slow
+    /// link filling the pre-roll" state the watchdog must not call a stall.
+    #[test]
+    fn decode_progress_is_counted_while_the_gate_holds_pops() {
+        // One chunk (8192 floats) against a two-chunk gate: queued audio
+        // with a closed gate.
+        let (mut src, frames, sourced, release) = gated_source(16 * 1024, pcm(4096), false);
+        release.store(true, Ordering::SeqCst);
+        // Pop until the pump's chunk is folded in (deterministic: the pump
+        // thread is not scheduled on demand), counting how many pops it took.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut real = 0usize;
+        while Instant::now() < deadline {
+            match src.next() {
+                Some(0.0) => {} // gated silence
+                Some(_) => real += 1,
+                None => break,
+            }
+            if sourced.load(Ordering::Relaxed) >= 4096 {
+                break;
+            }
+        }
+        assert_eq!(real, 0, "the gate still holds pops");
+        assert_eq!(
+            sourced.load(Ordering::Relaxed),
+            4096,
+            "decoded frames are counted while pops are gated"
+        );
+        assert_eq!(
+            frames.load(Ordering::Relaxed),
+            0,
+            "no delivered frames while the gate holds"
+        );
+    }
+
+    /// The pump channel must hold the whole pre-roll in chunks: a capacity
+    /// truncated below the pre-roll would leave the gate a chunk short of its
+    /// threshold at every supported depth (the 1s end rounds 10.76 chunks
+    /// down to 10 and loses the 11th — the gate then opens one pop late).
+    #[test]
+    fn channel_capacity_holds_the_full_pre_roll() {
+        for (secs, depth, chunks) in [
+            (1u8, 88_200usize, 11usize),
+            (2, 176_400, 22),
+            (5, 441_000, 54),
+            (30, 2_646_000, 323),
+        ] {
+            let cap = prebuffer_capacity(depth);
+            assert_eq!(cap, chunks, "{secs}s pre-roll needs {chunks} chunks");
+            // The invariant the capacity exists for: one full channel can
+            // satisfy the gate without waiting on a refill.
+            assert!(
+                cap * (READ_BYTES / 2) >= depth,
+                "{secs}s: capacity {cap} chunks < pre-roll"
+            );
+        }
+        // Tiny depths keep the legacy floor.
+        assert_eq!(prebuffer_capacity(4096), 8);
+    }
+
     /// The threshold is a parameter, not a constant: a bigger buffer delivers
     /// a longer gate.
     #[test]
     fn threshold_is_parameterized() {
         // Two chunks (16384 float samples) against a 16384-sample gate.
-        let (mut src, frames, release) = gated_source(16 * 1024, pcm(8192), false);
+        let (mut src, frames, _sourced, release) = gated_source(16 * 1024, pcm(8192), false);
 
         release.store(true, Ordering::SeqCst);
         let (_, real, f, _) = drive(&mut src, &frames, 50_000);

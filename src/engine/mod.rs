@@ -147,6 +147,10 @@ struct CurrentTrack {
     done: std::sync::mpsc::Receiver<()>,
     /// Per-channel samples delivered (the playhead authority).
     frames: Arc<AtomicU64>,
+    /// Stereo frames DECODED from the pump (the liveness signal). The source
+    /// increments it in `fold`; the watchdog refreshes its stall clock when
+    /// either counter advances, so a slow-but-working pre-roll is alive.
+    sourced: Arc<AtomicU64>,
     /// Shared with the source; flipped before killing the child so the old
     /// sound ends on the next callback instead of draining its backlog.
     cancelled: Arc<AtomicBool>,
@@ -170,6 +174,35 @@ struct PausedTrack {
 struct Health {
     playing: bool,
     last_progress: Instant,
+}
+
+/// Re-anchor the watchdog clock when the playhead OR the decoder made
+/// progress; returns whether either did. The decode counter exists because
+/// the pre-roll gate holds pops by design: a slow-but-working link filling a
+/// deep buffer advances `sourced` without a single delivered frame, and must
+/// not look stalled — or the watchdog tears the stream down and the rebuild
+/// restarts the gate, silence forever on the exact links the buffer is for.
+/// A genuinely dead pipeline (ffmpeg hung, network dead) advances neither,
+/// and still fires after [`STALL_AFTER`].
+fn refresh_progress(
+    health: &Mutex<Health>,
+    last_seen_frames: &mut u64,
+    last_seen_sourced: &mut u64,
+    frames: &AtomicU64,
+    sourced: &AtomicU64,
+) -> bool {
+    let f = frames.load(Ordering::Relaxed);
+    let s = sourced.load(Ordering::Relaxed);
+    if f != *last_seen_frames || s != *last_seen_sourced {
+        *last_seen_frames = f;
+        *last_seen_sourced = s;
+        if let Ok(mut h) = health.lock() {
+            h.last_progress = Instant::now();
+        }
+        true
+    } else {
+        false
+    }
 }
 
 impl Engine {
@@ -423,6 +456,7 @@ pub fn run(
         prebuffer_samples: crate::config::prebuffer_samples(buffer_duration_secs.clamp(1, 30)),
         drop_streak: 0,
         last_seen_frames: 0,
+        last_seen_sourced: 0,
         last_correction: Instant::now(),
         // Cloning the once-built blocking client (Arc-fee) — constructed by
         // `httpcache::warm_blocking_client` before the runtime started.
@@ -499,6 +533,9 @@ struct Worker {
     drop_streak: u32,
     /// The last frame count seen (stall detection needs deltas).
     last_seen_frames: u64,
+    /// The last decode-side count seen; a pre-roll filling slowly advances
+    /// this while `last_seen_frames` sits still.
+    last_seen_sourced: u64,
     last_correction: Instant,
     client: reqwest::blocking::Client,
     /// A user command that pre-empted a recovery retry-sleep; handled before
@@ -549,13 +586,13 @@ impl Worker {
         // borrow of `current` is released (`track_ended` needs `&mut self`).
         let mut ended = false;
         if let Some(cur) = self.current.as_mut() {
-            let f = cur.frames.load(Ordering::Relaxed);
-            if f != self.last_seen_frames {
-                self.last_seen_frames = f;
-                if let Ok(mut h) = self.health.lock() {
-                    h.last_progress = Instant::now();
-                }
-            }
+            refresh_progress(
+                &self.health,
+                &mut self.last_seen_frames,
+                &mut self.last_seen_sourced,
+                &cur.frames,
+                &cur.sourced,
+            );
             // Track end: rodio fired the sound-done signal.
             ended = cur.done.try_recv().is_ok();
             if !ended && self.state.playing && self.last_correction.elapsed() >= POSITION_EVERY {
@@ -1044,10 +1081,12 @@ impl Worker {
         let pos = truncate_seconds(pos);
         let (child, stdout) = spawn_ffmpeg(url, pos)?;
         let frames = Arc::new(AtomicU64::new(0));
+        let sourced = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let source = FfmpegSource::new(
             stdout,
             Arc::clone(&frames),
+            Arc::clone(&sourced),
             Arc::clone(&self.bands),
             Arc::clone(&cancelled),
             self.prebuffer_samples,
@@ -1066,26 +1105,15 @@ impl Worker {
             child,
             done,
             frames,
+            sourced,
             cancelled,
         });
         self.last_seen_frames = 0;
+        self.last_seen_sourced = 0;
         self.set_health(play);
-        // The pre-roll is silent and frame-free by design: push the stall
-        // clock past it, or a buffer longer than STALL_AFTER rebuilds on
-        // itself. `tick` re-anchors the clock at the first real frame, so a
-        // true mid-track stall still fires.
-        if let Ok(mut h) = self.health.lock() {
-            h.last_progress = Instant::now() + self.prebuffer_duration();
-        }
         self.set_active(play);
         self.last_correction = Instant::now();
         Ok(())
-    }
-
-    /// The pre-roll window in wall-clock terms (stereo f32 samples at
-    /// 44.1 kHz — 88_200 samples per second).
-    fn prebuffer_duration(&self) -> Duration {
-        Duration::from_secs_f64(self.prebuffer_samples as f64 / 88_200.0)
     }
 
     /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
@@ -1274,6 +1302,57 @@ fn fetch_cover(client: &reqwest::blocking::Client, url: &str) -> Option<Vec<u8>>
 mod tests {
     use super::*;
 
+    /// The watchdog clock refreshes on decode progress while pops are gated
+    /// (the pre-roll), so a slow-but-working link filling a deep buffer is
+    /// never called a stall and torn down.
+    #[test]
+    fn decode_progress_refreshes_the_stall_clock_while_pops_are_gated() {
+        let health = Arc::new(Mutex::new(Health {
+            playing: true,
+            last_progress: Instant::now() - Duration::from_secs(60), // long-stale
+        }));
+        let frames = AtomicU64::new(0); // pops: gated, frozen
+        let sourced = AtomicU64::new(4096); // decoder: advancing
+        let (mut last_frames, mut last_sourced) = (0u64, 0u64);
+        let advanced = refresh_progress(
+            &health,
+            &mut last_frames,
+            &mut last_sourced,
+            &frames,
+            &sourced,
+        );
+        assert!(advanced, "decode progress must count as liveness");
+        assert!(
+            health.lock().unwrap().last_progress.elapsed() < Duration::from_secs(1),
+            "the clock must be re-anchored"
+        );
+    }
+
+    /// No progress at all leaves the clock stale: a dead pipeline still
+    /// fires after [`STALL_AFTER`].
+    #[test]
+    fn no_progress_leaves_the_stall_clock_stale() {
+        let health = Arc::new(Mutex::new(Health {
+            playing: true,
+            last_progress: Instant::now() - Duration::from_secs(60),
+        }));
+        let frames = AtomicU64::new(0);
+        let sourced = AtomicU64::new(0);
+        let (mut last_frames, mut last_sourced) = (0u64, 0u64);
+        let advanced = refresh_progress(
+            &health,
+            &mut last_frames,
+            &mut last_sourced,
+            &frames,
+            &sourced,
+        );
+        assert!(!advanced, "no progress is a stall");
+        assert!(
+            health.lock().unwrap().last_progress.elapsed() > Duration::from_secs(30),
+            "the clock must stay stale"
+        );
+    }
+
     #[test]
     fn a_failing_recovery_backs_off_up_to_the_cap() {
         assert!(next_backoff(RETRY_MIN) > RETRY_MIN);
@@ -1422,6 +1501,7 @@ mod tests {
         let source = FfmpegSource::new(
             stdout,
             Arc::clone(&frames),
+            Arc::new(AtomicU64::new(0)),
             VisBands::shared(),
             cancelled,
             8 * 1024,
@@ -1495,6 +1575,7 @@ mod tests {
         let bands = VisBands::shared();
         let mut source = FfmpegSource::new(
             stdout,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&bands),
             Arc::new(AtomicBool::new(false)),
@@ -1572,6 +1653,7 @@ mod tests {
         let source = FfmpegSource::new(
             stdout,
             Arc::clone(&frames),
+            Arc::new(AtomicU64::new(0)),
             Arc::clone(&bands),
             cancelled,
             8 * 1024,

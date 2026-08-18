@@ -65,23 +65,46 @@ use souvlaki::{
 
 // ------------------------------------------------------------------ main
 
+fn parse_player_args() -> (Vec<String>, Option<u8>) {
+    parse_player_args_from(std::env::args().skip(1))
+}
+
 /// Split player-mode args from player flags. The only flag today is
 /// `--buffer-duration <secs>` (also `--buffer-duration=<secs>`); it is
 /// stripped here so the "first positional argument is a URI" contract in
 /// `boot` holds regardless of flag order, and the `theme` subcommand keeps
 /// working alongside it. A missing or unparseable value silently falls back
 /// to the config file — a typo must never lock someone out.
-fn parse_player_args() -> (Vec<String>, Option<u8>) {
+fn parse_player_args_from<I>(args: I) -> (Vec<String>, Option<u8>)
+where
+    I: IntoIterator<Item = String>,
+{
     let mut rest = Vec::new();
     let mut buffer = None;
-    let mut it = std::env::args().skip(1);
+    let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next() {
         let (flag, inline) = match arg.split_once('=') {
             Some((f, v)) if f == "--buffer-duration" => (f, Some(v.to_string())),
             _ => (arg.as_str(), None),
         };
         if flag == "--buffer-duration" {
-            let value = inline.or_else(|| it.next());
+            // Space-separated: only a next argv that looks like a value IS
+            // a value — a u8, or any all-digit string (so an out-of-range
+            // number still falls back to config instead of surfacing as a
+            // bogus startup URI). `--buffer-duration https://youtube.com/…`
+            // is a missing value followed by the startup URI — the URI must
+            // survive as the positional, not be eaten as an invalid value
+            // (the old code consumed and dropped it). Anything else stays in
+            // the stream as a positional.
+            let value = match inline {
+                Some(v) => Some(v),
+                None => match it.peek() {
+                    Some(v) if v.parse::<u8>().is_ok() || v.chars().all(|c| c.is_ascii_digit()) => {
+                        it.next()
+                    }
+                    _ => None,
+                },
+            };
             buffer = value.and_then(|s| s.parse::<u8>().ok());
             continue;
         }
