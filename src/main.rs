@@ -65,16 +65,44 @@ use souvlaki::{
 
 // ------------------------------------------------------------------ main
 
+/// Split player-mode args from player flags. The only flag today is
+/// `--buffer-duration <secs>` (also `--buffer-duration=<secs>`); it is
+/// stripped here so the "first positional argument is a URI" contract in
+/// `boot` holds regardless of flag order, and the `theme` subcommand keeps
+/// working alongside it. A missing or unparseable value silently falls back
+/// to the config file — a typo must never lock someone out.
+fn parse_player_args() -> (Vec<String>, Option<u8>) {
+    let mut rest = Vec::new();
+    let mut buffer = None;
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f == "--buffer-duration" => (f, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        if flag == "--buffer-duration" {
+            let value = inline.or_else(|| it.next());
+            buffer = value.and_then(|s| s.parse::<u8>().ok());
+            continue;
+        }
+        rest.push(arg);
+    }
+    (rest, buffer)
+}
+
 fn main() -> Result<()> {
+    // Player flags are stripped before anything else, so neither the `theme`
+    // subcommand dispatch nor `boot`'s URI positional ever sees them.
+    let (args, buffer_duration_secs) = parse_player_args();
+
     // `tuna-tui theme …` is a socket client, not a player: it must not start the
     // engine or touch the terminal. Intercepting argv here — before anything
     // else in `main` runs — is what guarantees that, and it also keeps `theme`
     // from reaching the "first positional argument is a URI" path in `boot`.
     #[cfg(all(feature = "txc", unix))]
     {
-        let argv: Vec<String> = std::env::args().collect();
-        if argv.get(1).is_some_and(|a| a == "theme") {
-            std::process::exit(tuna_tui::txc::cli::run(&argv[2..]));
+        if args.first().is_some_and(|a| a == "theme") {
+            std::process::exit(tuna_tui::txc::cli::run(&args[1..]));
         }
     }
 
@@ -114,9 +142,24 @@ fn main() -> Result<()> {
     ));
 
     #[cfg(target_os = "macos")]
-    let res = run_player_macos(terminal, saved, init_vol, picker);
+    let res = run_player_macos(
+        terminal,
+        saved,
+        init_vol,
+        picker,
+        args,
+        buffer_duration_secs,
+    );
     #[cfg(not(target_os = "macos"))]
-    let res = run_player(terminal, saved, init_vol, picker, true);
+    let res = run_player(
+        terminal,
+        saved,
+        init_vol,
+        picker,
+        true,
+        args,
+        buffer_duration_secs,
+    );
     res
 }
 
@@ -126,6 +169,8 @@ fn run_player(
     init_vol: u8,
     picker: Picker,
     media_platform_ready: bool,
+    args: Vec<String>,
+    buffer_duration_secs: Option<u8>,
 ) -> Result<()> {
     // Building reqwest's blocking client creates and drops its own inner
     // runtime, which tokio refuses inside a live runtime — construct it here,
@@ -136,12 +181,15 @@ fn run_player(
         .enable_all()
         .build()
         .context("start tokio runtime")?;
+    let startup_uri = args.first().filter(|a| a.as_str() != "theme").cloned();
     let outcome = runtime.block_on(boot(
         &mut terminal,
         saved,
         init_vol,
         picker,
         media_platform_ready,
+        startup_uri,
+        buffer_duration_secs,
     ));
     let restored = restore_terminal(&mut terminal);
     // Say goodbye *after* the screen is back, so a subscriber that has stopped
@@ -164,7 +212,14 @@ fn run_player(
 /// main thread's run loop, so the winit loop takes the main thread and the
 /// player runs beside it. No loop only costs the native integration.
 #[cfg(target_os = "macos")]
-fn run_player_macos(terminal: Term, saved: SavedState, init_vol: u8, picker: Picker) -> Result<()> {
+fn run_player_macos(
+    terminal: Term,
+    saved: SavedState,
+    init_vol: u8,
+    picker: Picker,
+    args: Vec<String>,
+    buffer_duration_secs: Option<u8>,
+) -> Result<()> {
     use winit::application::ApplicationHandler;
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
     use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -196,13 +251,29 @@ fn run_player_macos(terminal: Term, saved: SavedState, init_vol: u8, picker: Pic
         Ok(event_loop) => event_loop,
         Err(e) => {
             liblog(format!("media event loop unavailable: {e}"));
-            return run_player(terminal, saved, init_vol, picker, false);
+            return run_player(
+                terminal,
+                saved,
+                init_vol,
+                picker,
+                false,
+                args,
+                buffer_duration_secs,
+            );
         }
     };
 
     let proxy = event_loop.create_proxy();
     let player = std::thread::spawn(move || {
-        let res = run_player(terminal, saved, init_vol, picker, true);
+        let res = run_player(
+            terminal,
+            saved,
+            init_vol,
+            picker,
+            true,
+            args,
+            buffer_duration_secs,
+        );
         let _ = proxy.send_event(PlayerDone);
         res
     });
@@ -290,6 +361,8 @@ async fn boot(
     init_vol: u8,
     picker: Picker,
     media_platform_ready: bool,
+    startup_uri: Option<String>,
+    buffer_duration_secs: Option<u8>,
 ) -> Result<TxcHandle> {
     // The engine's in-band metadata channel. Established before the engine
     // starts so no event can land on a missing sender; boot passes the receiver
@@ -301,12 +374,14 @@ async fn boot(
     let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(tuna_tui::engine::YtExpander);
 
     let (ev_tx, ev_rx) = flume::unbounded::<EngineEvent>();
-    let engine = engine::run(ev_tx, engine_meta_tx, init_vol, expander).context("start engine")?;
+    let buffer_secs =
+        buffer_duration_secs.unwrap_or_else(|| tuna_tui::config::get().buffer_duration_secs);
+    let engine = engine::run(ev_tx, engine_meta_tx, init_vol, buffer_secs, expander)
+        .context("start engine")?;
 
     // The one positional argument is a yt: URI (or bare YouTube URL/playlist).
-    // It always wins over a
-    // persisted session; `theme` never reaches here (see `main`).
-    let startup_uri = std::env::args().nth(1).filter(|a| a != "theme");
+    // It always wins over a persisted session; player flags were stripped and
+    // `theme` never reaches here (see `main`).
     if let Some(uri) = startup_uri.as_ref() {
         let _ = engine.play_context(uri.clone(), false);
         // The URI path never sees a `Playing`-handler reapply (the boot is

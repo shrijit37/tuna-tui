@@ -387,6 +387,7 @@ pub fn run(
     events: flume::Sender<EngineEvent>,
     meta_tx: flume::Sender<EngineMeta>,
     initial_volume_pct: u8,
+    buffer_duration_secs: u8,
     expander: Arc<dyn Expander>,
 ) -> Result<Engine> {
     let bands = VisBands::shared();
@@ -419,6 +420,7 @@ pub fn run(
         },
         current: None,
         health: Arc::clone(&health),
+        prebuffer_samples: crate::config::prebuffer_samples(buffer_duration_secs.clamp(1, 30)),
         drop_streak: 0,
         last_seen_frames: 0,
         last_correction: Instant::now(),
@@ -511,6 +513,11 @@ struct Worker {
     /// transition out of the pause state (next/prev/stop/load/teardown) so it
     /// can never resurrect a stale stream on a later resume.
     paused: Option<PausedTrack>,
+    /// The pre-roll depth in float samples (from `config.buffer_duration_secs`,
+    /// clamped 1..=30). This is the gate each `FfmpegSource` holds until that
+    /// much audio is buffered, and the window the watchdog exempts from its
+    /// stall clock.
+    prebuffer_samples: usize,
 }
 
 impl Worker {
@@ -1043,6 +1050,7 @@ impl Worker {
             Arc::clone(&frames),
             Arc::clone(&self.bands),
             Arc::clone(&cancelled),
+            self.prebuffer_samples,
         );
         let done = self.queue.append_with_signal(source);
         if play {
@@ -1062,9 +1070,22 @@ impl Worker {
         });
         self.last_seen_frames = 0;
         self.set_health(play);
+        // The pre-roll is silent and frame-free by design: push the stall
+        // clock past it, or a buffer longer than STALL_AFTER rebuilds on
+        // itself. `tick` re-anchors the clock at the first real frame, so a
+        // true mid-track stall still fires.
+        if let Ok(mut h) = self.health.lock() {
+            h.last_progress = Instant::now() + self.prebuffer_duration();
+        }
         self.set_active(play);
         self.last_correction = Instant::now();
         Ok(())
+    }
+
+    /// The pre-roll window in wall-clock terms (stereo f32 samples at
+    /// 44.1 kHz — 88_200 samples per second).
+    fn prebuffer_duration(&self) -> Duration {
+        Duration::from_secs_f64(self.prebuffer_samples as f64 / 88_200.0)
     }
 
     /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
@@ -1398,7 +1419,13 @@ mod tests {
         let (mut child, stdout) = spawn_ffmpeg(wav.to_str().unwrap(), 0).expect("spawn ffmpeg");
         let frames = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let source = FfmpegSource::new(stdout, Arc::clone(&frames), VisBands::shared(), cancelled);
+        let source = FfmpegSource::new(
+            stdout,
+            Arc::clone(&frames),
+            VisBands::shared(),
+            cancelled,
+            8 * 1024,
+        );
         queue_in.append_with_signal(source);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -1471,6 +1498,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&bands),
             Arc::new(AtomicBool::new(false)),
+            8 * 1024,
         );
         // ~3 s of playback, paced to realtime: 441 pops are 10 ms of audio,
         // and each 10 ms of audio is paid with a 10 ms sleep. The device is
@@ -1541,7 +1569,13 @@ mod tests {
         let bands = VisBands::shared();
         let frames = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let source = FfmpegSource::new(stdout, Arc::clone(&frames), Arc::clone(&bands), cancelled);
+        let source = FfmpegSource::new(
+            stdout,
+            Arc::clone(&frames),
+            Arc::clone(&bands),
+            cancelled,
+            8 * 1024,
+        );
         queue_in.append_with_signal(source);
         // Prebuffer + playback start (~1.2 s is well past the 93 ms gate).
         std::thread::sleep(Duration::from_millis(1200));

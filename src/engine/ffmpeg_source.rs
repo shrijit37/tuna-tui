@@ -16,11 +16,12 @@
 //! without ever blocking; an empty channel (ffmpeg still starting, or jitter)
 //! yields silence, so the device keeps streaming.
 //!
-//! A small prebuffer (≈93 ms) is filled before playback hands over the first
-//! real sample, so ffmpeg's bursty start-up never reaches the listener as a
-//! hole. Position authority stays the playhead: `frames` counts *stereo frames
-//! actually popped* (converted from a chunk, not received) and position is
-//! `start_ms + frames/44.1`.
+//! A prebuffer (`config.buffer_duration_secs`, default 2 s — the legacy
+//! constant was ≈93 ms) is filled before playback hands over the first real
+//! sample, so ffmpeg's bursty start-up — or a high-latency link — never
+//! reaches the listener as a hole. Position authority stays the playhead:
+//! `frames` counts *stereo frames actually popped* (converted from a chunk,
+//! not received) and position is `start_ms + frames/44.1`.
 //!
 //! EOF is the pipe closing: the pump exits with `eof = true`, the source pops
 //! the remaining buffer, then `Iterator::next` returns `None` and rodio's
@@ -28,7 +29,6 @@
 
 use std::collections::VecDeque;
 use std::io::Read;
-use std::process::ChildStdout;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,9 +39,6 @@ use crate::audio::{VisBands, Visualizer};
 
 /// Bytes per pump read (16 KiB = 4096 stereo frames ≈ 93 ms).
 const READ_BYTES: usize = 16 * 1024;
-/// Raw samples (floats) to accumulate before the first pop — the prebuffer.
-/// 8 KiB of float samples = 4096 stereo frames ≈ 93 ms of latency.
-const PREBUFFER_SAMPLES: usize = 8 * 1024;
 
 /// The rodio source for one ffmpeg child. Cheap to build; the expensive pipe
 /// I/O happens on the pump thread started inside [`FfmpegSource::new`].
@@ -63,27 +60,40 @@ pub(crate) struct FfmpegSource {
     /// been served, later delivery gaps play silence directly instead of
     /// re-gating and stalling the queue.
     started: bool,
-    /// Live chunks from the pump thread. Bounded to ~8 reads (≈0.75 s of
-    /// audio): the pump blocks on a full queue — on *its own* thread, never on
-    /// the audio callback — instead of letting a burst decode flood memory.
+    /// Live chunks from the pump thread. Bounded to hold the full pre-roll
+    /// (≈0.75 s at the legacy 93 ms depth; `prebuffer_samples` bytes at
+    /// configurable depths): the pump blocks on a full queue — on *its own*
+    /// thread, never on the audio callback — instead of letting a burst
+    /// decode flood memory.
     chunks: flume::Receiver<Vec<u8>>,
     /// Reused s16 decode buffer, one pump chunk in size (4096 i16 = READ_BYTES).
     /// `fold` decodes into it instead of allocating a Vec per chunk.
     scratch: Vec<i16>,
+    /// The pre-roll depth in float samples: the gate threshold in `next()`,
+    /// the pull bound in `fold()`, and the `pending` capacity. Threaded in
+    /// from `config.buffer_duration_secs` by the engine.
+    prebuffer_samples: usize,
 }
 
 impl FfmpegSource {
     /// Build the source over ffmpeg's stdout. `bands` is the shared cell the
     /// FFT tee writes into (the same `Arc` the renderer reads); `cancelled`
-    /// is owned by the engine, which flips it to abort this source.
+    /// is owned by the engine, which flips it to abort this source. Generic
+    /// over the reader so the gate tests can drive it with a fake PCM pipe.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        stdout: ChildStdout,
+    pub(crate) fn new<R: Read + Send + 'static>(
+        stdout: R,
         frames: Arc<AtomicU64>,
         bands: Arc<Mutex<VisBands>>,
         cancelled: Arc<AtomicBool>,
+        prebuffer_samples: usize,
     ) -> Self {
-        let (tx, chunks) = flume::bounded(8);
+        // The channel must hold at least the whole pre-roll (in s16 bytes) —
+        // otherwise `fold` drains it once, stays below the gate, and the
+        // source plays silence until EOF: a startup deadlock. Floor of 8
+        // keeps the legacy depth for tiny buffers.
+        let capacity = (prebuffer_samples * 2 / READ_BYTES).max(8);
+        let (tx, chunks) = flume::bounded(capacity);
         // The pump: blocking `read`s live here, never on cpal's callback
         // thread. It ends when the pipe closes (natural EOF or a killed
         // child), or when the source (and so `tx`) goes away.
@@ -110,7 +120,7 @@ impl FfmpegSource {
             })
             .expect("spawn ffmpeg pump");
         Self {
-            pending: VecDeque::with_capacity(PREBUFFER_SAMPLES),
+            pending: VecDeque::with_capacity(prebuffer_samples),
             frames,
             visualizer: Visualizer::new(bands, 44_100.0),
             eof: false,
@@ -118,6 +128,7 @@ impl FfmpegSource {
             started: false,
             chunks,
             scratch: vec![0i16; READ_BYTES / 2],
+            prebuffer_samples,
         }
     }
 
@@ -134,7 +145,7 @@ impl FfmpegSource {
     /// to the playhead, so the tee stays fed for the whole track, and the
     /// channel's backpressure moves the pump block off the callback thread.
     fn fold(&mut self) {
-        while self.pending.len() < PREBUFFER_SAMPLES {
+        while self.pending.len() < self.prebuffer_samples {
             match self.chunks.try_recv() {
                 Ok(chunk) if !chunk.is_empty() => {
                     // Decode into the reused scratch (chunks_exact drops a
@@ -179,13 +190,13 @@ impl Iterator for FfmpegSource {
             return None;
         }
         self.fold();
-        // Prebuffer: hold back real audio until there's ~93 ms of it, so the
-        // device never tears on ffmpeg's start-up. Silence here is *not*
-        // counted against the playhead — and the gate is startup-only, so a
-        // delivery gap later in the track plays silence directly instead of
-        // re-arming the stall.
+        // Prebuffer: hold back real audio until the configured depth is
+        // filled, so the device never tears on ffmpeg's start-up or a
+        // high-latency link. Silence here is *not* counted against the
+        // playhead — and the gate is startup-only, so a delivery gap later
+        // in the track plays silence directly instead of re-arming the stall.
         if !self.started {
-            if self.pending.len() < PREBUFFER_SAMPLES && !self.eof {
+            if self.pending.len() < self.prebuffer_samples && !self.eof {
                 return Some(0.0);
             }
             self.started = true;
@@ -226,5 +237,163 @@ impl Source for FfmpegSource {
 
     fn total_duration(&self) -> Option<Duration> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Interleaved s16 stereo PCM: `frames` stereo frames of nonzero samples
+    /// (`i + 1` skips zero so no real pop is ever classified as silence, and
+    /// wraps only past 32_768, far above any test's frame count).
+    fn pcm(frames: usize) -> Vec<u8> {
+        (0..frames * 2)
+            .flat_map(|i| ((i as i16) + 1).to_le_bytes())
+            .collect()
+    }
+
+    /// A reader that parks until released, then serves `data`, then either
+    /// reports EOF (like a pipe closing) or parks forever (a slow pipe that
+    /// never closes). The pump thread blocks in `read()` until `release`
+    /// flips — which gives the tests a deterministic "before any audio"
+    /// phase to prove the gate's silence is uncounted.
+    struct GatedReader {
+        data: Vec<u8>,
+        pos: usize,
+        release: Arc<AtomicBool>,
+        eof: bool,
+    }
+
+    impl Read for GatedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Hold the pump until the test lets the audio through.
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            if self.pos < self.data.len() {
+                let n = (self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            } else if self.eof {
+                Ok(0) // natural EOF: the pump breaks and sends the end-marker
+            } else {
+                std::thread::park(); // the pump waits here; the test is done
+                Ok(0) // spurious unpark only — treated as EOF, harmless
+            }
+        }
+    }
+
+    /// A source over a gated pipe with the given pre-roll depth. The release
+    /// flag lets the test hold the pipe shut to observe the silence phase;
+    /// `eof` says whether the pipe closes after its data (test 1) or stays
+    /// open for a delivery gap (tests 2/3).
+    fn gated_source(
+        prebuffer_samples: usize,
+        data: Vec<u8>,
+        eof: bool,
+    ) -> (FfmpegSource, Arc<AtomicU64>, Arc<AtomicBool>) {
+        let frames = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let src = FfmpegSource::new(
+            GatedReader {
+                data,
+                pos: 0,
+                release: Arc::clone(&release),
+                eof,
+            },
+            Arc::clone(&frames),
+            VisBands::shared(),
+            Arc::new(AtomicBool::new(false)),
+            prebuffer_samples,
+        );
+        (src, frames, release)
+    }
+
+    /// Take up to `max` pops. Returns (zeros, real pops, frames at the end,
+    /// ended).
+    fn drive(src: &mut FfmpegSource, frames: &AtomicU64, max: usize) -> (usize, usize, u64, bool) {
+        let mut zeros = 0;
+        let mut real = 0;
+        let mut ended = false;
+        for _ in 0..max {
+            match src.next() {
+                Some(s) => {
+                    if s == 0.0 {
+                        zeros += 1;
+                    } else {
+                        real += 1;
+                    }
+                }
+                None => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        (zeros, real, frames.load(Ordering::Relaxed), ended)
+    }
+
+    /// The gate holds back real audio until the pending pool reaches the
+    /// threshold — and when the pipe can never fill it, EOF opens the gate
+    /// early so a short stream completes instead of hanging in silence.
+    #[test]
+    fn gate_holds_below_threshold_and_eof_opens_it() {
+        // 2048 stereo frames = 4096 float samples against a 8192-sample gate:
+        // the pool can never fill it — only the end-marker can open the gate.
+        let (mut src, frames, release) = gated_source(8 * 1024, pcm(2048), true);
+
+        // With the pipe shut, pops are silence — and uncounted.
+        let (z0, r0, f0, e0) = drive(&mut src, &frames, 1000);
+        assert_eq!(r0, 0, "no real audio before the pipe opens");
+        assert_eq!(f0, 0, "silence must not advance the playhead");
+        assert!(!e0, "no EOF while the pipe is open");
+        assert!(z0 > 0, "the gate should have played some silence");
+
+        // Release: the pipe delivers + closes. EOF opens the gate below the
+        // threshold; every sample is popped, then the source ends.
+        release.store(true, Ordering::SeqCst);
+        let (_, real, f, ended) = drive(&mut src, &frames, 50_000);
+        assert_eq!(real, 4096, "all delivered audio is played");
+        assert_eq!(f, 2048, "only real pops count as stereo frames");
+        assert!(ended, "the short stream must end after EOF");
+        assert_eq!(src.next(), None, "the iterator stays ended");
+    }
+
+    /// Once the pool reaches the threshold the gate opens on its own — no EOF
+    /// needed — and a later delivery gap plays (uncounted) silence instead of
+    /// re-gating or ending.
+    #[test]
+    fn gate_opens_on_filled_pool_then_gap_plays_silence() {
+        // One full chunk (8192 float samples) exactly fills an 8192-sample
+        // gate; the pipe then never closes.
+        let (mut src, frames, release) = gated_source(8 * 1024, pcm(4096), false);
+
+        release.store(true, Ordering::SeqCst);
+        let (_, real, f, ended) = drive(&mut src, &frames, 50_000);
+        assert_eq!(real, 8192, "gate opens on the filled pool, no EOF needed");
+        assert_eq!(f, 4096, "4096 stereo frames popped");
+        assert!(!ended, "a gap is silence, not EOF");
+
+        // The channel is drained and the pipe never closes: mid-track silence.
+        let (zeros, real2, f2, ended2) = drive(&mut src, &frames, 2000);
+        assert_eq!(real2, 0, "no more real audio");
+        assert!(zeros > 0, "gap plays silence");
+        assert_eq!(f2, 4096, "gap silence is not counted");
+        assert!(!ended2, "gap silence is not EOF");
+    }
+
+    /// The threshold is a parameter, not a constant: a bigger buffer delivers
+    /// a longer gate.
+    #[test]
+    fn threshold_is_parameterized() {
+        // Two chunks (16384 float samples) against a 16384-sample gate.
+        let (mut src, frames, release) = gated_source(16 * 1024, pcm(8192), false);
+
+        release.store(true, Ordering::SeqCst);
+        let (_, real, f, _) = drive(&mut src, &frames, 50_000);
+        assert_eq!(real, 16_384, "the full 16k-sample pool is popped");
+        assert_eq!(f, 8192, "8192 stereo frames");
     }
 }

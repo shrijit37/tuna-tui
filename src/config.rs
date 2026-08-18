@@ -28,6 +28,17 @@ pub struct Config {
     /// liked lists and history, and quiets bot checks that throttle anonymized
     /// traffic.
     pub cookies_file: Option<String>,
+    /// Seconds of decoded PCM buffered before playback output starts. A larger
+    /// buffer smooths stutter on high-latency or fluctuating connections at
+    /// the cost of a silent pre-roll on every stream start.
+    pub buffer_duration_secs: u8,
+}
+
+/// Stereo f32 samples for `secs` of 44.1 kHz audio — what the engine's
+/// prebuffer gate counts. The engine and the tests share this conversion so
+/// the knob and the gate can never disagree.
+pub fn prebuffer_samples(secs: u8) -> usize {
+    secs as usize * 44_100 * 2
 }
 
 impl Default for Config {
@@ -41,6 +52,7 @@ impl Default for Config {
             audio_format: "bestaudio/best".to_string(),
             search_limit: 6,
             cookies_file: None,
+            buffer_duration_secs: 2,
         }
     }
 }
@@ -92,6 +104,12 @@ const TEMPLATE: &str = "\
 # your browser). Unlocks private playlists / liked lists / history and quiets
 # the bot checks that throttle anonymized traffic.
 #cookies_file = \"/home/you/.config/tuna-tui/cookies.txt\"
+
+# Seconds of decoded PCM buffered before playback output starts (1..30).
+# Larger buffers smooth stutter on high-latency or fluctuating connections;
+# each stream start (track, seek, pause-resume) waits this long in silence
+# while the buffer fills.
+#buffer_duration_secs = 2
 ";
 
 /// One-time move of the pre-rebrand `myx` dirs to the `tuna-tui` names.
@@ -164,6 +182,20 @@ mod tests {
         let c = Config::parse("").expect("empty toml is valid");
         assert_eq!(c.scrolloff, 3);
         assert!(c.restore_on_startup);
+        assert_eq!(c.buffer_duration_secs, 2);
+    }
+
+    #[test]
+    fn buffer_duration_reads_when_present() {
+        let c = Config::parse("buffer_duration_secs = 7").expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 7);
+    }
+
+    #[test]
+    fn prebuffer_samples_converts_secs_to_stereo_floats() {
+        // 2 s default → 2 × 44_100 frames × 2 channels; 5 s → five times that.
+        assert_eq!(prebuffer_samples(2), 176_400);
+        assert_eq!(prebuffer_samples(5), 441_000);
     }
 
     #[test]
