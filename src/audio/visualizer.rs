@@ -125,7 +125,6 @@ impl Visualizer {
             return;
         }
         // Interleaved stereo -> mono.
-        // Interleaved stereo -> mono (i16 PCM; the librespot era fed f64).
         self.sample_buf.extend(samples.chunks(2).map(|c| {
             if c.len() == 2 {
                 (c[0] as f32 + c[1] as f32) * 0.5
