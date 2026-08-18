@@ -192,6 +192,9 @@ fn apply_toggle(
     name: String,
     subtitle: String,
 ) -> String {
+    // The store mutated (added or removed) — the next 24s sync tick must
+    // persist it even though playback may be idle.
+    app.store_dirty = true;
     let (added, removed) = toggle_msg(kind);
     if app.store.toggle(kind, name, subtitle, uri) {
         added.into()
@@ -219,6 +222,7 @@ pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
             {
                 app.transport.queue_uris.push(uri.clone());
                 app.transport.queue.push(app.track_label_of(&uri));
+                app.queue_dirty = true;
             }
             "added to queue".into()
         }
@@ -237,7 +241,10 @@ pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
                 .store
                 .add_to_playlist(&playlist_uri, name.clone(), track)
             {
-                Some(msg) => msg,
+                Some(msg) => {
+                    app.store_dirty = true;
+                    msg
+                }
                 None => "playlist gone — press r to reload the library".into(),
             }
         }
