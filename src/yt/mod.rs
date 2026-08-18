@@ -859,6 +859,7 @@ mod tests {
     /// F13: a cancelled `yt_stdout` call kills its child on the next 50ms
     /// poll — not at the 15s deadline — and returns `None`; without a cancel
     /// the same child runs into the deadline and is killed there.
+    #[cfg(unix)]
     #[test]
     fn yt_stdout_cancel_kills_a_slow_child() {
         let path = fake_bin("sleep", "exec sleep 30");
@@ -912,6 +913,7 @@ mod tests {
     /// F17: two sequential calls through the real `yt_stdout` core (fake
     /// binary, exits 0) both complete — each acquires and releases the global
     /// permit.
+    #[cfg(unix)]
     #[test]
     fn two_sequential_yt_stdout_calls_complete() {
         let path = fake_bin("echo", "printf ok");
