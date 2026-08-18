@@ -26,6 +26,10 @@ jobs:
           # Real reviews on non-trivial PRs take 15-25 min; the 30 min default allows
           # only 2 attempts before the check run fails.
           timeout_minutes: 45
+          # The action reviews its own introduction when an up-to-date master-merge pulls
+          # this file into a PR diff (it does not know it is itself). Ignore it: master
+          # infrastructure, user-directed and SHA-pinned, never authored PR content.
+          ignored_paths: '["\.github/workflows/jules-review\.yml"]'
 
 # --- Known limitation (accepted 2026-08-18, decision: document + accept) ---
 # The action skips fork PRs by default (skip_forks: true, anti prompt-injection) and creates
