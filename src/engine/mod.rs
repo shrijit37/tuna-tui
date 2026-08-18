@@ -283,8 +283,11 @@ impl Engine {
         self.send(Cmd::Seek(position_ms))
     }
     /// The radio station for a seed track (seed followed by similar uris).
-    pub fn radio_tracks(&self, seed: &str) -> Result<Vec<String>, String> {
-        self.inner.expander.radio(seed)
+    /// `cancel` is the per-request F13 flag: when the app's radio deadline has
+    /// given up, the flag stops the yt-dlp chain from spawning further
+    /// children instead of leaving it orphaned for ~40s.
+    pub fn radio_tracks(&self, seed: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String> {
+        self.inner.expander.radio(seed, cancel)
     }
 
     /// The loaded play list, in play order (post-shuffle). Empty when nothing

@@ -19,6 +19,8 @@
 use crate::config;
 use crate::util::{track_id_from_uri, uri_parts};
 use crate::yt;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// One resolved, playable track: the direct stream URL plus the metadata that
 /// playback events and the NowPlaying pipeline consume.
@@ -50,7 +52,10 @@ pub trait Expander: Send + Sync {
     fn resolve(&self, uri: &str) -> Result<ResolvedTrack, String>;
 
     /// The radio station for a seed track: the seed followed by similar uris.
-    fn radio(&self, seed: &str) -> Result<Vec<String>, String>;
+    /// `cancel` (F13) is the per-request flag set once the app's radio
+    /// deadline fires; the yt-dlp chain stops spawning children instead of
+    /// running its full fallback for ~40s after the UI has given up.
+    fn radio(&self, seed: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String>;
 }
 
 /// The pure-YouTube expander — the port's end state, live from phase 1's
@@ -88,15 +93,17 @@ impl Expander for YtExpander {
             .ok_or_else(|| format!("couldn't resolve {uri}"))
     }
 
-    fn radio(&self, seed: &str) -> Result<Vec<String>, String> {
+    fn radio(&self, seed: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String> {
         let Some(id) = track_id_from_uri(seed) else {
             return Err(format!("not a track uri: {seed}"));
         };
         // `radio_entries` caps the mix fetch to one inner-page (a full RD mix
         // paginates 15+ API calls and blows past the app's radio deadline),
         // falls back across the mix id variants, and ends in a search-built
-        // pseudo-radio when YouTube has no mix for the seed at all.
-        let rows = yt::radio_entries(&id);
+        // pseudo-radio when YouTube has no mix for the seed at all. `cancel`
+        // (F13) is checked between every chain step and inside yt_stdout's
+        // poll loop, so a timed-out request kills its children in-flight.
+        let rows = yt::radio_entries(&id, cancel);
         station_from(seed, rows)
     }
 }
@@ -215,8 +222,9 @@ mod tests {
     #[test]
     #[ignore]
     fn live_radio_roundtrip() {
+        let cancel = Arc::new(AtomicBool::new(false));
         let uris = YtExpander
-            .radio("yt:video:dQw4w9WgXcQ")
+            .radio("yt:video:dQw4w9WgXcQ", cancel)
             .expect("radio station");
         assert!(uris.len() >= 2, "seed + at least one similar track");
         assert_eq!(uris[0], "yt:video:dQw4w9WgXcQ");
@@ -231,8 +239,9 @@ mod tests {
     #[test]
     #[ignore]
     fn live_radio_falls_back_to_a_search_station() {
+        let cancel = Arc::new(AtomicBool::new(false));
         let uris = YtExpander
-            .radio("yt:video:P8qNOneERe0")
+            .radio("yt:video:P8qNOneERe0", cancel)
             .expect("radio station");
         assert_eq!(uris[0], "yt:video:P8qNOneERe0");
         assert!(uris.len() >= 2, "seed + at least one similar track");
