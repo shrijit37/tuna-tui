@@ -763,12 +763,11 @@ impl Worker {
         }
         if self.state.shuffle && n > 1 {
             let pick = shuffle_pick(self.state.cursor, n, &mut rand::rng());
-            // Only a valid cursor belongs in the prev-history: the degenerate
-            // `cursor == n` state `give_up_on` can leave would push an
-            // out-of-range index that `Prev` would replay as a silent no-op.
-            if self.state.cursor < n {
-                self.state.history.push(self.state.cursor);
-            }
+            // Push-history-then-assign-cursor, unconditionally (binding F8
+            // safe fix). `start_track_at` bounds-checks `tracks.get(idx)`, so
+            // even the degenerate `cursor == n` state `give_up_on` can leave
+            // replays as a safe no-op, never a panic.
+            self.state.history.push(self.state.cursor);
             self.state.cursor = pick;
             return Some(pick);
         }
@@ -826,7 +825,7 @@ impl Worker {
         // `wait()` reports `code()==None`, which would flip every natural end
         // into a failed stream and trigger spurious recover_into rebuilds.
         let exited = cur.child.try_wait().ok().flatten();
-        let (mut failed, dropped) = classify_end(exited, pos, cur.duration_ms);
+        let (failed, dropped) = classify_end(exited, pos, cur.duration_ms);
         if failed || dropped {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
@@ -856,33 +855,13 @@ impl Worker {
         // already use). A child stuck in an unkillable state (D-state) lets
         // this wait block the worker's advance — the same tradeoff the other
         // four kill+wait sites already accept, and audio at EOF has ceased
-        // anyway.
+        // anyway. The classification stays strictly on the pre-kill
+        // `try_wait` (binding F8 regression caution): the status of a child
+        // we killed ourselves (`code()==None` over signal death) must not
+        // reclassify a natural end into a failed stream.
         if exited.is_none() {
-            // If the child was ALREADY gone, kill() fails and wait() yields
-            // its REAL status — a genuine non-zero exit there is a decoder
-            // crash the pre-kill probe missed (rebuild it, don't silently
-            // advance). A landed kill means the status is ours — `code()==None`
-            // over a signal death — and must NOT reclassify (the F8 trap: a
-            // post-kill status would flip every natural end into a failed
-            // stream and trigger spurious recover_into rebuilds).
-            if cur.child.kill().is_ok() {
-                let _ = cur.child.wait();
-            } else if let Ok(s) = cur.child.wait() {
-                failed = s.code() != Some(0);
-            }
-            if failed {
-                self.drop_streak += 1;
-                if self.drop_streak >= RECOVERY_ATTEMPTS {
-                    liblog(format!(
-                        "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
-                    ));
-                    self.give_up_on(uri);
-                    return;
-                }
-                liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
-                self.recover_into(uri, pos);
-                return;
-            }
+            let _ = cur.child.kill();
+            let _ = cur.child.wait();
         }
         drop(cur);
         self.advance();
