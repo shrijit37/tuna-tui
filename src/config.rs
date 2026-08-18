@@ -3,9 +3,10 @@
 //! the app, and a wrong-typed *value* must never take out the keys beside it
 //! (see [`Config::parse`]).
 //!
-//! Only unparseable TOML *syntax* still falls back wholesale — a broken
-//! document has nothing to salvage. A value that fails its key's type check
-//! defaults that key alone.
+//! A value that fails its key's type check defaults that key alone; a line
+//! that fails TOML *syntax* (an out-of-i64-range integer literal is one) is
+//! dropped and the rest salvaged, so it costs only its own key too. Only a
+//! document whose badness spans lines falls back wholesale.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -170,12 +171,43 @@ impl Config {
     /// silently discarded every other key — cookies unlock, yt-dlp/ffmpeg
     /// paths, audio format — all gone with no message, which is exactly the
     /// "a typo must never lock someone out" failure the module preamble
-    /// promises against. Now a wrong-typed value costs only its own key;
-    /// unparseable TOML syntax still falls back wholesale (there is nothing
-    /// to salvage from a broken document), and unknown keys stay ignored so
-    /// an older binary never chokes on a newer config.
+    /// promises against. Now a wrong-typed value costs only its own key, an
+    /// out-of-range integer literal costs only its own *line* (see the
+    /// salvage pass), and unknown keys stay ignored so an older binary
+    /// never chokes on a newer config.
     fn parse(s: &str) -> Option<Self> {
-        let table: toml::Table = s.parse().ok()?;
+        // Fast path: the whole document parses.
+        if let Ok(table) = s.parse::<toml::Table>() {
+            return Some(Self::from_table(&table));
+        }
+        // Salvage: TOML integers are i64-bounded, so an over-range literal
+        // (`buffer_duration_secs = 99999999999999999999`, issue #15) is a
+        // DOCUMENT-level syntax error — the per-key reader above never sees
+        // it. Drop one line at a time and retry: the first parseable
+        // candidate is the document with the offending line removed, and
+        // that key falls back to its default while every other key
+        // survives. A document whose badness spans lines (a multi-line
+        // construct broken twice) defeats single-line salvage and falls
+        // back wholesale.
+        for drop in 0..s.lines().count() {
+            let mut candidate = String::with_capacity(s.len());
+            for (i, line) in s.lines().enumerate() {
+                if i != drop {
+                    candidate.push_str(line);
+                    candidate.push('\n');
+                }
+            }
+            if let Ok(table) = candidate.parse::<toml::Table>() {
+                return Some(Self::from_table(&table));
+            }
+        }
+        None
+    }
+
+    /// The per-key lenient reader: extract each field with a type check of
+    /// its own, defaulting per key. Shared by the fast path and the salvage
+    /// candidates.
+    fn from_table(table: &toml::Table) -> Self {
         let d = Self::default();
         let int = |k: &str| table.get(k).and_then(toml::Value::as_integer);
         let text = |k: &str| {
@@ -184,7 +216,7 @@ impl Config {
                 .and_then(toml::Value::as_str)
                 .map(str::to_owned)
         };
-        Some(Config {
+        Config {
             scrolloff: int("scrolloff")
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(d.scrolloff),
@@ -203,7 +235,7 @@ impl Config {
             buffer_duration_secs: int("buffer_duration_secs")
                 .and_then(|v| u8::try_from(v).ok())
                 .unwrap_or(d.buffer_duration_secs),
-        })
+        }
     }
 }
 
@@ -280,11 +312,48 @@ mod tests {
     }
 
     #[test]
-    fn malformed_toml_syntax_falls_back_rather_than_failing() {
-        // Only unparseable syntax is unsalvageable — a wrong-typed *value*
-        // now defaults its own key alone (see the lenient tests below).
-        assert!(Config::parse("scrolloff = = =").is_none());
-        assert!(Config::parse("this is not toml ] ] ]").is_none());
+    fn a_single_malformed_line_costs_only_that_line() {
+        // One unparseable line makes the whole document fail the table
+        // parse; the salvage pass drops just that line, so the keys beside
+        // it survive untouched.
+        let c = Config::parse("scrolloff = = =\ncookies_file = \"/tmp/c.txt\"").expect("salvaged");
+        assert_eq!(c.scrolloff, 3, "the dropped line defaults its key");
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "good line survives"
+        );
+    }
+
+    #[test]
+    fn an_unsalvageable_document_falls_back_wholesale() {
+        // Two broken lines: no single-line drop can yield a parseable
+        // document, so the whole thing falls back.
+        assert!(Config::parse("scrolloff = = =\nstill not toml ] ] ]").is_none());
+    }
+
+    #[test]
+    fn an_out_of_range_integer_literal_costs_only_its_own_line() {
+        // TOML integers are i64-bounded (issue #15): an over-range literal
+        // is a document-level syntax error, so the per-key reader never
+        // sees it — the salvage pass removes that one line and keeps
+        // everything beside it.
+        let c = Config::parse(
+            "buffer_duration_secs = 99999999999999999999\n\
+             cookies_file = \"/tmp/c.txt\"\n\
+             ffmpeg_path = \"/opt/ffmpeg\"",
+        )
+        .expect("salvaged");
+        assert_eq!(
+            c.buffer_duration_secs, 2,
+            "the bad literal defaults its key"
+        );
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "cookies survive"
+        );
+        assert_eq!(c.ffmpeg_path, "/opt/ffmpeg", "ffmpeg path survives");
     }
 
     #[test]

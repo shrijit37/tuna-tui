@@ -69,6 +69,15 @@ fn parse_player_args() -> (Vec<String>, Option<u8>) {
     parse_player_args_from(std::env::args().skip(1))
 }
 
+/// The radio-drain fence: a landed expansion applies only while the user
+/// still wants the radio. Every play path (browse play, drill-in context,
+/// liked list) rewrites `transport.source`, so anything but `Radio` at
+/// drain time means the request was superseded — its outcome must not take
+/// over the queue or the status line (the zombie-radio class).
+fn radio_still_wanted(source: &PlaySource) -> bool {
+    matches!(source, PlaySource::Radio(_))
+}
+
 /// Split player-mode args from player flags. The only flag today is
 /// `--buffer-duration <secs>` (also `--buffer-duration=<secs>`); it is
 /// stripped here so the "first positional argument is a URI" contract in
@@ -691,6 +700,16 @@ async fn run_ui(
                     // The resolve finished (or its timeout path failed): a
                     // fresh request can go out again.
                     app.session.radio_in_flight = false;
+                    // The user may have started something else while the
+                    // expansion ran (browse play, drill-in, liked list) —
+                    // every play path rewrites `transport.source`. A late
+                    // radio outcome must apply to nothing: not the queue
+                    // (zombie radio overriding the user's choice), and not
+                    // the status line (it would speak for a station the user
+                    // abandoned).
+                    if !radio_still_wanted(&app.transport.source) {
+                        continue;
+                    }
                     match rad {
                         Ok(radio) if !radio.uris.is_empty() => {
                             if let Err(e) = app.svc.engine.play_tracks(radio.uris, None, radio.start_position_ms, false) {

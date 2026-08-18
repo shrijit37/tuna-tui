@@ -4,6 +4,7 @@
 mod args;
 mod nav;
 mod playlist;
+mod radio;
 mod search;
 mod sync;
 
