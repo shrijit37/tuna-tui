@@ -4,6 +4,7 @@
 mod nav;
 mod playlist;
 mod search;
+mod sync;
 
 /// Live-API tests, `#[ignore]`d so `cargo test` stays offline:
 ///
