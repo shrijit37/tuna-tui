@@ -17,13 +17,13 @@ ratatui = "0.30.2"
 crossterm = "0.29.0"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"], optional = true }
 tui-textarea-2 = { version = "0.12", default-features = false, features = ["crossterm"], optional = true }
-image = { version = "0.25", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 color-thief = { version = "0.2", optional = true }
 
 # --- streaming backend (on by default; the single `tuna-tui` binary needs it) ---
 # Phase 2: librespot is gone. Playback is yt-dlp → ffmpeg → rodio.
 rodio = { version = "0.22", optional = true, default-features = false, features = ["playback"] }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros", "time"] }
 flume = { version = "0.12", optional = true }
 rustfft = { version = "6", optional = true }
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["blocking", "json", "native-tls"] }
