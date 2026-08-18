@@ -206,6 +206,18 @@ struct MetaJob {
     info: ResolvedTrack,
 }
 
+/// Delivery-side dedup: a job whose uri matches the last DELIVERED one is a
+/// recovery re-push of an already-covered track (F6 — one record_played /
+/// cover / theme per play session). "Queued" is NOT "delivered": a full
+/// queue drops the oldest job (see [`MetaQueue::push`]), so a recovery's
+/// re-push is the authoritative second chance for a dropped metadata job —
+/// skipping duplicates here instead of at push time keeps both guarantees:
+/// the current track's metadata always ships, and the app never gets the
+/// same uri twice in a row.
+fn is_duplicate_delivery(last_sent: Option<&str>, job_uri: &str) -> bool {
+    last_sent == Some(job_uri)
+}
+
 /// Metadata jobs a single worker still owes (audit F6, bead Myx-a7o):
 /// bounded FIFO, oldest dropped on overflow. FIFO order among the survivors
 /// matters — the app's `meta_is_current` guard relies on delivery order.
@@ -263,13 +275,25 @@ impl MetaWorker {
             .name("tuna-meta".into())
             .spawn(move || {
                 // The wake channel disconnects when the meta worker drops
-                // (engine teardown) — the thread exits with it.
+                // (engine teardown) — the thread exits with it. Dedup lives
+                // HERE (delivery side), not at push time: the queue is
+                // best-effort (a full queue drops the oldest job), so
+                // "queued" is not "delivered" and a push-side skip could
+                // permanently lose the current track's metadata. The
+                // recovery re-push in build_stream always lands; a
+                // consecutive same-uri pair is the duplicate worth
+                // dropping.
+                let mut last_sent: Option<String> = None;
                 while wake_rx.recv().is_ok() {
                     while let Some(job) = q.pop() {
+                        if is_duplicate_delivery(last_sent.as_deref(), &job.uri) {
+                            continue;
+                        }
                         let meta = engine_meta(&job.uri, &job.info, &client);
                         if meta_tx.send(meta).is_err() {
                             return; // the app is gone — queued jobs are worthless
                         }
+                        last_sent = Some(job.uri);
                     }
                 }
             })
@@ -656,7 +680,6 @@ pub fn run(
         drop_streak: 0,
         last_seen_frames: 0,
         last_seen_sourced: 0,
-        meta_queued: None,
         load_gate: LoadGate::new(),
         load_tx,
         load_rx,
@@ -726,7 +749,6 @@ struct Worker {
     meta_worker: MetaWorker,
     /// The uri whose metadata is queued or delivered; a recovery rebuild of
     /// the same uri must not queue a duplicate (F6).
-    meta_queued: Option<String>,
     cmds: flume::Receiver<Cmd>,
     expander: Arc<dyn Expander>,
     /// The public mirror of the loaded list (`Engine::queue`).
@@ -1248,7 +1270,7 @@ impl Worker {
             if attempt > 0 {
                 let _ = self.events.send(EngineEvent::Reconnecting);
             }
-            match self.build_stream(&uri, pos, play, false) {
+            match self.build_stream(&uri, pos, play) {
                 Ok(()) => {
                     if attempt > 0 {
                         let _ = self.events.send(EngineEvent::Reconnected);
@@ -1357,7 +1379,7 @@ impl Worker {
             .events
             .send(EngineEvent::TrackChanged { uri: uri.clone() });
 
-        if let Err(e) = self.build_stream(&uri, pos, true, true) {
+        if let Err(e) = self.build_stream(&uri, pos, true) {
             liblog(format!("engine: start {uri} failed: {e}"));
             self.recover_into(uri, pos);
         }
@@ -1419,7 +1441,7 @@ impl Worker {
     /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
     /// when `play` is false, announce Paused and keep the mixer suspended (a
     /// recovery rebuilding a track the user had paused must not force-play it).
-    fn build_stream(&mut self, uri: &str, pos: u32, play: bool, fresh: bool) -> Result<()> {
+    fn build_stream(&mut self, uri: &str, pos: u32, play: bool) -> Result<()> {
         let resolved = self.expander.resolve(uri).map_err(|e| anyhow!(e))?;
         let url = resolved.url.clone();
         self.restart_stream(&url, uri, resolved.duration_ms, pos, play)?;
@@ -1441,16 +1463,15 @@ impl Worker {
         // worker's state machine (audit F6 / bead Myx-a7o: was a fresh
         // detached thread per track start AND per recovery rebuild).
         //
-        // `fresh` is false only for a recovery rebuild of the SAME uri: the
-        // track's metadata was already delivered on its first start, and
-        // re-delivering it would repeat the cover/theme work and the app's
-        // `record_played` (Home count inflation). Exception: when the first
-        // attempt failed at resolve, nothing was ever queued — this recovery
-        // is the track's only chance to ship metadata, so it must queue.
-        if fresh || self.meta_queued.as_deref() != Some(uri) {
-            self.meta_queued = Some(uri.to_string());
-            self.meta_worker.push(uri.to_string(), resolved);
-        }
+        // EVERY successful build queues — fresh start or recovery rebuild —
+        // and the meta thread's delivery-side dedup turns a same-uri
+        // duplicate into a no-op. The queue is best-effort (drop-oldest on
+        // overflow), so "queued" is not "delivered": if the fresh job lost
+        // its slot to the cap, the recovery's re-push is the metadata's
+        // second chance — the old push-side `meta_queued` skip permanently
+        // lost the current track's cover/theme and Home history exactly in
+        // that drop-then-stall case.
+        self.meta_worker.push(uri.to_string(), resolved);
         Ok(())
     }
 
@@ -1685,6 +1706,71 @@ mod tests {
         // in order.
         let expected: Vec<String> = (5..META_QUEUE_CAP + 5).map(|i| format!("u{i}")).collect();
         assert_eq!(seen, expected);
+    }
+
+    /// The queued≠delivered invariant: an overflow drop evicts a job, but a
+    /// recovery's re-push must still LAND behind everything currently
+    /// pending — delivery-side dedup (not push-side) is what keeps the
+    /// dropped track's metadata shippable.
+    #[test]
+    fn an_overflow_drop_does_not_erase_the_recovery_repush() {
+        let q = MetaQueue::new();
+        for i in 0..META_QUEUE_CAP {
+            q.push(MetaJob {
+                uri: format!("u{i}"),
+                info: ResolvedTrack {
+                    url: String::new(),
+                    title: String::new(),
+                    artist: String::new(),
+                    album: None,
+                    duration_ms: None,
+                    thumbnail: None,
+                },
+            });
+        }
+        // u0's fresh job is evicted by the next push...
+        q.push(MetaJob {
+            uri: "filler".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        // ...and the recovery of the stalled u0 re-pushes it: it must
+        // survive to delivery (it lands at the back of the FIFO).
+        q.push(MetaJob {
+            uri: "u0".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        assert!(
+            seen.iter().any(|u| u == "u0"),
+            "the recovery re-push must land even after its fresh job was dropped: {seen:?}"
+        );
+    }
+
+    /// Delivery-side dedup skips only a CONSECUTIVE same-uri delivery: a
+    /// re-started same-uri track (repeat, reload) is a legit delivery, and a
+    /// uri change always ships.
+    #[test]
+    fn delivery_dedup_skips_only_consecutive_duplicates() {
+        assert!(is_duplicate_delivery(Some("u1"), "u1"));
+        assert!(!is_duplicate_delivery(Some("u1"), "u2"));
+        assert!(!is_duplicate_delivery(None, "u1"));
     }
 
     #[test]
