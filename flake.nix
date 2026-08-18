@@ -48,7 +48,10 @@
               ]
               ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
                 pkgs.libiconv
-              ];
+              ]
+              # The engine oracle tests spawn the real `ffmpeg` binary; it must
+              # be present in the check phase (nix flake check runs cargo test).
+              ++ [ pkgs.ffmpeg ];
 
             strictDeps = true;
 
