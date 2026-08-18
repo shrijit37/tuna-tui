@@ -523,10 +523,12 @@ fn send_drop_oldest<T>(tx: &flume::Sender<T>, rx: &flume::Receiver<T>, mut msg: 
             Ok(()) => return,
             Err(flume::TrySendError::Full(m)) => {
                 msg = m;
-                if rx.try_recv().is_err() {
-                    // Queue drained concurrently, or the receiver is gone:
-                    // give up rather than churn.
-                    return;
+                match rx.try_recv() {
+                    // Dropped the oldest, or a receiver drained the queue
+                    // concurrently — either way there is room now; retry.
+                    Ok(_) | Err(flume::TryRecvError::Empty) => {}
+                    // Receiver gone — nothing left to drop for.
+                    Err(flume::TryRecvError::Disconnected) => return,
                 }
             }
             Err(flume::TrySendError::Disconnected(_)) => return,
