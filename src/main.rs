@@ -600,7 +600,7 @@ async fn run_ui(
                     .svc
                     .engine
                     .bands
-                    .try_lock()
+                    .lock()
                     .map(|mut g| {
                         g.enabled = now_playing;
                         g.is_active
