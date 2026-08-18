@@ -835,30 +835,23 @@ impl Worker {
         if failed || dropped {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
-            self.drop_streak += 1;
-            if self.drop_streak >= RECOVERY_ATTEMPTS {
-                liblog(format!(
-                    "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
-                ));
-                self.give_up_on(uri);
-                return;
-            }
             if dropped {
                 // Distinguish the two drop kinds in the log: a late transport
                 // death (EOF far short of the known duration) versus a stream
                 // that died inside the start-up window.
-                match cur.duration_ms.map(|d| d.saturating_sub(pos)) {
-                    Some(short) if short > EOF_SHORTFALL_MS => liblog(format!(
-                        "engine: stream ended {short}ms short of duration for {uri}; rebuilding"
-                    )),
-                    _ => liblog(format!(
-                        "engine: stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms); rebuilding"
-                    )),
-                }
+                let why = match cur.duration_ms.map(|d| d.saturating_sub(pos)) {
+                    Some(short) if short > EOF_SHORTFALL_MS => {
+                        format!("stream ended {short}ms short of duration for {uri}")
+                    }
+                    _ => format!(
+                        "stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms)"
+                    ),
+                };
+                self.rebuild_after_eof(uri, pos, why);
             } else {
-                liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
+                let why = format!("decoder died for {uri}");
+                self.rebuild_after_eof(uri, pos, why);
             }
-            self.recover_into(uri, pos);
             return;
         }
         self.drop_streak = 0;
@@ -874,11 +867,45 @@ impl Worker {
         // we killed ourselves (`code()==None` over signal death) must not
         // reclassify a natural end into a failed stream.
         if exited.is_none() {
-            let _ = cur.child.kill();
-            let _ = cur.child.wait();
+            // A kill that fails (ESRCH) means the child exited in the window
+            // since the try_wait above — wait() then reports the REAL status
+            // (no signal was delivered), and a mid-song decoder crash racing
+            // the EOF must rebuild instead of advancing. The post-successful-
+            // kill wait stays discarded: code()==None over signal death is
+            // the signal we sent, never a classification (binding F8).
+            if cur.child.kill().is_err() {
+                let crashed = cur
+                    .child
+                    .wait()
+                    .ok()
+                    .and_then(|s| s.code())
+                    .is_some_and(|c| c != 0);
+                if crashed {
+                    let why = format!("decoder died for {uri} at EOF");
+                    self.rebuild_after_eof(uri, pos, why);
+                    return;
+                }
+            } else {
+                let _ = cur.child.wait();
+            }
         }
         drop(cur);
         self.advance();
+    }
+
+    /// Shared tail of the failed/dropped/crashed-at-EOF paths: bounded
+    /// retries, then a rebuild of the current stream from `pos`.
+    fn rebuild_after_eof(&mut self, uri: String, pos: u32, why: String) {
+        self.drop_streak += 1;
+        if self.drop_streak >= RECOVERY_ATTEMPTS {
+            liblog(format!(
+                "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
+            ));
+            self.give_up_on(uri);
+            return;
+        }
+        liblog(format!("engine: {why}; rebuilding"));
+        self.recover_into(uri, pos);
     }
 
     /// The track is given up on after too many consecutive failures: remove it
