@@ -13,6 +13,7 @@
 
 use crate::app::*;
 use tuna_tui::config;
+use tuna_tui::itunes;
 use tuna_tui::util::uri_parts;
 use tuna_tui::yt;
 
@@ -99,15 +100,27 @@ pub(crate) fn spawn_search(query: String, tx: flume::Sender<Vec<LibItem>>) {
     std::thread::Builder::new()
         .name("tuna-search".to_string())
         .spawn(move || {
-            let vids = yt::search(&query, config::get().search_limit);
+            // Music-only by construction, not by heuristic: the row list IS
+            // the canonical iTunes song hits (entity=song returns nothing
+            // else), each mapped to its playable video via a canonical
+            // one-hit search. Non-music content never becomes a row. The
+            // mapping is the old hybrid_expander pattern — the port deleted
+            // it with the Spotify API, this cred-free version is its return.
+            let client = reqwest::blocking::Client::new();
+            let hits = itunes::search_songs(&client, &query, config::get().search_limit);
             let mut out = Vec::new();
-            if !vids.is_empty() {
+            if !hits.is_empty() {
                 out.push(LibItem::header("Songs"));
             }
-            out.extend(
-                vids.into_iter()
-                    .map(|v| LibItem::track(v.title, v.artist, v.uri)),
-            );
+            for hit in hits {
+                // The canonical query's top video is the playable row; a
+                // dead mapping (yt-dlp no-hit) drops the song quietly — a
+                // canonical track without a playable copy is not a row.
+                let vid_query = format!("{} {} single", hit.artist, hit.title);
+                if let Some(v) = yt::search(&vid_query, 1).into_iter().next() {
+                    out.push(LibItem::track(hit.title, hit.artist, v.uri));
+                }
+            }
             let _ = tx.send(out);
         })
         .expect("spawn search worker");

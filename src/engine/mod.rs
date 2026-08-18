@@ -1688,12 +1688,20 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
         } else {
             format!("{} {}", r.artist, r.title)
         };
-        crate::spotify::search_track(client, &query)
+        // Confidence gate on the hit (itunes::artist_overlap): a fuzzy
+        // search's top hit can be a DIFFERENT song, and only an
+        // artist-overlapping hit may override the row — wrongness is not
+        // the same as failure (the search `None`s on failure; this gates
+        // on wrongness).
+        match crate::itunes::search_track(client, &query) {
+            Some(s) if crate::itunes::artist_overlap(&r.artist, &r.title, &s.artist) => Some(s),
+            _ => None,
+        }
     };
     let (title, artist, album, duration_ms) = match &spot {
         Some(s) => (
             s.title.clone(),
-            s.artists.join(", "),
+            s.artist.clone(),
             s.album.clone(),
             s.duration_ms,
         ),
@@ -1710,7 +1718,7 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
     let cover_url = r
         .thumbnail
         .as_deref()
-        .or(spot.as_ref().and_then(|s| s.image_url.as_deref()));
+        .or(spot.as_ref().and_then(|s| s.artwork_url.as_deref()));
     let mut image = None;
     let mut theme = None;
     if let Some(url) = cover_url {

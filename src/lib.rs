@@ -14,11 +14,11 @@ pub mod components;
 pub mod cover;
 pub mod gradient;
 pub mod httpcache;
+pub mod itunes;
 pub mod liblog;
 pub mod lyrics;
 #[cfg(feature = "streaming")]
 pub mod reactive;
-pub mod spotify;
 pub mod theme;
 pub mod util;
 
