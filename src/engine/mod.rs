@@ -628,10 +628,26 @@ const MIN_EOF_POSITION_MS: u32 = 5_000;
 /// we keep retrying this track before walking away" — one number, so tuning
 /// it can't leave the two paths disagreeing about when to give up.
 const RECOVERY_ATTEMPTS: u32 = 8;
+/// A fresh start gets exactly this many consecutive build attempts before
+/// the skip policy treats the track as unplayable (Myx-a4e.10, issue #19).
+/// Resolve failures mix permanent (deleted video) and transient (dead
+/// socket F17, bot-gate, DNS blip) causes, and yt-dlp errors are untyped —
+/// one immediate re-attempt is the cheapest large win on both: a deleted
+/// video fails fast twice, a transient blip recovers on the second attempt,
+/// and no minutes of dead air are spent either way.
+const FRESH_START_ATTEMPTS: u32 = 2;
 /// First and last wait between failed recovery attempts, so an offline spell
 /// doesn't hammer the resolver every five seconds until dawn.
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(120);
+
+/// The skip policy's decision point: give up on a fresh start after
+/// [`FRESH_START_ATTEMPTS`] consecutive build failures. Extracted so the
+/// count is pinned by tests — a change of policy has to change the number
+/// here and the test with it.
+fn fresh_start_gives_up_after(attempt: u32) -> bool {
+    attempt >= FRESH_START_ATTEMPTS
+}
 /// Worker loop wakeup: drains commands, watches for EOF, emits position.
 const TICK: Duration = Duration::from_millis(100);
 /// How often the worker emits a [`EngineEvent::PositionCorrection`] while
@@ -1407,14 +1423,29 @@ impl Worker {
             .events
             .send(EngineEvent::TrackChanged { uri: uri.clone() });
 
-        if let Err(e) = self.build_stream(&uri, pos, true) {
-            liblog(format!("engine: start {uri} failed: {e}"));
-            // A fresh start that never produced audio is deterministic at
-            // this moment — retrying inside the 5-120s recovery backoff
-            // would leave dead air for a minute per unplayable track
-            // (deleted videos in playlists). Skip to the successor
-            // immediately (Myx-a4e.10).
-            self.give_up_on(uri, "fresh build failed — skipping");
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            match self.build_stream(&uri, pos, true) {
+                Ok(()) => break,
+                Err(e) => {
+                    liblog(format!(
+                        "engine: start {uri} failed (attempt {attempts}): {e}"
+                    ));
+                    // One immediate re-attempt before the skip applies:
+                    // resolve() failures are NOT all permanent — a dead
+                    // socket (F17), a bot-gate or a DNS blip at fresh start
+                    // is transient, and recover_into's 5-120s ladder (built
+                    // for mid-track drops) was the only thing that used to
+                    // absorb it. The skip must not delete a playable track
+                    // on a blip; a deleted video fails fast on both attempts
+                    // (Myx-a4e.10 / issue #19).
+                    if fresh_start_gives_up_after(attempts) {
+                        self.give_up_on(uri, "fresh build failed twice — skipping");
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1913,6 +1944,17 @@ mod tests {
         // off the queue's end is dropped harmlessly by `start_track_at`'s
         // `.get()` guard when `prev` later consumes it.
         assert_eq!(history, vec![1usize, 2]);
+    }
+
+    /// The fresh-start retry policy (issue #19): exactly one immediate
+    /// re-attempt before the skip applies — a transient resolve blip (dead
+    /// socket, bot-gate, DNS) must not delete a playable track from the
+    /// queue, while a deleted video fails fast on both attempts anyway.
+    #[test]
+    fn a_fresh_start_gets_one_retry_before_the_skip_applies() {
+        assert!(!fresh_start_gives_up_after(1), "attempt 1 is retried");
+        assert!(fresh_start_gives_up_after(2), "attempt 2 is the last");
+        assert!(fresh_start_gives_up_after(3), "no attempt after 2");
     }
 
     /// A single dead track empties the queue: stop, never loop.
