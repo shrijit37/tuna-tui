@@ -128,6 +128,8 @@ pub(crate) struct SessionState {
     pub(crate) radio_in_flight: bool,
     // Display titles for known tracks (uri → "title — artist"), fed by
     // `apply_meta` and backing the local queue view — the server queue that
-    // used to supply these strings is gone.
+    // used to supply these strings is gone. Bounded by the queue-uri retain
+    // in the 24s sync tick (F22): entries whose uri left the engine queue are
+    // dropped there, so a long radio session can't grow it without bound.
     pub(crate) meta_cache: std::collections::HashMap<String, (String, String)>,
 }

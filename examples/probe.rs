@@ -15,9 +15,9 @@ use tuna_tui::engine::{self, EngineEvent};
 fn main() -> anyhow::Result<()> {
     println!("tuna-tui-probe: opening audio device…");
     let (tx, rx) = flume::unbounded::<EngineEvent>();
-    let (meta_tx, _meta_rx) = flume::unbounded::<engine::EngineMeta>();
+    let (meta_tx, meta_rx) = flume::bounded::<engine::EngineMeta>(4);
     let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(engine::YtExpander);
-    let engine = engine::run(tx, meta_tx, 50, expander)?;
+    let engine = engine::run(tx, meta_tx, meta_rx, 50, expander)?;
     println!("tuna-tui-probe: engine live; yt-dlp + ffmpeg pipelines ready.");
 
     // If a URI was passed, start playing it immediately.

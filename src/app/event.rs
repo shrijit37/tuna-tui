@@ -127,7 +127,8 @@ pub(crate) fn apply_meta(
     }
 
     // Cache the display triple for the local queue view, and roll the track
-    // into the Home/Recent history (counts + last-play ordering).
+    // into the Home/Recent history (counts + last-play ordering). Bounded by
+    // the queue-uri retain in the 24s sync tick (F22) — not here.
     app.session
         .meta_cache
         .insert(meta.uri.clone(), (meta.title.clone(), meta.artist.clone()));

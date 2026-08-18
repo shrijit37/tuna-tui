@@ -293,15 +293,25 @@ async fn boot(
 ) -> Result<TxcHandle> {
     // The engine's in-band metadata channel. Established before the engine
     // starts so no event can land on a missing sender; boot passes the receiver
-    // on to `run_ui`, where it feeds `apply_meta`.
-    let (engine_meta_tx, engine_meta_rx) = flume::unbounded::<tuna_tui::engine::EngineMeta>();
+    // on to `run_ui`, where it feeds `apply_meta`. Bounded with drop-oldest
+    // (F25): each message can carry a multi-MB cover image, so a momentarily
+    // busy UI must shed the OLDEST pending message instead of queueing images
+    // without bound — and saturation never blocks the engine's meta worker.
+    let (engine_meta_tx, engine_meta_rx) = flume::bounded::<tuna_tui::engine::EngineMeta>(4);
 
     // The pure-YouTube expander: every uri the app produces is `yt:` now, so
     // there is nothing for a hybrid bridge to do.
     let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(tuna_tui::engine::YtExpander);
 
     let (ev_tx, ev_rx) = flume::unbounded::<EngineEvent>();
-    let engine = engine::run(ev_tx, engine_meta_tx, init_vol, expander).context("start engine")?;
+    let engine = engine::run(
+        ev_tx,
+        engine_meta_tx,
+        engine_meta_rx.clone(),
+        init_vol,
+        expander,
+    )
+    .context("start engine")?;
 
     // The one positional argument is a yt: URI (or bare YouTube URL/playlist).
     // It always wins over a
@@ -692,6 +702,14 @@ async fn run_ui(
                     if app.transport.playback_started {
                         if refresh_needed(qlen, mlen, last_queue_len, last_meta_len) {
                             app.refresh_local_queue();
+                            // F22: the display cache is bounded by the queue,
+                            // not by age — drop labels for tracks that left
+                            // the engine queue so a long radio session can't
+                            // grow it without bound (the only reader is the
+                            // queue view's labels).
+                            let keep: std::collections::HashSet<&String> =
+                                app.transport.queue_uris.iter().collect();
+                            app.session.meta_cache.retain(|uri, _| keep.contains(uri));
                         }
                         last_queue_len = qlen;
                         last_meta_len = mlen;
@@ -727,6 +745,7 @@ async fn run_ui(
                         last_saved_repeat = app.transport.repeat;
                         let snapshot = save_state(&app);
                         tokio::task::spawn_blocking(move || snapshot.save());
+
                     }
                 }
                 false
