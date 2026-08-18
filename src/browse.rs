@@ -146,15 +146,18 @@ pub(crate) fn fetch_detail_blocking(
     match kind {
         // A playlist whose contents have grown locally renders its own rows;
         // otherwise the network copy (flat-extracted) is the contents.
-        "playlist" if let Some(rows) = store.playlist_tracks(uri) => {
-            append_or_hint(
-                &mut items,
-                rows.iter()
-                    .map(|t| LibItem::track(t.name.clone(), t.subtitle.clone(), t.uri.clone())),
-                "empty playlist",
-            );
-        }
+        // (No `if let` match guard: unstable E0658 on the current toolchain.)
         "playlist" => {
+            // Prefer the local rows when the store has them.
+            if let Some(rows) = store.playlist_tracks(uri) {
+                append_or_hint(
+                    &mut items,
+                    rows.iter()
+                        .map(|t| LibItem::track(t.name.clone(), t.subtitle.clone(), t.uri.clone())),
+                    "empty playlist",
+                );
+                return (name.to_string(), items);
+            }
             // Capped (F14): the drill-in view must not paginate a whole
             // multi-hundred-row playlist. Deliberately NOT `search_limit`
             // (defaults to 6 — would truncate a 30-track playlist with no
