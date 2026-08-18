@@ -465,22 +465,18 @@ fn yt_stdout_with_bin(
 ) -> Option<String> {
     // F17: the RAII permit is held across the child's WHOLE life — spawn
     // through both drain joins — and drops on every early-return path below.
-    // The bounded wait shares the child's own deadline; when the budget is
-    // exhausted the wait fails OPEN (spawn anyway once a permit frees),
-    // degrading to today's behavior instead of manufacturing a resolve
-    // failure the engine would treat as a dropped stream.
+    // The bounded wait shares the child's own deadline; on budget exhaustion
+    // the wait fails OPEN immediately (run unpermitted, log it) — an
+    // unbounded blocking acquire here would hold the engine worker past its
+    // resolve deadline, so the cap degrades to today's concurrency instead of
+    // manufacturing a hang (audit F17 regression caution).
     let deadline =
         Instant::now() + Duration::from_secs((SOCKET_TIMEOUT_SECS + DEADLINE_MARGIN_SECS) as u64);
     let _permit = match wait_for_permit(&YTDLP_PERMIT, deadline) {
-        Some(permit) => permit,
+        Some(permit) => Some(permit),
         None => {
-            liblog("yt: yt-dlp budget exhausted — waiting beyond deadline (fail-open)");
-            loop {
-                if let Ok(permit) = YTDLP_PERMIT.try_acquire() {
-                    break permit;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            liblog("yt: yt-dlp budget exhausted — running unpermitted (fail-open)");
+            None
         }
     };
     let mut child = std::process::Command::new(bin)
