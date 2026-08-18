@@ -178,7 +178,12 @@ impl Config {
         let table: toml::Table = s.parse().ok()?;
         let d = Self::default();
         let int = |k: &str| table.get(k).and_then(toml::Value::as_integer);
-        let text = |k: &str| table.get(k).and_then(toml::Value::as_str).map(str::to_owned);
+        let text = |k: &str| {
+            table
+                .get(k)
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
         Some(Config {
             scrolloff: int("scrolloff")
                 .and_then(|v| usize::try_from(v).ok())
@@ -296,7 +301,11 @@ mod tests {
         )
         .expect("valid toml");
         assert_eq!(c.buffer_duration_secs, 2, "out-of-range u8 falls back");
-        assert_eq!(c.cookies_file.as_deref(), Some("/tmp/c.txt"), "cookies survive");
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "cookies survive"
+        );
         assert_eq!(c.ffmpeg_path, "/opt/ffmpeg", "ffmpeg path survives");
 
         let c = Config::parse("buffer_duration_secs = 2.5").expect("valid toml");
@@ -317,7 +326,11 @@ mod tests {
         assert_eq!(c.scrolloff, 3, "negative int falls back");
         assert_eq!(c.search_limit, 6, "string for usize falls back");
         assert!(c.restore_on_startup, "string for bool falls back");
-        assert_eq!(c.cookies_file.as_deref(), Some("/tmp/c.txt"), "good key survives");
+        assert_eq!(
+            c.cookies_file.as_deref(),
+            Some("/tmp/c.txt"),
+            "good key survives"
+        );
     }
 
     #[test]

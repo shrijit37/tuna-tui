@@ -199,7 +199,6 @@ impl LoadGate {
     }
 }
 
-
 /// A queued metadata delivery: the resolved track whose cover/theme derive
 /// still needs shipping to the app.
 struct MetaJob {
@@ -286,6 +285,7 @@ impl MetaWorker {
         // Coalesced: one wake per drain cycle is enough.
         let _ = self.wake_tx.try_send(());
     }
+}
 
 /// What a landed context-load result did to the player.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
