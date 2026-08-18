@@ -224,27 +224,55 @@ fn is_duplicate_delivery(last_sent: Option<&str>, job_uri: &str) -> bool {
 const META_QUEUE_CAP: usize = 16;
 
 /// The queue half of the metadata worker, split out so the boundedness and
-/// drop-oldest rules are unit-testable without threads.
+/// drop rules are unit-testable without threads.
+///
+/// The current track's job is PINNED: an eviction never picks it. A queued
+/// job for any other track is re-pushed when that track starts, so losing
+/// it at cap pressure only costs a re-fetch later — but the track that is
+/// PLAYING has no second chance (its recovery rebuilt once; the delivery-
+/// side dedup can't conjure a job that never delivered). Dropping the
+/// oldest non-pinned job still respects FIFO among the survivors, which is
+/// what the app's `meta_is_current` ordering guard needs.
 struct MetaQueue {
     inner: Mutex<VecDeque<MetaJob>>,
+    /// The uri whose queued job must never be evicted — the current track,
+    /// written by `build_stream` before each push.
+    pinned: Mutex<Option<String>>,
 }
 
 impl MetaQueue {
     fn new() -> Self {
         Self {
             inner: Mutex::new(VecDeque::with_capacity(META_QUEUE_CAP)),
+            pinned: Mutex::new(None),
         }
     }
 
-    /// Push a job. A full queue drops the OLDEST — a recovery's duplicate
-    /// for an already-covered track is worth less than the current track's
-    /// cover (drop-newest would lose exactly the cover the user can see).
+    /// The track whose metadata must survive queue pressure.
+    fn set_pinned(&self, uri: Option<String>) {
+        *self.pinned.lock().unwrap() = uri;
+    }
+
+    /// Push a job. Same-uri jobs CONSOLIDATE (a re-push replaces the stale
+    /// copy instead of stacking — duplicates would burn cap slots, the
+    /// fuel of the double-eviction cascade). A full queue then evicts the
+    /// oldest NON-pinned job, keeping the currently-playing track's
+    /// metadata shippable; only if every queued job were the pinned uri
+    /// (impossible after consolidation) does the head go.
     fn push(&self, job: MetaJob) {
         let mut q = self.inner.lock().unwrap();
-        if q.len() >= META_QUEUE_CAP {
-            q.pop_front();
+        if let Some(i) = q.iter().position(|j| j.uri == job.uri) {
+            q.remove(i);
         }
         q.push_back(job);
+        if q.len() > META_QUEUE_CAP {
+            let pin = self.pinned.lock().unwrap().clone();
+            let victim = q
+                .iter()
+                .position(|j| Some(&j.uri) != pin.as_ref())
+                .unwrap_or(0);
+            q.remove(victim);
+        }
     }
 
     fn pop(&self) -> Option<MetaJob> {
@@ -301,10 +329,12 @@ impl MetaWorker {
         Self { queue, wake_tx }
     }
 
-    /// Queue a metadata delivery for `uri`. Fresh track starts only: a
-    /// recovery rebuild delivers the same track's metadata again, and the
-    /// cover/theme work + the app's `record_played` must not repeat (F6).
+    /// Queue a metadata delivery for `uri` and pin it as the current
+    /// track's — a full queue may evict anything except this job (the
+    /// playing track has no second chance; every other track re-pushes on
+    /// its own start).
     fn push(&self, uri: String, info: ResolvedTrack) {
+        self.queue.set_pinned(Some(uri.clone()));
         self.queue.push(MetaJob { uri, info });
         // Coalesced: one wake per drain cycle is enough.
         let _ = self.wake_tx.try_send(());
@@ -1824,6 +1854,82 @@ mod tests {
             seen.iter().any(|u| u == "u0"),
             "the recovery re-push must land even after its fresh job was dropped: {seen:?}"
         );
+    }
+
+    /// The double-eviction cascade (bead): under sustained cap pressure —
+    /// a meta thread blocked in one slow fetch while a cap-worth of new
+    /// jobs lands — the current track's queued job must never be the
+    /// eviction victim. It is the only job with no second chance: every
+    /// other uri re-pushes on its own start.
+    #[test]
+    fn eviction_never_drops_the_pinned_current_job() {
+        let q = MetaQueue::new();
+        q.set_pinned(Some("u0".into()));
+        for i in 0..=META_QUEUE_CAP {
+            q.push(MetaJob {
+                uri: format!("u{i}"),
+                info: ResolvedTrack {
+                    url: String::new(),
+                    title: String::new(),
+                    artist: String::new(),
+                    album: None,
+                    duration_ms: None,
+                    thumbnail: None,
+                },
+            });
+        }
+        // Two pushes past the cap: u0 must survive both, older non-pinned
+        // jobs are the victims, and the pinned job still delivers FIRST
+        // (FIFO among survivors keeps the app's ordering guard intact).
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        assert!(
+            seen.contains(&"u0".to_string()),
+            "pinned job survived: {seen:?}"
+        );
+        assert_eq!(seen[0], "u0", "FIFO order among survivors: {seen:?}");
+        assert_eq!(seen.len(), META_QUEUE_CAP, "cap still bounds the queue");
+        assert!(
+            !seen.contains(&"u1".to_string()),
+            "u1 was the eviction victim: {seen:?}"
+        );
+    }
+
+    /// Same-uri re-pushes consolidate instead of stacking: duplicates are
+    /// the cascade's fuel — 16 copies of one track's job could evict
+    /// everything else's.
+    #[test]
+    fn a_same_uri_repush_consolidates_instead_of_stacking() {
+        let q = MetaQueue::new();
+        q.push(MetaJob {
+            uri: "u0".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        q.push(MetaJob {
+            uri: "u0".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        assert_eq!(seen, vec!["u0"], "one job per uri, not a stack");
     }
 
     /// Delivery-side dedup skips only a CONSECUTIVE same-uri delivery: a
