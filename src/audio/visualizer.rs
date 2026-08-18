@@ -121,7 +121,10 @@ impl Visualizer {
         // decay≈0, so the first frame after re-enable replaces the stale
         // peaks immediately (the Myx-a4.14 frozen-spectrum class must not
         // come back).
-        if !self.bands.lock().map(|g| g.enabled).unwrap_or(true) {
+        // try_lock on the audio path (perf audit F7): a UI thread holding
+        // the bands lock must never block the pump — a missed gate read just
+        // means the next chunk re-checks.
+        if !self.bands.try_lock().map(|g| g.enabled).unwrap_or(true) {
             return;
         }
         // Interleaved stereo -> mono.
@@ -172,7 +175,9 @@ impl Visualizer {
             fill_log_bands(&self.magnitudes, &self.band_ranges, &mut self.new_bands);
             smooth_bands(&mut self.new_bands, &mut self.smooth_scratch);
 
-            if let Ok(mut g) = self.bands.lock() {
+            // try_lock: a dropped update is fine — the next hop re-fills the
+            // bands, and the pump thread never waits on the UI.
+            if let Ok(mut g) = self.bands.try_lock() {
                 let elapsed_hops =
                     g.updated_at.elapsed().as_secs_f32() * self.sample_rate / HOP_SIZE as f32;
                 let decay = DECAY_FACTOR.powf(elapsed_hops);
