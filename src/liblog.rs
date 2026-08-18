@@ -40,28 +40,45 @@ pub fn install_tuna_log() {
 
 /// Optional debug log — silent unless `TUNA_LOG` is set. Writes to
 /// ~/.cache/tuna-tui/tuna-tui.log (user-owned dir 0700, file 0600) instead of a
-/// world-writable fixed /tmp path (audit H5).
+/// world-writable fixed /tmp path (audit H5). The file is opened once, on the
+/// first call, and kept for the session (audit F26): no open/close syscall pair
+/// per call, and the env gate below stays ahead of the OnceLock because liblog
+/// runs inside `config::migrate_legacy_paths` — before the cache migration —
+/// where the cache dir must not be created (or raced) yet (util.rs contract).
+/// If that first open finds no cache dir it yields None and is never retried;
+/// acceptable for this debug path.
+static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
 pub fn liblog(msg: impl AsRef<str>) {
     use std::io::Write;
+    // Env gate first: must run before the OnceLock is ever touched, because
+    // this function is reachable from migrate_legacy_paths (config.rs) ahead of
+    // the cache migration.
     if std::env::var_os("TUNA_LOG").is_none() {
         return;
     }
-    let Some(dir) = crate::util::ensure_cache_dir_0700() else {
-        return;
-    };
-    let dir = dir.as_path();
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    if let Ok(mut f) = opts.open(dir.join("tuna-tui.log")) {
+    let file = FILE.get_or_init(|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(crate::util::cache_dir()?.join("tuna-tui.log"))
+            .ok()
+            .map(std::sync::Mutex::new)
+    });
+    if let Some(f) = file.as_ref() {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let _ = writeln!(f, "{ts:.3} {}", msg.as_ref());
+        let _ = writeln!(
+            f.lock().unwrap_or_else(|p| p.into_inner()),
+            "{ts:.3} {}",
+            msg.as_ref()
+        );
     }
 }
