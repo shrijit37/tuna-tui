@@ -52,10 +52,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # cpal's ALSA backend (rodio) and native-tls need these; macOS has them.
-      - name: Install Linux audio/TLS headers
+      # cpal's ALSA backend (rodio) needs ALSA headers, native-tls needs
+      # openssl, and the engine oracle tests spawn the real `ffmpeg` binary
+      # (the app's runtime dep) — none are preinstalled on the Linux runners.
+      - name: Install Linux audio/TLS headers + ffmpeg
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libasound2-dev libssl-dev pkg-config
+
+      - name: Install macOS ffmpeg (engine oracle tests spawn it)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install Windows ffmpeg (engine oracle tests spawn it)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y
 
       - name: Format
         run: cargo fmt --all --check

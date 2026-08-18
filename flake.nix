@@ -32,9 +32,14 @@
             src = lib.cleanSource ./.;
             cargoLock.lockFile = ./Cargo.lock;
 
-            nativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-              pkgs.pkg-config
-            ];
+            nativeBuildInputs =
+              lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.pkg-config
+              ]
+              # The engine oracle tests spawn the real `ffmpeg` binary during
+              # the check phase (which runs at BUILD time); with strictDeps the
+              # test env only has nativeBuildInputs on PATH.
+              ++ [ pkgs.ffmpeg ];
 
             buildInputs =
               lib.optionals pkgs.stdenv.hostPlatform.isLinux [
