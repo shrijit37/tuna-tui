@@ -435,7 +435,6 @@ async fn boot(
             last_click: None,
             radio_in_flight: false,
             meta_cache: std::collections::HashMap::new(),
-            meta_order: std::collections::VecDeque::new(),
         },
         store: saved.store.clone(),
         store_dirty: false,
@@ -703,6 +702,14 @@ async fn run_ui(
                     if app.transport.playback_started {
                         if refresh_needed(qlen, mlen, last_queue_len, last_meta_len) {
                             app.refresh_local_queue();
+                            // F22: the display cache is bounded by the queue,
+                            // not by age — drop labels for tracks that left
+                            // the engine queue so a long radio session can't
+                            // grow it without bound (the only reader is the
+                            // queue view's labels).
+                            let keep: std::collections::HashSet<&String> =
+                                app.transport.queue_uris.iter().collect();
+                            app.session.meta_cache.retain(|uri, _| keep.contains(uri));
                         }
                         last_queue_len = qlen;
                         last_meta_len = mlen;
@@ -738,6 +745,7 @@ async fn run_ui(
                         last_saved_repeat = app.transport.repeat;
                         let snapshot = save_state(&app);
                         tokio::task::spawn_blocking(move || snapshot.save());
+
                     }
                 }
                 false

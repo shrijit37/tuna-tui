@@ -127,12 +127,8 @@ pub(crate) fn apply_meta(
     }
 
     // Cache the display triple for the local queue view, and roll the track
-    // into the Home/Recent history (counts + last-play ordering).
-    meta_cache_register(
-        &mut app.session.meta_cache,
-        &mut app.session.meta_order,
-        &meta.uri,
-    );
+    // into the Home/Recent history (counts + last-play ordering). Bounded by
+    // the queue-uri retain in the 24s sync tick (F22) — not here.
     app.session
         .meta_cache
         .insert(meta.uri.clone(), (meta.title.clone(), meta.artist.clone()));
@@ -213,27 +209,6 @@ pub(crate) fn apply_meta(
                 .as_ref()
                 .map(|n| Duration::from_millis(n.duration_ms as u64)),
         });
-    }
-}
-
-/// Register `uri` in the FIFO eviction order of the display cache (F22):
-/// new keys are appended and, past [`META_CACHE_CAP`], the oldest key is
-/// evicted from both structures. Existing keys are left untouched — pushing
-/// on every insert would inflate the deque and spuriously evict entries,
-/// including (pathologically) the current track's.
-pub(crate) fn meta_cache_register(
-    cache: &mut std::collections::HashMap<String, (String, String)>,
-    order: &mut std::collections::VecDeque<String>,
-    uri: &str,
-) {
-    if cache.contains_key(uri) {
-        return;
-    }
-    order.push_back(uri.to_string());
-    while order.len() > META_CACHE_CAP {
-        if let Some(old) = order.pop_front() {
-            cache.remove(&old);
-        }
     }
 }
 

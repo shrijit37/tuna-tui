@@ -128,15 +128,8 @@ pub(crate) struct SessionState {
     pub(crate) radio_in_flight: bool,
     // Display titles for known tracks (uri → "title — artist"), fed by
     // `apply_meta` and backing the local queue view — the server queue that
-    // used to supply these strings is gone. Bounded by the FIFO `meta_order`
-    // deque below (F22) so a long radio session can't grow it without bound.
+    // used to supply these strings is gone. Bounded by the queue-uri retain
+    // in the 24s sync tick (F22): entries whose uri left the engine queue are
+    // dropped there, so a long radio session can't grow it without bound.
     pub(crate) meta_cache: std::collections::HashMap<String, (String, String)>,
-    // Insertion order of `meta_cache` keys — pushed only for NEW keys — the
-    // FIFO eviction authority that caps `meta_cache` at `META_CACHE_CAP`.
-    pub(crate) meta_order: std::collections::VecDeque<String>,
 }
-
-/// Cap on `SessionState::meta_cache` entries (F22): `apply_meta` appends new
-/// keys to `meta_order` and evicts the oldest past this bound — roughly
-/// 150–250 B/entry, so ~125 KB worst case for the whole session.
-pub(crate) const META_CACHE_CAP: usize = 500;

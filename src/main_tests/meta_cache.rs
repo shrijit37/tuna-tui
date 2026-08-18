@@ -1,40 +1,56 @@
-//! F22 — the display cache's FIFO cap bounds a long session's memory.
+//! F22 — the display cache is bounded by the engine queue, not by age:
+//! the 24s sync tick retains only entries whose uri is still in the queue.
 
-// `mod event` / `mod state` are private; the public(crate) paths are the
-// `app` module's glob re-exports.
-use crate::app::meta_cache_register;
-use crate::app::META_CACHE_CAP;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
+
+/// The retain predicate the sync tick applies: keep labels for queued uris.
+fn retain_for_queue(cache: &mut HashMap<String, (String, String)>, queue_uris: &[String]) {
+    let keep: HashSet<&String> = queue_uris.iter().collect();
+    cache.retain(|uri, _| keep.contains(uri));
+}
 
 #[test]
-fn meta_cache_caps_at_500() {
+fn meta_cache_is_bounded_by_the_queue() {
     let mut cache: HashMap<String, (String, String)> = HashMap::new();
-    let mut order: VecDeque<String> = VecDeque::new();
-
-    // 510 distinct tracks: the cache must settle at the cap, and the deque
-    // (the eviction authority) must track it exactly.
     for i in 0..510u32 {
-        let uri = format!("yt:video:cap-{i}");
-        meta_cache_register(&mut cache, &mut order, &uri);
-        cache.insert(uri, ("title".to_string(), String::new()));
+        cache.insert(
+            format!("yt:video:cap-{i}"),
+            ("title".to_string(), String::new()),
+        );
     }
-    assert_eq!(cache.len(), META_CACHE_CAP);
-    assert_eq!(order.len(), META_CACHE_CAP);
+
+    // The queue holds only three tracks: everything else must be dropped.
+    let queue = vec!["yt:video:cap-1".to_string(), "yt:video:cap-9".to_string()];
+    retain_for_queue(&mut cache, &queue);
+
+    assert_eq!(cache.len(), 2);
+    assert!(cache.contains_key("yt:video:cap-1"));
+    assert!(cache.contains_key("yt:video:cap-9"));
     assert!(
         !cache.contains_key("yt:video:cap-0"),
-        "oldest entries must be evicted"
+        "labels for tracks that left the queue are dropped"
     );
-    assert!(cache.contains_key("yt:video:cap-509"), "newest survive");
+}
 
-    // A re-delivered key is not a new key: length and eviction order stay
-    // exactly as they were (no deque inflation, no spurious eviction).
-    let before_len = cache.len();
-    let before: Vec<String> = order.iter().cloned().collect();
-    meta_cache_register(&mut cache, &mut order, "yt:video:cap-509");
-    assert_eq!(cache.len(), before_len);
-    let after: Vec<String> = order.iter().cloned().collect();
-    assert_eq!(
-        after, before,
-        "re-insert must not reorder or inflate the deque"
+#[test]
+fn meta_cache_empty_queue_drops_everything() {
+    let mut cache: HashMap<String, (String, String)> = HashMap::new();
+    cache.insert(
+        "yt:video:gone".to_string(),
+        ("title".to_string(), String::new()),
     );
+    retain_for_queue(&mut cache, &[]);
+    assert!(cache.is_empty(), "no queue, no labels");
+}
+
+#[test]
+fn meta_cache_keeps_labels_when_the_queue_keeps_tracks() {
+    let mut cache: HashMap<String, (String, String)> = HashMap::new();
+    cache.insert(
+        "yt:video:stay".to_string(),
+        ("title".to_string(), String::new()),
+    );
+    let queue = vec!["yt:video:stay".to_string()];
+    retain_for_queue(&mut cache, &queue);
+    assert_eq!(cache.len(), 1, "queued tracks keep their labels");
 }
