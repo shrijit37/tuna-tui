@@ -78,7 +78,12 @@ pub(crate) fn render_nowplaying_view(
         // Already on screen: hold the cells so nothing overwrites the picture,
         // and send nothing.
         Some(_) => hold_area(f, art_rect),
-        None => wipe_area(f, art_rect),
+        // No cover: blank the box only when something asked for it — the wipe
+        // marks the cells AlwaysUpdate, so re-sending an identical blank box
+        // every frame is pure waste. apply_meta schedules Draw on every track
+        // change, so a stale previous-track cover still gets cleared.
+        None if repaint != ArtRepaint::Idle => wipe_area(f, art_rect),
+        None => {}
     }
 
     if let Some(n) = app.playback.now.as_ref() {
