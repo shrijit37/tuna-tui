@@ -3,7 +3,7 @@
 use crate::*;
 
 /// Persisted across sessions (~/.cache/tuna-tui/state.json).
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SavedState {
     pub(crate) volume: u8,
     #[serde(default)]
@@ -23,7 +23,7 @@ pub(crate) struct SavedState {
     pub(crate) store: Store,
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LastPlayed {
     pub(crate) uri: String,
     pub(crate) title: String,
@@ -211,21 +211,70 @@ impl SavedState {
     pub(crate) fn path() -> Option<std::path::PathBuf> {
         Some(tuna_tui::home_dir()?.join(".cache/tuna-tui/state.json"))
     }
+
+    /// Load the saved session. The on-disk rules live in [`Self::load_from`];
+    /// this wrapper only resolves the home path, so the rules stay testable
+    /// without mutating `$HOME` in parallel test threads.
     pub(crate) fn load() -> SavedState {
         Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .map(|p| Self::load_from(&p))
             .unwrap_or_default()
     }
+
+    /// Read `path` and recover. A missing file (first run) and any read error
+    /// silently yield a default session — never a log line. A corrupt file
+    /// logs the reset and falls back to the `.bak` the save dance keeps (stale
+    /// by at most one save), then to a default session.
+    fn load_from(path: &std::path::Path) -> SavedState {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return SavedState::default(); // first run, or unreadable — never logged
+        };
+        match serde_json::from_str(&text) {
+            Ok(state) => state,
+            Err(_) => {
+                let bak = path.with_extension("json.bak");
+                tuna_tui::liblog::liblog(format!(
+                    "{} corrupt; recovering from {bak:?}",
+                    path.display()
+                ));
+                std::fs::read_to_string(&bak)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default()
+            }
+        }
+    }
+
     pub(crate) fn save(&self) {
-        // The dir is created (0700) by the shared helper — same one-time cost
-        // as the old create_dir_all, strictly more private on unix.
-        let Some(dir) = tuna_tui::util::ensure_cache_dir_0700() else {
+        // F19: the cache dir already exists at boot (the single-instance lock
+        // created it). Write straight to it and only recreate the dir when a
+        // write fails — the mid-session-deleted-dir self-heal survives without
+        // per-save create_dir_all + chmod syscalls. Errors stay swallowed.
+        let Some(path) = Self::path() else {
             return;
         };
-        if let Ok(json) = serde_json::to_string(self) {
-            let _ = std::fs::write(dir.join("state.json"), json);
+        if self.save_to(&path) {
+            return;
         }
+        tuna_tui::util::ensure_cache_dir_0700();
+        let _ = self.save_to(&path);
+    }
+
+    /// Write `path` atomically (unique tmp + fsync + rename) with a `.bak`
+    /// dance: the previous state.json becomes state.json.bak before the new
+    /// file takes its place, so a torn or corrupt state.json has a recovery
+    /// copy. Every move is best-effort — on failure the previous file remains
+    /// at state.json.bak and false is returned (the retry in [`Self::save`]
+    /// and the next periodic save both pick it up).
+    fn save_to(&self, path: &std::path::Path) -> bool {
+        let Ok(json) = serde_json::to_string(self) else {
+            return false;
+        };
+        let bak = path.with_extension("json.bak");
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(&bak); // rename cannot replace on Windows
+        let _ = std::fs::rename(path, &bak); // best-effort; no-op on first run
+        tuna_tui::util::write_atomic(path, json.as_bytes())
     }
 }
 
@@ -254,5 +303,134 @@ pub(crate) fn save_state(app: &App) -> SavedState {
         source: app.transport.source.clone(),
         source_name: app.transport.source_name.clone(),
         store: app.store.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tuna-tui-persist-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A distinct, non-default state: the volume and one liked row differ per
+    /// call, so "equals one of the stores" is checkable via its serialized
+    /// form (SavedState has no PartialEq — PlaySource lives in an off-limits
+    /// file and serde output is field-ordered and deterministic).
+    fn state(volume: u8, uri: &str) -> SavedState {
+        SavedState {
+            volume,
+            store: Store {
+                liked: vec![LibEntry {
+                    name: uri.into(),
+                    subtitle: String::new(),
+                    uri: uri.into(),
+                }],
+                ..Store::default()
+            },
+            ..SavedState::default()
+        }
+    }
+
+    fn json(state: &SavedState) -> String {
+        serde_json::to_string(state).unwrap()
+    }
+
+    #[test]
+    fn missing_file_returns_default() {
+        // HARD requirement (F18): the first-run path must stay a silent
+        // default — the load-side recovery must not fire on a missing file.
+        let dir = scratch("missing");
+        let path = dir.join("state.json");
+        assert_eq!(
+            json(&SavedState::load_from(&path)),
+            json(&SavedState::default())
+        );
+    }
+
+    #[test]
+    fn torn_write_recovers_from_bak() {
+        let dir = scratch("bak");
+        let path = dir.join("state.json");
+        let a = state(7, "yt:video:aaa");
+        let b = state(9, "yt:video:bbb");
+        assert!(a.save_to(&path));
+        assert!(b.save_to(&path));
+        // A mid-write interruption leaves garbage in state.json; the load must
+        // fall back to the .bak (the state before the latest save), not to an
+        // empty default library.
+        std::fs::write(&path, "{\"volume\": 255, torn").unwrap();
+        assert_eq!(json(&SavedState::load_from(&path)), json(&a));
+    }
+
+    #[test]
+    fn no_tmp_residue_after_save() {
+        let dir = scratch("noresidue");
+        let path = dir.join("state.json");
+        assert!(state(7, "yt:video:aaa").save_to(&path));
+        assert!(state(9, "yt:video:bbb").save_to(&path));
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["state.json", "state.json.bak"]);
+        // The visible file is the latest save, intact.
+        assert_eq!(
+            json(&SavedState::load_from(&path)),
+            json(&state(9, "yt:video:bbb"))
+        );
+    }
+
+    #[test]
+    fn concurrent_saves_never_leave_torn_state() {
+        // The periodic (un-awaited) and quit (awaited) saves overlap on the
+        // same file; unique temp names mean the winner is always exactly one
+        // complete store, never a blend of both.
+        let dir = scratch("concurrent");
+        let path = dir.join("state.json");
+        let a = state(1, "yt:video:aaa");
+        let b = state(2, "yt:video:bbb");
+        let writer_a = {
+            let path = path.clone();
+            let a = a.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    assert!(a.save_to(&path));
+                }
+            })
+        };
+        let writer_b = {
+            let path = path.clone();
+            let b = b.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    assert!(b.save_to(&path));
+                }
+            })
+        };
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+        let final_json = json(&SavedState::load_from(&path));
+        assert!(
+            final_json == json(&a) || final_json == json(&b),
+            "final file must be exactly one complete store"
+        );
+    }
+
+    #[test]
+    fn save_does_not_create_the_dir() {
+        // F19: the parent is no longer created eagerly on save — a missing
+        // cache dir makes save_to fail cleanly and is only recreated by the
+        // caller's one-shot retry path (exercised in the e2e recipe).
+        let dir = scratch("nodir");
+        let doomed = dir.join("gone/deeper");
+        let path = doomed.join("state.json");
+        assert!(!state(7, "yt:video:aaa").save_to(&path));
+        assert!(!doomed.exists());
     }
 }
