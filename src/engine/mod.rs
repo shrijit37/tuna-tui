@@ -843,9 +843,7 @@ impl Worker {
                     Some(short) if short > EOF_SHORTFALL_MS => {
                         format!("stream ended {short}ms short of duration for {uri}")
                     }
-                    _ => format!(
-                        "stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms)"
-                    ),
+                    _ => format!("stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms)"),
                 };
                 self.rebuild_after_eof(uri, pos, why);
             } else {
@@ -874,12 +872,10 @@ impl Worker {
             // kill wait stays discarded: code()==None over signal death is
             // the signal we sent, never a classification (binding F8).
             if cur.child.kill().is_err() {
-                let crashed = cur
-                    .child
-                    .wait()
-                    .ok()
-                    .and_then(|s| s.code())
-                    .is_some_and(|c| c != 0);
+                // Signal deaths count as crashes (a segfaulting decoder has
+                // `code()==None`, non-failed by the `.and_then` form) — same
+                // predicate as the primary `failed` check.
+                let crashed = cur.child.wait().ok().is_some_and(|s| s.code() != Some(0));
                 if crashed {
                     let why = format!("decoder died for {uri} at EOF");
                     self.rebuild_after_eof(uri, pos, why);
