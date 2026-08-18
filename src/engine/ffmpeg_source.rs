@@ -382,7 +382,7 @@ mod tests {
         let (mut zeros, mut real) = (0, 0);
         loop {
             match src.next() {
-                Some(s) if s == 0.0 => zeros += 1,
+                Some(0.0) => zeros += 1,
                 Some(_) => real += 1,
                 None => return (zeros, real, frames.load(Ordering::Relaxed), true),
             }
@@ -407,7 +407,7 @@ mod tests {
         let mut real = 0;
         loop {
             match src.next() {
-                Some(s) if s == 0.0 => {}
+                Some(0.0) => {}
                 Some(_) => real += 1,
                 None => return (real, frames.load(Ordering::Relaxed), true),
             }
