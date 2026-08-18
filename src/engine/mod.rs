@@ -1359,7 +1359,10 @@ mod tests {
     #[cfg(unix)]
     fn status_from_code(code: i32) -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(code)
+        // wait(2) stores the exit code in the high byte of the raw status
+        // word (WEXITSTATUS); passing it bare decodes as a signal
+        // termination (code() == None), not "exited with code N".
+        std::process::ExitStatus::from_raw((code & 0xff) << 8)
     }
 
     /// Windows stores the exit code directly in the raw status word.
