@@ -118,7 +118,12 @@ pub(crate) fn spawn_search(query: String, tx: flume::Sender<Vec<LibItem>>) {
                 // canonical track without a playable copy is not a row.
                 let vid_query = format!("{} {} single", hit.artist, hit.title);
                 if let Some(v) = yt::search(&vid_query, 1).into_iter().next() {
-                    out.push(LibItem::track(hit.title, hit.artist, v.uri));
+                    // Mapping gate (#22): official/audio/live variants keep,
+                    // covers and unrelated videos drop — a row must actually
+                    // BE the canonical song, not just be labeled as it.
+                    if itunes::video_matches(&hit.artist, &hit.title, &v.title, &v.artist) {
+                        out.push(LibItem::track(hit.title, hit.artist, v.uri));
+                    }
                 }
             }
             let _ = tx.send(out);

@@ -67,17 +67,42 @@ pub fn search_track(client: &reqwest::blocking::Client, query: &str) -> Option<S
 /// a hits-are-random miss yields no overlap and the row keeps its own
 /// metadata. Failure and wrongness are distinct: `search_track`'s `None`
 /// covers failure; this covers wrongness.
+pub(crate) fn tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
 pub(crate) fn artist_overlap(yts_artist: &str, yts_title: &str, hit_artist: &str) -> bool {
-    let tokens = |s: &str| -> Vec<String> {
-        s.split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_lowercase())
-            .collect()
-    };
     let mut source: Vec<String> = tokens(yts_artist);
     source.extend(tokens(yts_title));
-    let hit: Vec<String> = tokens(hit_artist);
+    let hit = tokens(hit_artist);
     source.iter().any(|a| hit.contains(a))
+}
+
+/// Confidence gate for the search MAPPING seam (#22): the canonical hit is
+/// played through the top video of an `artist title single` search, and a
+/// single title-token match still lets covers through ("Wheel in the Sky
+/// but it's a lofi cover" shares "sky"). Requiring the canonical ARTIST to
+/// appear in the video's title or artist field closes that: a cover's
+/// title rarely names the original artist. Miss = drop the row.
+pub fn video_matches(
+    hit_artist: &str,
+    hit_title: &str,
+    video_title: &str,
+    video_artist: &str,
+) -> bool {
+    let artist = tokens(hit_artist);
+    let title = tokens(hit_title);
+    let vtitle = tokens(video_title);
+    let vartist = tokens(video_artist);
+    let artist_ok = artist.is_empty()
+        || artist
+            .iter()
+            .any(|t| vtitle.contains(t) || vartist.contains(t));
+    let title_ok = title.is_empty() || title.iter().any(|t| vtitle.contains(t));
+    artist_ok && title_ok
 }
 
 /// The parser half, offline-testable: `results[0..]` of the iTunes search
@@ -192,6 +217,49 @@ mod tests {
             "not in the title"
         );
         assert!(!artist_overlap("", "", "Random Artist"));
+    }
+
+    /// The mapping gate (#22): the canonical row must match the playable
+    /// video — official/audio/live variants keep (artist+title tokens
+    /// present), covers and unrelated videos drop (a cover's title does
+    /// not name the original artist).
+    #[test]
+    fn the_mapping_gate_keeps_matches_and_drops_covers() {
+        // Official audio: "Journey - Wheel In The Sky (Official Audio)"
+        assert!(video_matches(
+            "Journey",
+            "Wheel in the Sky",
+            "Journey - Wheel In The Sky (Official Audio)",
+            "Journey"
+        ));
+        // Live: "Wheel in the Sky (Live at...)" — artist token still there
+        assert!(video_matches(
+            "Journey",
+            "Wheel in the Sky",
+            "Wheel in the Sky (Live in Osaka)",
+            "Journey"
+        ));
+        // A lofi cover shares title tokens but no artist token -> dropped
+        assert!(!video_matches(
+            "Journey",
+            "Wheel in the Sky",
+            "Wheel in the Sky but it's a lofi cover",
+            "LoFi Beats"
+        ));
+        // Unrelated results drop outright
+        assert!(!video_matches(
+            "Journey",
+            "Wheel in the Sky",
+            "Top 100 Rock Songs Ever",
+            "Rock Mix"
+        ));
+        // Case-folding + punctuation
+        assert!(video_matches(
+            "THE BEATLES",
+            "Let It Be",
+            "The Beatles - Let It Be (Remastered)",
+            "The Beatles"
+        ));
     }
 
     /// Live gate: the keyless leg is the whole premise — a real query
