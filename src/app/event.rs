@@ -133,6 +133,10 @@ pub(crate) fn apply_meta(
         .insert(meta.uri.clone(), (meta.title.clone(), meta.artist.clone()));
     app.store
         .record_played(&meta.uri, &meta.title, &meta.artist);
+    // Third store-mutator site per the F21 binding spec (audit:
+    // app/event.rs:134–136) — flag it so the 24s save persists the history
+    // row even if the playback cadence ever stops covering it.
+    app.store_dirty = true;
 
     let cover = meta
         .image

@@ -15,15 +15,15 @@ default-run = "tuna-tui"
 [dependencies]
 ratatui = "0.30.2"
 crossterm = "0.29.0"
-ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
-tui-textarea-2 = { version = "0.12", default-features = false, features = ["crossterm"] }
-image = "0.25"
-color-thief = "0.2"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"], optional = true }
+tui-textarea-2 = { version = "0.12", default-features = false, features = ["crossterm"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+color-thief = { version = "0.2", optional = true }
 
 # --- streaming backend (on by default; the single `tuna-tui` binary needs it) ---
 # Phase 2: librespot is gone. Playback is yt-dlp → ffmpeg → rodio.
 rodio = { version = "0.22", optional = true, default-features = false, features = ["playback"] }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros", "time"] }
 flume = { version = "0.12", optional = true }
 rustfft = { version = "6", optional = true }
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["blocking", "json", "native-tls"] }
@@ -32,16 +32,16 @@ serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 anyhow = { version = "1", optional = true }
 fs2 = { version = "0.4", optional = true }
-souvlaki = { version = "0.8.3", default-features = false, features = ["pollster", "zbus", "zvariant"] }
+souvlaki = { version = "0.8.3", default-features = false, features = ["pollster", "zbus", "zvariant"], optional = true }
 toml = { version = "1", default-features = false, features = ["parse", "serde"], optional = true }
 log = { version = "0.4.33", features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-win = "3.0.0"
+windows-win = { version = "3.0.0", optional = true }
 
 # Macos-only
 [target.'cfg(target_os = "macos")'.dependencies]
-winit = "0.30.13"
+winit = { version = "0.30.13", optional = true }
 
 [features]
 default = ["streaming", "txc"]
@@ -62,6 +62,17 @@ streaming = [
     "dep:anyhow",
     "dep:fs2",
     "dep:toml",
+    # UI/image/zbus stack — needed only by the streaming binary surface
+    # (cover art, theme derivation, MPRIS media keys, text input).
+    "dep:image",
+    "dep:ratatui-image",
+    "dep:color-thief",
+    "dep:tui-textarea-2",
+    "dep:souvlaki",
+    # winit (macOS event loop) and windows-win (console handle) are used only
+    # by main.rs, the streaming-gated binary.
+    "dep:winit",
+    "dep:windows-win",
 ]
 
 # The one, fully-wired binary. `required-features` states what was already
@@ -77,6 +88,15 @@ required-features = ["streaming"]
 [[example]]
 name = "theme_demo"
 path = "examples/theme_demo.rs"
+required-features = ["streaming"]
+
+# dump_theme is auto-discovered by Cargo (its parent dir has no main.rs); it
+# needs the cover/theme/image stack, so declare it explicitly to keep
+# --all-targets green in the txc-only mode this crate advertises.
+[[example]]
+name = "dump_theme"
+path = "examples/dump_theme.rs"
+required-features = ["streaming"]
 
 [[example]]
 name = "txc_demo"

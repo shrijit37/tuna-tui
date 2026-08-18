@@ -55,6 +55,13 @@ pub(crate) struct App {
     // The local library (likes / follows / saves / play history), persisted
     // to `state.json` alongside the rest of the session.
     pub(crate) store: Store,
+    // Dirty gates for the periodic save tick: the store mutated (like /
+    // follow / save / playlist add) or the transport queue was appended.
+    // Set at the mutation sites; consumed (and reset) by the 24s sync tick
+    // in `run_ui`. While playing, `transport.playback_started` keeps the
+    // save cadence on its own, so these only matter when playback is idle.
+    pub(crate) store_dirty: bool,
+    pub(crate) queue_dirty: bool,
     // What the album art box owes the next frame. See ArtRepaint.
     pub(crate) art_repaint: ArtRepaint,
 }
