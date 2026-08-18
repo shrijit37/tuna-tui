@@ -112,9 +112,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     if std::fs::rename(&tmp, path).is_ok() {
         return true;
     }
-    // Windows: rename cannot replace an existing destination.
-    if std::fs::remove_file(path).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-        return true;
+    // Windows: rename cannot replace an existing destination — remove first.
+    // Never run on Unix: a failed first rename fails identically after
+    // remove, so the destination would be deleted for nothing.
+    #[cfg(windows)]
+    {
+        if std::fs::remove_file(path).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+            return true;
+        }
     }
     let _ = std::fs::remove_file(&tmp);
     false
