@@ -55,6 +55,9 @@ fn main() -> anyhow::Result<()> {
                     println!("⏸ paused    {uri} @ {position_ms}ms")
                 }
                 EngineEvent::Stopped => println!("⏹ stopped"),
+                EngineEvent::LoadFailed { uri, message } => {
+                    println!("✗ load failed {uri}: {message}")
+                }
                 EngineEvent::Reconnecting => println!("⟳ stream lost, reconnecting"),
                 EngineEvent::Reconnected => println!("⟳ reconnected"),
                 EngineEvent::PositionCorrection { uri, position_ms } => {

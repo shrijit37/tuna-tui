@@ -1020,6 +1020,10 @@ fn resume_source(app: &mut App, radio_tx: &flume::Sender<Result<Radio, String>>)
 
     match app.transport.source.clone() {
         PlaySource::Context(ctx) => {
+            // The expansion is async now (bead Myx-a4.8): say what is
+            // happening while the worker fills the queue; failures arrive as
+            // EngineEvent::LoadFailed.
+            app.status = "loading playlist…".to_string();
             if let Err(e) = app
                 .svc
                 .engine

@@ -55,6 +55,14 @@ pub enum EngineEvent {
     Reconnecting,
     /// Playback control works again; the stream was restarted from its position.
     Reconnected,
+    /// A context load (playlist/channel/album expansion) failed on the worker.
+    /// The facade can no longer return the error — expansion is off the
+    /// caller's thread (bead Myx-a4.8) — so it arrives here instead, with the
+    /// context uri and a user-facing message.
+    LoadFailed {
+        uri: String,
+        message: String,
+    },
     PositionCorrection {
         uri: String,
         position_ms: u32,
@@ -95,11 +103,19 @@ pub struct Engine {
 }
 
 /// Commands the facade hands the worker. `Load` carries a fully-expanded
-/// queue — expansion happens in the facade so a resolve failure surfaces as
-/// the caller's `Err`.
+/// queue; `LoadContext` carries a context URI the worker expands on a helper
+/// thread so the caller never blocks on pagination (bead Myx-a4.8), with the
+/// result fenced by generation and the chain cancellable like the radio path.
+/// Expansion failures surface as [`EngineEvent::LoadFailed`].
 enum Cmd {
     Load {
         tracks: Vec<String>,
+        start_uri: Option<String>,
+        position_ms: u32,
+        shuffle: bool,
+    },
+    LoadContext {
+        context_uri: String,
         start_uri: Option<String>,
         position_ms: u32,
         shuffle: bool,
@@ -118,6 +134,68 @@ enum Cmd {
     Stop,
     /// Watchdog-initiated stream recovery (stall or decode failure).
     Recover,
+}
+
+/// The outcome of a `Cmd::LoadContext` expansion, posted back on its own
+/// channel so a long expansion cannot keep the command channel — and the
+/// worker's exit — alive. `gen` fences superseded loads: a result tagged
+/// with an older generation is dropped.
+struct LoadResult {
+    gen: u64,
+    context_uri: String,
+    tracks: Result<Vec<String>, String>,
+    start_uri: Option<String>,
+    position_ms: u32,
+    shuffle: bool,
+}
+
+/// Generation + cancellation bookkeeping for context loads (bead Myx-a4.8).
+/// Every `begin` supersedes the previous load — flipping its cancel flag so
+/// the orphaned yt-dlp chain stops spawning children (the F13 pattern) — and
+/// hands out a fresh flag. Results are fenced by generation: the last load
+/// wins even when an earlier expansion finishes late. Kept as its own type
+/// so the rules are unit-testable without an engine.
+struct LoadGate {
+    gen: u64,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl LoadGate {
+    fn new() -> Self {
+        Self {
+            gen: 0,
+            cancel: None,
+        }
+    }
+
+    /// Begin a new context load. Returns the new generation and its fresh
+    /// cancel flag (never set, unless superseded or torn down).
+    fn begin(&mut self) -> (u64, Arc<AtomicBool>) {
+        self.gen = self.gen.wrapping_add(1);
+        if let Some(prev) = self.cancel.take() {
+            prev.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(Arc::clone(&cancel));
+        (self.gen, cancel)
+    }
+
+    /// Is `gen` the current load? A current result clears the flag (the load
+    /// finished); a stale one leaves everything alone.
+    fn is_current(&mut self, gen: u64) -> bool {
+        if gen != self.gen {
+            return false;
+        }
+        self.cancel = None;
+        true
+    }
+
+    /// The engine is going away: stop any in-flight chain.
+    fn cancel_inflight(&mut self) {
+        if let Some(c) = self.cancel.take() {
+            c.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The local queue: the loaded context plus a replay history for `prev`.
@@ -224,14 +302,22 @@ impl Engine {
 
     /// Start a context (playlist / album / artist / track URI). When
     /// `shuffle` is set, the whole expanded context shuffles locally.
+    ///
+    /// Non-blocking: the expansion (which can paginate for minutes on a big
+    /// or stalled playlist) runs on a helper thread, so the caller's UI never
+    /// freezes (bead Myx-a4.8). Failures arrive as
+    /// [`EngineEvent::LoadFailed`]; the `Err` here means the engine is gone.
     pub fn play_context(&self, context_uri: impl Into<String>, shuffle: bool) -> Result<()> {
-        let uri = context_uri.into();
-        let tracks = self.inner.expander.expand(&uri).map_err(|e| anyhow!(e))?;
-        self.load(tracks, None, 0, shuffle)
+        self.send(Cmd::LoadContext {
+            context_uri: context_uri.into(),
+            start_uri: None,
+            position_ms: 0,
+            shuffle,
+        })
     }
 
     /// Load a context and start at a specific track + position (context
-    /// resume).
+    /// resume). Non-blocking, like [`Engine::play_context`].
     pub fn play_context_at(
         &self,
         context_uri: String,
@@ -239,12 +325,12 @@ impl Engine {
         position_ms: u32,
         shuffle: bool,
     ) -> Result<()> {
-        let tracks = self
-            .inner
-            .expander
-            .expand(&context_uri)
-            .map_err(|e| anyhow!(e))?;
-        self.load(tracks, track_uri, position_ms, shuffle)
+        self.send(Cmd::LoadContext {
+            context_uri,
+            start_uri: track_uri,
+            position_ms,
+            shuffle,
+        })
     }
 
     /// Play an explicit list of track URIs as a queue. `start_uri` picks the
@@ -431,6 +517,8 @@ pub fn run(
         last_progress: Instant::now(),
     }));
 
+    let (load_tx, load_rx) = flume::unbounded::<LoadResult>();
+
     let queue_snapshot = Arc::new(Mutex::new(Vec::new()));
     let worker = Worker {
         sink,
@@ -457,6 +545,9 @@ pub fn run(
         drop_streak: 0,
         last_seen_frames: 0,
         last_seen_sourced: 0,
+        load_gate: LoadGate::new(),
+        load_tx,
+        load_rx,
         last_correction: Instant::now(),
         // Cloning the once-built blocking client (Arc-fee) — constructed by
         // `httpcache::warm_blocking_client` before the runtime started.
@@ -555,6 +646,16 @@ struct Worker {
     /// much audio is buffered, and the window the watchdog exempts from its
     /// stall clock.
     prebuffer_samples: usize,
+    /// Generation + cancellation for `Cmd::LoadContext` expansions: the last
+    /// load wins (stale results fenced out) and its superseded chain is
+    /// cancelled (the F13 pattern).
+    load_gate: LoadGate,
+    /// The expand thread posts its `LoadResult` here instead of the command
+    /// channel, so a long expansion cannot keep the worker's `recv` from ever
+    /// seeing `Disconnected` (a sender clone would delay teardown for the
+    /// whole fetch).
+    load_tx: flume::Sender<LoadResult>,
+    load_rx: flume::Receiver<LoadResult>,
 }
 
 impl Worker {
@@ -575,6 +676,12 @@ impl Worker {
                         self.recover_into(uri, pos);
                     }
                 }
+            }
+            // Context-load results land on their own channel — a sender clone
+            // on the command channel would keep this `recv` from ever seeing
+            // `Disconnected` while a long expansion runs. Non-blocking drain.
+            while let Ok(r) = self.load_rx.try_recv() {
+                self.handle_load_result(r);
             }
         }
         self.teardown();
@@ -634,6 +741,62 @@ impl Worker {
         }
     }
 
+    /// The shared tail of `Cmd::Load` and a landed `LoadResult`: replace the
+    /// queue, reset the player state and start at `start_uri` (or the top).
+    fn apply_load(
+        &mut self,
+        tracks: Vec<String>,
+        start_uri: Option<String>,
+        position_ms: u32,
+        shuffle: bool,
+    ) {
+        self.shutdown_current();
+        // A fresh context supersedes any in-flight recovery.
+        self.recovery = None;
+        let start = start_uri
+            .as_deref()
+            .and_then(|u| tracks.iter().position(|t| t == u))
+            .unwrap_or(0);
+        if let Ok(mut q) = self.queue_snapshot.lock() {
+            *q = tracks.clone();
+        }
+        self.state = PlayerState {
+            // `start` is the cursor: advance picks up after the first
+            // track, and history grows from it — not from 0.
+            tracks,
+            cursor: start,
+            history: Vec::new(),
+            shuffle,
+            repeat: self.state.repeat,
+            volume: self.state.volume,
+            playing: true,
+        };
+        self.start_track_at(start, position_ms);
+    }
+
+    /// A context expansion finished (or failed) on its helper thread. Stale
+    /// generations are dropped — a newer load superseded this one — and an
+    /// expansion error surfaces as [`EngineEvent::LoadFailed`] since the
+    /// facade already returned.
+    fn handle_load_result(&mut self, r: LoadResult) {
+        if !self.load_gate.is_current(r.gen) {
+            return; // superseded — the current load's own result decides
+        }
+        match r.tracks {
+            Ok(tracks) => self.apply_load(tracks, r.start_uri, r.position_ms, r.shuffle),
+            Err(message) => {
+                liblog(format!(
+                    "engine: context load failed for {}: {message}",
+                    r.context_uri
+                ));
+                let _ = self.events.send(EngineEvent::LoadFailed {
+                    uri: r.context_uri,
+                    message,
+                });
+            }
+        }
+    }
+
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Load {
@@ -641,29 +804,33 @@ impl Worker {
                 start_uri,
                 position_ms,
                 shuffle,
+            } => self.apply_load(tracks, start_uri, position_ms, shuffle),
+            Cmd::LoadContext {
+                context_uri,
+                start_uri,
+                position_ms,
+                shuffle,
             } => {
-                self.shutdown_current();
-                // A fresh context supersedes any in-flight recovery.
-                self.recovery = None;
-                let start = start_uri
-                    .as_deref()
-                    .and_then(|u| tracks.iter().position(|t| t == u))
-                    .unwrap_or(0);
-                if let Ok(mut q) = self.queue_snapshot.lock() {
-                    *q = tracks.clone();
-                }
-                self.state = PlayerState {
-                    // `start` is the cursor: advance picks up after the first
-                    // track, and history grows from it — not from 0.
-                    tracks,
-                    cursor: start,
-                    history: Vec::new(),
-                    shuffle,
-                    repeat: self.state.repeat,
-                    volume: self.state.volume,
-                    playing: true,
-                };
-                self.start_track_at(start, position_ms);
+                // Bump the generation and cancel the previous in-flight
+                // expansion: the last load wins, and the orphaned chain stops
+                // spawning yt-dlp children (the F13 pattern, LoadGate).
+                let (gen, cancel) = self.load_gate.begin();
+                let tx = self.load_tx.clone();
+                let expander = Arc::clone(&self.expander);
+                std::thread::Builder::new()
+                    .name("context-expand".into())
+                    .spawn(move || {
+                        let tracks = expander.expand(&context_uri, cancel);
+                        let _ = tx.send(LoadResult {
+                            gen,
+                            context_uri,
+                            tracks,
+                            start_uri,
+                            position_ms,
+                            shuffle,
+                        });
+                    })
+                    .expect("spawn context expand");
             }
             Cmd::Resume => {
                 if !self.state.playing && self.current.is_none() {
@@ -982,6 +1149,14 @@ impl Worker {
                         self.pending = Some(pre);
                         return;
                     }
+                    // A context load landed during the backoff: the queue is
+                    // being replaced, so the recovery is superseded — apply
+                    // the result here (fenced by generation) and stop
+                    // instead of fighting it by rebuilding the old track.
+                    if let Ok(r) = self.load_rx.try_recv() {
+                        self.handle_load_result(r);
+                        return;
+                    }
                     backoff = next_backoff(backoff);
                 }
             }
@@ -1206,6 +1381,9 @@ impl Worker {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
         }
+        // Stop any in-flight context expansion's yt-dlp chain — its result is
+        // worthless once the engine is gone.
+        self.load_gate.cancel_inflight();
         self.paused = None;
         self.set_active(false);
         self.set_health(false);
@@ -1351,6 +1529,84 @@ mod tests {
             health.lock().unwrap().last_progress.elapsed() > Duration::from_secs(30),
             "the clock must stay stale"
         );
+    }
+
+    /// The context-load gate: every new load supersedes the previous one —
+    /// flipping its cancel flag so the orphaned yt-dlp chain stops spawning —
+    /// and stale generations are fenced out of the queue (bead Myx-a4.8).
+    #[test]
+    fn a_new_context_load_supersedes_and_cancels_the_previous() {
+        let mut gate = LoadGate::new();
+        let (g1, c1) = gate.begin();
+        let (g2, c2) = gate.begin();
+        assert_ne!(g1, g2, "each load gets a fresh generation");
+        assert!(
+            c1.load(Ordering::Relaxed),
+            "the superseded chain's cancel must flip"
+        );
+        assert!(
+            !c2.load(Ordering::Relaxed),
+            "the current chain is untouched"
+        );
+        assert!(gate.is_current(g2), "the newest generation is current");
+        assert!(
+            !gate.is_current(g1),
+            "a late result for the old generation is fenced out"
+        );
+    }
+
+    /// Finishing the current load clears its flag; teardown cancels whatever
+    /// is still in flight.
+    #[test]
+    fn finishing_a_load_clears_it_and_teardown_cancels_the_rest() {
+        let mut gate = LoadGate::new();
+        let (g1, _) = gate.begin();
+        assert!(gate.is_current(g1), "the fresh load is current");
+        let (g2, c2) = gate.begin();
+        gate.cancel_inflight();
+        assert!(
+            c2.load(Ordering::Relaxed),
+            "teardown stops the in-flight chain"
+        );
+        assert!(
+            !gate.is_current(g1),
+            "a stale gen stays fenced after teardown"
+        );
+        assert!(gate.is_current(g2), "the last gen is still current");
+    }
+
+    /// The facade must not expand synchronously: `play_context` queues the
+    /// command and returns, so a big or stalled playlist cannot freeze the
+    /// caller's UI thread (bead Myx-a4.8 — the old facade expanded in-place,
+    /// and this call would do a live network fetch).
+    #[test]
+    fn play_context_queues_the_load_without_expanding() {
+        let (tx, rx) = flume::unbounded::<Cmd>();
+        let engine = Engine {
+            bands: VisBands::shared(),
+            inner: Arc::new(Inner {
+                cmds: tx,
+                expander: Arc::new(YtExpander),
+                queue: Arc::new(Mutex::new(Vec::new())),
+            }),
+        };
+        let t0 = Instant::now();
+        engine.play_context("yt:playlist:PLabc", false).unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "play_context must not block on expansion"
+        );
+        match rx.try_recv() {
+            Ok(Cmd::LoadContext {
+                context_uri,
+                shuffle,
+                ..
+            }) => {
+                assert_eq!(context_uri, "yt:playlist:PLabc");
+                assert!(!shuffle);
+            }
+            _ => panic!("expected Cmd::LoadContext on the command channel"),
+        }
     }
 
     #[test]

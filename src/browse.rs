@@ -186,7 +186,7 @@ pub(crate) fn fetch_detail_blocking(
             // YouTube has no first-class albums; the saved slug searches.
             append_or_hint(
                 &mut items,
-                yt::resolve_kind(kind, id, config::get().search_limit)
+                yt::resolve_kind(kind, id, config::get().search_limit, None)
                     .into_iter()
                     .map(|v| LibItem::track(v.title, v.artist, v.uri)),
                 "nothing loaded — search failed",

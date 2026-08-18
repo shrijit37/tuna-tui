@@ -50,6 +50,12 @@ pub(crate) fn handle_engine_event(app: &mut App, ev: EngineEvent) {
             let is_playing = app.playback.now.as_ref().map(|n| n.is_playing);
             apply_position(app, position_ms, is_playing);
         }
+        EngineEvent::LoadFailed { message, .. } => {
+            // A context expansion failed on the worker (bead Myx-a4.8): the
+            // facade already returned, so the error arrives here.
+            app.status = format!("couldn't play: {message}");
+            app.transport.playback_started = false;
+        }
         EngineEvent::Reconnecting => {
             app.status = "connection dropped — reconnecting…".to_string();
         }
