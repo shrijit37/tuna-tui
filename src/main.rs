@@ -537,6 +537,13 @@ async fn run_ui(
     // lengths are already in steady state.
     let mut last_queue_len = usize::MAX;
     let mut last_meta_len = usize::MAX;
+    // Last-saved transport fields for the F21 save gate: a stopped-session
+    // mixer tweak (volume/shuffle/repeat — mutated in the protected input
+    // files) must still persist within the 24s cadence, so the tick compares
+    // the live fields against what the previous save wrote.
+    let mut last_saved_volume = app.transport.volume;
+    let mut last_saved_shuffle = app.transport.shuffle;
+    let mut last_saved_repeat = app.transport.repeat;
     // Nothing is on screen yet, so the first tick must draw.
     let mut dirty = true;
     let mut last_layout = (app.view.mode, app.view.zen);
@@ -684,10 +691,22 @@ async fn run_ui(
                     // mutations flag `store_dirty`; queue appends flag
                     // `queue_dirty`. When both are clean and playback is
                     // idle, skip the full-store clone + serialize + write.
-                    let transport_dirty = app.transport.playback_started || app.queue_dirty;
+                    // Per the F21 binding spec, transport-dirty is
+                    // `playback_started || transport_changed_since_save`. The
+                    // volume/shuffle/repeat mutators live in protected input
+                    // files, so the change is computed here — comparing the
+                    // live fields against the last-saved copy (O(1)).
+                    let transport_changed = app.transport.volume != last_saved_volume
+                        || app.transport.shuffle != last_saved_shuffle
+                        || app.transport.repeat != last_saved_repeat;
+                    let transport_dirty =
+                        app.transport.playback_started || app.queue_dirty || transport_changed;
                     if app.store_dirty || transport_dirty {
                         app.store_dirty = false;
                         app.queue_dirty = false;
+                        last_saved_volume = app.transport.volume;
+                        last_saved_shuffle = app.transport.shuffle;
+                        last_saved_repeat = app.transport.repeat;
                         let snapshot = save_state(&app);
                         tokio::task::spawn_blocking(move || snapshot.save());
                     }
