@@ -664,13 +664,20 @@ async fn run_ui(
                     // re-clone and re-format the same rows every 24s. `refresh_needed`
                     // fires on every metadata landing (label upgrade) and on
                     // recovery-removal (the engine snapshot shrinks).
-                    if app.transport.playback_started
-                        && refresh_needed(qlen, mlen, last_queue_len, last_meta_len)
-                    {
-                        app.refresh_local_queue();
+                    if app.transport.playback_started {
+                        if refresh_needed(qlen, mlen, last_queue_len, last_meta_len) {
+                            app.refresh_local_queue();
+                        }
+                        last_queue_len = qlen;
+                        last_meta_len = mlen;
+                    } else {
+                        // While stopped the sentinel must survive untouched so
+                        // the first playing tick always refreshes (resume-
+                        // restore path); tracking lengths here would consume
+                        // it without ever refreshing.
+                        last_queue_len = usize::MAX;
+                        last_meta_len = usize::MAX;
                     }
-                    last_queue_len = qlen;
-                    last_meta_len = mlen;
                     // Dirty gate for the save: at idle the snapshot only
                     // changes while playing (position ticks) — and a playing
                     // transport keeps the save cadence on its own. Store
