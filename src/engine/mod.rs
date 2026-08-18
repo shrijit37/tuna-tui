@@ -1103,6 +1103,13 @@ impl Worker {
         // — restart_stream anchors at the same truncation.
         if let Some(p) = self.paused.as_mut() {
             p.position_ms = truncate_seconds(pos);
+            // Keep the app (and media controls via apply_position) in sync
+            // with the engine-truncated target — same contract as the
+            // current-based seek path below.
+            let _ = self.events.send(EngineEvent::PositionCorrection {
+                uri: p.uri.clone(),
+                position_ms: p.position_ms,
+            });
             return;
         }
         let Some(mut cur) = self.current.take() else {
