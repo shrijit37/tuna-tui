@@ -327,6 +327,12 @@ const STALL_AFTER: Duration = Duration::from_secs(15);
 /// connections die a few hundred ms in and ffmpeg exits 0, indistinguishable
 /// from a natural end by exit code alone. 5 s is well under any real song.
 const MIN_EOF_POSITION_MS: u32 = 5_000;
+/// A clean EOF whose delivered playhead ends more than this far short of the
+/// known `duration_ms` is a stream that died near the end (googlevideo closes
+/// mid-stream on this box), not a finished track — rebuild it from `pos`.
+/// Above the 3 s `short_track` allowance (decode jitter, resume anchors),
+/// well under the ~30 s symptom that motivated it.
+const EOF_SHORTFALL_MS: u32 = 10_000;
 /// How many consecutive short-EOF drops on the same track before it is given
 /// up on (skipped or, at the queue tail with repeat off, stopped cleanly)
 /// instead of rebuilding forever.
@@ -838,9 +844,17 @@ impl Worker {
                 return;
             }
             if dropped {
-                liblog(format!(
-                    "engine: stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms); rebuilding"
-                ));
+                // Distinguish the two drop kinds in the log: a late transport
+                // death (EOF far short of the known duration) versus a stream
+                // that died inside the start-up window.
+                match cur.duration_ms.map(|d| d.saturating_sub(pos)) {
+                    Some(short) if short > EOF_SHORTFALL_MS => liblog(format!(
+                        "engine: stream ended {short}ms short of duration for {uri}; rebuilding"
+                    )),
+                    _ => liblog(format!(
+                        "engine: stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms); rebuilding"
+                    )),
+                }
             } else {
                 liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
             }
@@ -1242,10 +1256,13 @@ fn shuffle_pick(cursor: usize, n: usize, rng: &mut impl rand::Rng) -> usize {
 /// mislabel every natural end as a failed stream. `dropped` is a clean end
 /// with fewer than [`MIN_EOF_POSITION_MS`] of delivered playhead, unless the
 /// track itself is genuinely that short (`duration_ms` says its real end was
-/// reached). Known gap, pre-existing: when the resolver's `duration_ms` is
-/// unknown (None), a genuinely short clean track reads as a drop and gets
-/// rebuilt once — the `short_track` exemption needs the known length. Pure
-/// for testing.
+/// reached) — or a clean end whose playhead ends more than
+/// [`EOF_SHORTFALL_MS`] short of the known duration: a transport that died
+/// near the end (googlevideo closes mid-stream on this box) reads as a
+/// finished track otherwise, and the song "ends" early. Known gap,
+/// pre-existing: when the resolver's `duration_ms` is unknown (None), a
+/// genuinely short clean track reads as a drop and gets rebuilt once — the
+/// `short_track` exemption needs the known length. Pure for testing.
 fn classify_end(
     exited: Option<std::process::ExitStatus>,
     pos: u32,
@@ -1253,7 +1270,9 @@ fn classify_end(
 ) -> (bool, bool) {
     let failed = exited.is_some_and(|s| s.code() != Some(0));
     let short_track = duration_ms.is_some_and(|d| pos.saturating_add(3_000) >= d);
-    let dropped = !failed && pos < MIN_EOF_POSITION_MS && !short_track;
+    let truncated =
+        !failed && duration_ms.is_some_and(|d| pos.saturating_add(EOF_SHORTFALL_MS) < d);
+    let dropped = (!failed && pos < MIN_EOF_POSITION_MS && !short_track) || truncated;
     (failed, dropped)
 }
 
@@ -1372,6 +1391,26 @@ mod tests {
         assert_eq!(classify_end(Some(ok), 0, Some(2_000)), (false, false));
         // No status, only 500 ms delivered: dropped.
         assert_eq!(classify_end(None, 500, None), (false, true));
+        // A clean EOF 30 s short of a 200 s track: the transport died near
+        // the end — dropped, rebuilt from pos (the early-end bug).
+        assert_eq!(
+            classify_end(Some(ok), 170_000, Some(200_000)),
+            (false, true)
+        );
+        // A clean EOF 5 s short: within the 10 s shortfall allowance — a
+        // natural end (decode jitter, resume anchors).
+        assert_eq!(
+            classify_end(Some(ok), 195_000, Some(200_000)),
+            (false, false)
+        );
+        // Unknown duration: the shortfall clause can't apply — behavior
+        // unchanged for resolver gaps.
+        assert_eq!(classify_end(Some(ok), 170_000, None), (false, false));
+        // Failed AND truncated: failed wins the classification.
+        assert_eq!(
+            classify_end(Some(err), 170_000, Some(200_000)),
+            (true, false)
+        );
     }
 
     /// F11: the rejection loop must stay in `0..n` and never return the
