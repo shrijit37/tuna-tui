@@ -1408,13 +1408,20 @@ impl Worker {
             .send(EngineEvent::TrackChanged { uri: uri.clone() });
 
         if let Err(e) = self.build_stream(&uri, pos, true) {
-            liblog(format!("engine: start {uri} failed: {e}"));
-            // A fresh start that never produced audio is deterministic at
-            // this moment — retrying inside the 5-120s recovery backoff
-            // would leave dead air for a minute per unplayable track
-            // (deleted videos in playlists). Skip to the successor
-            // immediately (Myx-a4e.10).
-            self.give_up_on(uri, "fresh build failed — skipping");
+            liblog(format!("engine: start {uri} failed (retrying once): {e}"));
+            // One immediate retry, then skip. The first failure here is
+            // NOT deterministic: build_stream's error envelope includes
+            // yt-dlp resolve over the live network — a dead socket, a
+            // bot-gate that clears in seconds (issue #19). Deleting the
+            // track from the queue on that first error permanently loses
+            // a playable track; the retry absorbs transients without
+            // reintroducing the 5-120s backoff Myx-a4e.10 removed. Two
+            // consecutive failures are permanent with high probability —
+            // then skip to the successor immediately.
+            if let Err(e) = self.build_stream(&uri, pos, true) {
+                liblog(format!("engine: start {uri} failed twice: {e}"));
+                self.give_up_on(uri, "fresh build failed twice — skipping");
+            }
         }
     }
 
