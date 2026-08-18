@@ -199,6 +199,7 @@ impl LoadGate {
     }
 }
 
+
 /// A queued metadata delivery: the resolved track whose cover/theme derive
 /// still needs shipping to the app.
 struct MetaJob {
@@ -285,6 +286,27 @@ impl MetaWorker {
         // Coalesced: one wake per drain cycle is enough.
         let _ = self.wake_tx.try_send(());
     }
+
+/// What a landed context-load result did to the player.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoadDisposition {
+    /// The queue was replaced — an in-flight recovery of the old track is
+    /// moot.
+    Applied,
+    /// The result belonged to a superseded generation; a newer load's own
+    /// result will (or already did) replace the queue.
+    Fenced,
+    /// The load failed: the queue still belongs to the old track.
+    Failed,
+}
+
+/// Does a landed load result end the in-flight recovery of the old track?
+/// `Applied` replaces the queue outright; `Fenced` means the newer load's
+/// result is ahead and will replace it. `Failed` does not — no replacement
+/// happened, so the recovery must keep going or the player is left silent
+/// forever (`current` gone, `recovery` armed, watchdog off).
+fn supersedes_recovery(d: LoadDisposition) -> bool {
+    matches!(d, LoadDisposition::Applied | LoadDisposition::Fenced)
 }
 
 /// The local queue: the loaded context plus a replay history for `prev`.
@@ -869,13 +891,17 @@ impl Worker {
     /// A context expansion finished (or failed) on its helper thread. Stale
     /// generations are dropped — a newer load superseded this one — and an
     /// expansion error surfaces as [`EngineEvent::LoadFailed`] since the
-    /// facade already returned.
-    fn handle_load_result(&mut self, r: LoadResult) {
+    /// facade already returned. Returns what the result did to the player so
+    /// the recovery loop can decide whether its track is still the truth.
+    fn handle_load_result(&mut self, r: LoadResult) -> LoadDisposition {
         if !self.load_gate.is_current(r.gen) {
-            return; // superseded — the current load's own result decides
+            return LoadDisposition::Fenced; // superseded — the current load's own result decides
         }
         match r.tracks {
-            Ok(tracks) => self.apply_load(tracks, r.start_uri, r.position_ms, r.shuffle),
+            Ok(tracks) => {
+                self.apply_load(tracks, r.start_uri, r.position_ms, r.shuffle);
+                LoadDisposition::Applied
+            }
             Err(message) => {
                 liblog(format!(
                     "engine: context load failed for {}: {message}",
@@ -885,6 +911,7 @@ impl Worker {
                     uri: r.context_uri,
                     message,
                 });
+                LoadDisposition::Failed
             }
         }
     }
@@ -1241,13 +1268,19 @@ impl Worker {
                         self.pending = Some(pre);
                         return;
                     }
-                    // A context load landed during the backoff: the queue is
-                    // being replaced, so the recovery is superseded — apply
-                    // the result here (fenced by generation) and stop
-                    // instead of fighting it by rebuilding the old track.
+                    // A context load landed during the backoff. Only a
+                    // result that replaces the queue ends the recovery —
+                    // `Applied` (this load owns the stage) or `Fenced` (a
+                    // newer load's result behind it will). A `Failed` load
+                    // must NOT: the queue still belongs to the old track,
+                    // and abandoning the recovery there leaves `current`
+                    // gone, `recovery` armed, `playing` true and the
+                    // watchdog off — a silent dead player that only a stop,
+                    // next or fresh load can revive.
                     if let Ok(r) = self.load_rx.try_recv() {
-                        self.handle_load_result(r);
-                        return;
+                        if supersedes_recovery(self.handle_load_result(r)) {
+                            return;
+                        }
                     }
                     backoff = next_backoff(backoff);
                 }
@@ -1693,6 +1726,22 @@ mod tests {
             "a stale gen stays fenced after teardown"
         );
         assert!(gate.is_current(g2), "the last gen is still current");
+    }
+
+    /// A FAILED context load must not supersede an in-flight recovery: the
+    /// queue still belongs to the old track, and abandoning the rebuild
+    /// there leaves the player silent forever (current gone, recovery armed,
+    /// watchdog off). Only a load that actually replaces the queue — or
+    /// belongs to a superseded generation whose newer result will — ends
+    /// the recovery.
+    #[test]
+    fn a_failed_load_does_not_supersede_an_in_flight_recovery() {
+        assert!(supersedes_recovery(LoadDisposition::Applied));
+        assert!(supersedes_recovery(LoadDisposition::Fenced));
+        assert!(
+            !supersedes_recovery(LoadDisposition::Failed),
+            "a failed load leaves the queue untouched — the old track's              recovery must continue, not be abandoned"
+        );
     }
 
     /// The facade must not expand synchronously: `play_context` queues the

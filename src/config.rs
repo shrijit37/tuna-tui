@@ -1,12 +1,15 @@
-//! User settings from `~/.config/tuna-tui/config.toml`. Missing, empty or malformed
-//! all fall back to defaults — a typo must never lock someone out of the app.
+//! User settings from `~/.config/tuna-tui/config.toml`. Missing, empty or
+//! malformed all fall back to defaults — a typo must never lock someone out of
+//! the app, and a wrong-typed *value* must never take out the keys beside it
+//! (see [`Config::parse`]).
+//!
+//! Only unparseable TOML *syntax* still falls back wholesale — a broken
+//! document has nothing to salvage. A value that fails its key's type check
+//! defaults that key alone.
 
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-#[derive(Deserialize)]
-#[serde(default)]
 pub struct Config {
     /// Rows kept visible above and below the list cursor, like vim's `scrolloff`.
     pub scrolloff: usize,
@@ -160,8 +163,42 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Parse the document as a generic map and extract each key with a type
+    /// check of its own. Under the old one-shot serde read, a single bad
+    /// value (e.g. `buffer_duration_secs = 300` or `= 2.5` on a u8 field)
+    /// failed the WHOLE document and the caller's `unwrap_or_default`
+    /// silently discarded every other key — cookies unlock, yt-dlp/ffmpeg
+    /// paths, audio format — all gone with no message, which is exactly the
+    /// "a typo must never lock someone out" failure the module preamble
+    /// promises against. Now a wrong-typed value costs only its own key;
+    /// unparseable TOML syntax still falls back wholesale (there is nothing
+    /// to salvage from a broken document), and unknown keys stay ignored so
+    /// an older binary never chokes on a newer config.
     fn parse(s: &str) -> Option<Self> {
-        toml::from_str(s).ok()
+        let table: toml::Table = s.parse().ok()?;
+        let d = Self::default();
+        let int = |k: &str| table.get(k).and_then(toml::Value::as_integer);
+        let text = |k: &str| table.get(k).and_then(toml::Value::as_str).map(str::to_owned);
+        Some(Config {
+            scrolloff: int("scrolloff")
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(d.scrolloff),
+            restore_on_startup: table
+                .get("restore_on_startup")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(d.restore_on_startup),
+            protocol: text("protocol").or(d.protocol),
+            ytdlp_path: text("ytdlp_path").unwrap_or(d.ytdlp_path),
+            ffmpeg_path: text("ffmpeg_path").unwrap_or(d.ffmpeg_path),
+            audio_format: text("audio_format").unwrap_or(d.audio_format),
+            search_limit: int("search_limit")
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(d.search_limit),
+            cookies_file: text("cookies_file").or(d.cookies_file),
+            buffer_duration_secs: int("buffer_duration_secs")
+                .and_then(|v| u8::try_from(v).ok())
+                .unwrap_or(d.buffer_duration_secs),
+        })
     }
 }
 
@@ -238,8 +275,49 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_falls_back_rather_than_failing() {
-        assert!(Config::parse("scrolloff = \"three\"").is_none());
+    fn malformed_toml_syntax_falls_back_rather_than_failing() {
+        // Only unparseable syntax is unsalvageable — a wrong-typed *value*
+        // now defaults its own key alone (see the lenient tests below).
+        assert!(Config::parse("scrolloff = = =").is_none());
+        assert!(Config::parse("this is not toml ] ] ]").is_none());
+    }
+
+    #[test]
+    fn a_wrong_typed_value_defaults_only_its_own_key() {
+        // `buffer_duration_secs = 300` doesn't fit u8 and `= 2.5` is a float:
+        // both are plausible user typos in exactly the file the template
+        // points them at. Each must cost only that key — never the cookies
+        // unlock or the binary paths beside it (the old one-shot serde read
+        // silently discarded the whole config on the first bad value).
+        let c = Config::parse(
+            "buffer_duration_secs = 300\n\
+             cookies_file = \"/tmp/c.txt\"\n\
+             ffmpeg_path = \"/opt/ffmpeg\"",
+        )
+        .expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 2, "out-of-range u8 falls back");
+        assert_eq!(c.cookies_file.as_deref(), Some("/tmp/c.txt"), "cookies survive");
+        assert_eq!(c.ffmpeg_path, "/opt/ffmpeg", "ffmpeg path survives");
+
+        let c = Config::parse("buffer_duration_secs = 2.5").expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 2, "float for u8 falls back");
+        let c = Config::parse("buffer_duration_secs = \"5\"").expect("valid toml");
+        assert_eq!(c.buffer_duration_secs, 2, "string for u8 falls back");
+    }
+
+    #[test]
+    fn wrong_typed_legacy_keys_default_their_own_key() {
+        // Same leniency for the pre-buffer keys: one bad line among good ones
+        // must not take the good ones down with it.
+        let c = Config::parse(
+            "scrolloff = -4\nsearch_limit = \"many\"\n\
+             restore_on_startup = \"yes\"\ncookies_file = \"/tmp/c.txt\"",
+        )
+        .expect("valid toml");
+        assert_eq!(c.scrolloff, 3, "negative int falls back");
+        assert_eq!(c.search_limit, 6, "string for usize falls back");
+        assert!(c.restore_on_startup, "string for bool falls back");
+        assert_eq!(c.cookies_file.as_deref(), Some("/tmp/c.txt"), "good key survives");
     }
 
     #[test]
