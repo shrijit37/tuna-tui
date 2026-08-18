@@ -1675,6 +1675,17 @@ fn truncate_seconds(pos: u32) -> u32 {
 
 /// Build in-band metadata for a yt: track, fetching its cover + theme the
 /// same way the api layer did (httpcache-keyed, 24 h TTL).
+/// Cover consumers re-sample at terminal scale (ratatui-image) and the
+/// theme palette is dominated by large regions — neither needs the source
+/// JPEG's resolution (usually 1280px). Downscale once, at the source: the
+/// shipped/cached EngineMeta carries ~1/16 of the pixels, and
+/// derive_theme runs on the small image (Myx-o0g). Shrinking the derive
+/// cost also shortens the meta thread's per-job latency — the drain
+/// window behind the cascade bead. Pinned by `covers_are_capped_before_shipping`.
+fn downscale_cover(img: image::DynamicImage) -> image::DynamicImage {
+    img.thumbnail(320, 320)
+}
+
 fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client) -> EngineMeta {
     // Spotify canonical metadata enriches the YouTube-derived row: the
     // query is the raw resolved title ("Artist — Title" flat rows parse
@@ -1724,6 +1735,7 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
     if let Some(url) = cover_url {
         if let Some(bytes) = fetch_cover(client, url) {
             if let Ok(img) = image::load_from_memory(&bytes) {
+                let img = downscale_cover(img);
                 theme = Some(crate::reactive::derive_theme(&img, "album ✦"));
                 image = Some(img);
             }
@@ -1973,6 +1985,22 @@ mod tests {
             seen.push(job.uri);
         }
         assert_eq!(seen, vec!["u0"], "one job per uri, not a stack");
+    }
+
+    /// Cover sources (the yt-dlp thumbnails) are typically 1280px; the
+    /// shipped/cached image and the theme derive both cap well below that.
+    /// The downscale must live at the source — a removal of the cap is a
+    /// memory regression in the channel AND the meta cache.
+    #[test]
+    fn covers_are_capped_before_shipping() {
+        let big = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1280,
+            720,
+            image::Rgba([255u8; 4]),
+        ));
+        let capped = downscale_cover(big);
+        let (w, h) = (capped.width(), capped.height());
+        assert!(w <= 320 && h <= 320, "cover fits the 320px bound: {w}x{h}");
     }
 
     /// Delivery-side dedup skips only a CONSECUTIVE same-uri delivery: a
