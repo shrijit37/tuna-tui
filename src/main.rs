@@ -131,8 +131,7 @@ fn run_player(
     // before ours starts (see `httpcache::blocking_client`).
     tuna_tui::httpcache::warm_blocking_client();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("start tokio runtime")?;
