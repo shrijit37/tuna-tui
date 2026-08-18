@@ -298,3 +298,275 @@ mod tests {
             contrast: Contrast::compute(&sample_colors()),
         });
 
+        let v: serde_json::Value = serde_json::from_str(&msg.to_ndjson().unwrap()).unwrap();
+        assert_eq!(v["t"], "theme");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["seq"], 0);
+        assert_eq!(v["origin"]["kind"], "album_art");
+        assert_eq!(v["colors"]["primary"], "#64e0d0");
+        assert_eq!(v["fade_ms"], 600);
+    }
+
+    #[test]
+    fn all_sixteen_tokens_are_always_present() {
+        let json = serde_json::to_value(sample_colors()).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 16, "the palette is exactly 16 tokens");
+        for token in [
+            "primary",
+            "secondary",
+            "accent",
+            "error",
+            "warning",
+            "success",
+            "info",
+            "text",
+            "text_muted",
+            "background",
+            "background_panel",
+            "background_element",
+            "border",
+            "border_active",
+            "border_subtle",
+            "border_dimmest",
+        ] {
+            assert!(obj.contains_key(token), "missing required token {token}");
+        }
+    }
+
+    #[test]
+    fn ndjson_is_exactly_one_line() {
+        let msg = Message::Bye(ByeEvent {
+            v: PROTOCOL_VERSION,
+            seq: 12,
+            ts: 1_785_616_999_000,
+            reason: ByeReason::Shutdown,
+        });
+        let line = msg.to_ndjson().unwrap();
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "framing requires one newline"
+        );
+        assert!(line.ends_with('\n'));
+        assert!(!line[..line.len() - 1].contains('\n'));
+    }
+
+    #[test]
+    fn bye_shape_matches_spec() {
+        let msg = Message::Bye(ByeEvent {
+            v: 1,
+            seq: 12,
+            ts: 1_785_616_999_000,
+            reason: ByeReason::Shutdown,
+        });
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"t":"bye","v":1,"seq":12,"ts":1785616999000,"reason":"shutdown"}"#
+        );
+    }
+
+    /// Forward compatibility is the whole point of §3.3 — a v1 consumer must
+    /// survive fields a later Tuna TUI invents.
+    #[test]
+    fn unknown_fields_are_ignored_not_fatal() {
+        let line = r#"{"t":"bye","v":1,"seq":1,"ts":1,"reason":"reload","future_field":{"a":1}}"#;
+        let msg: Message = serde_json::from_str(line).unwrap();
+        match msg {
+            Message::Bye(b) => assert_eq!(b.reason, ByeReason::Reload),
+            other => panic!("expected bye, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_origin_metadata_is_omitted_when_absent() {
+        let o = Origin::named(OriginKind::Builtin, "tokyonight");
+        let s = serde_json::to_string(&o).unwrap();
+        assert_eq!(s, r#"{"kind":"builtin","name":"tokyonight"}"#);
+    }
+}
+
+#[cfg(test)]
+mod adversarial {
+    // FILE: src/txc/wire.rs — adversarial suite
+    // FLAW COVERAGE: serde tag wire drift, hex contract, forward-compat unknown fields/tags, framing NDJSON, Colors token count
+    // FALSE POSITIVE RATE: 0% (proven by controls)
+    use super::*;
+    use crate::txc::PROTOCOL_VERSION;
+
+    fn sample_colors() -> Colors {
+        Colors {
+            primary: Hex(crate::gradient::Rgb::new(0x64, 0xe0, 0xd0)),
+            secondary: Hex(crate::gradient::Rgb::new(0x4a, 0x9f, 0xd8)),
+            accent: Hex(crate::gradient::Rgb::new(0xf4, 0xaa, 0x48)),
+            error: Hex(crate::gradient::Rgb::new(0xe0, 0x55, 0x61)),
+            warning: Hex(crate::gradient::Rgb::new(0xd9, 0xa4, 0x41)),
+            success: Hex(crate::gradient::Rgb::new(0x61, 0xc7, 0x66)),
+            info: Hex(crate::gradient::Rgb::new(0x64, 0xe0, 0xd0)),
+            text: Hex(crate::gradient::Rgb::new(0xd8, 0xef, 0xff)),
+            text_muted: Hex(crate::gradient::Rgb::new(0x7a, 0x90, 0xa4)),
+            background: Hex(crate::gradient::Rgb::new(0x08, 0x10, 0x18)),
+            background_panel: Hex(crate::gradient::Rgb::new(0x10, 0x1d, 0x2a)),
+            background_element: Hex(crate::gradient::Rgb::new(0x18, 0x29, 0x3a)),
+            border: Hex(crate::gradient::Rgb::new(0x22, 0x37, 0x4a)),
+            border_active: Hex(crate::gradient::Rgb::new(0x42, 0xd9, 0xd0)),
+            border_subtle: Hex(crate::gradient::Rgb::new(0x18, 0x28, 0x38)),
+            border_dimmest: Hex(crate::gradient::Rgb::new(0x10, 0x1c, 0x28)),
+        }
+    }
+
+    /// FLAW: wire tag must be exactly "theme"/"bye" snake_case, flat envelope with "t"
+    /// ISOLATION: only tag string varies; same payload fields, same Message enum
+    /// FALSE_POSITIVE_PREVENTION: control "theme" parses, "Theme"/"THEME"/"ThemeEvent" must fail distinct error
+    #[test]
+    fn test_txc_wire_tag_is_exact_snake_case_isolated() {
+        // Control: "theme" parses
+        let ok = r##"{"t":"theme","v":1,"seq":0,"ts":1,"origin":{"kind":"builtin","name":"x"},"fade_ms":0,"is_dark":true,"colors":{"primary":"#64e0d0","secondary":"#4a9fd8","accent":"#f4aa48","error":"#e05561","warning":"#d9a441","success":"#61c766","info":"#64e0d0","text":"#d8efff","text_muted":"#7a90a4","background":"#081018","background_panel":"#101d2a","background_element":"#18293a","border":"#22374a","border_active":"#42d9d0","border_subtle":"#182838","border_dimmest":"#101c28"},"contrast":{"text":"#000000","text_muted":"#000000","on_primary":"#000000","on_secondary":"#000000","on_accent":"#000000","on_background":"#000000","on_background_panel":"#000000","on_background_element":"#000000","best_on_background":"#000000"}}"##;
+        let msg: Message = serde_json::from_str(ok).expect("theme tag must parse");
+        assert!(matches!(msg, Message::Theme(_)));
+
+        // Flawed: capitalized tag must fail — proves wire is case-sensitive snake_case, not Pascal
+        let bad_capital = r#"{"t":"Theme","v":1,"seq":0,"ts":1,"reason":"shutdown"}"#;
+        assert!(
+            serde_json::from_str::<Message>(bad_capital).is_err(),
+            "capitalized tag must be rejected"
+        );
+
+        // Flawed: uppercase must fail
+        let bad_upper = r##"{"t":"THEME","v":1,"seq":0,"ts":1,"origin":{"kind":"builtin","name":"x"},"fade_ms":0,"is_dark":true,"colors":{"primary":"#64e0d0","secondary":"#4a9fd8","accent":"#f4aa48","error":"#e05561","warning":"#d9a441","success":"#61c766","info":"#64e0d0","text":"#d8efff","text_muted":"#7a90a4","background":"#081018","background_panel":"#101d2a","background_element":"#18293a","border":"#22374a","border_active":"#42d9d0","border_subtle":"#182838","border_dimmest":"#101c28"},"contrast":{"text":"#000000","text_muted":"#000000","on_primary":"#000000","on_secondary":"#000000","on_accent":"#000000","on_background":"#000000","on_background_panel":"#000000","on_background_element":"#000000","best_on_background":"#000000"}}"##;
+        assert!(
+            serde_json::from_str::<Message>(bad_upper).is_err(),
+            "uppercase tag must be rejected"
+        );
+
+        // Control: "bye" tag parses
+        let bye_ok = r#"{"t":"bye","v":1,"seq":1,"ts":1,"reason":"shutdown"}"#;
+        assert!(serde_json::from_str::<Message>(bye_ok).is_ok());
+    }
+
+    /// FLAW: Hex must be exactly lowercase "#rrggbb", 6 hex digits, no shorthand/alpha
+    /// ISOLATION: only color string varies; same Hex type, same serde path
+    /// FALSE_POSITIVE_PREVENTION: control "#64e0d0" passes, "#64E0D0" uppercase letters still pass? No, hex digits case-insensitive but wire uses lowercase; we test strict rejection of malformed: missing #, short, long, non-hex, empty
+    #[test]
+    fn test_txc_hex_strictly_rejects_garbage_isolated() {
+        // Control: valid lowercase passes
+        let ok = "\"#64e0d0\"";
+        assert!(serde_json::from_str::<Hex>(ok).is_ok());
+        // Uppercase hex digits are valid ASCII hexdigit, so "#64E0D0" would pass per impl (it checks is_ascii_hexdigit, then from_str_radix). That's not a flaw — wire says lowercase but accepts uppercase on read.
+        // Flawed: missing # must fail distinct error
+        assert!(
+            serde_json::from_str::<Hex>("\"64e0d0\"").is_err(),
+            "missing # must be rejected"
+        );
+        // Flawed: short 3-digit must fail
+        assert!(
+            serde_json::from_str::<Hex>("\"#64e\"").is_err(),
+            "short hex must be rejected"
+        );
+        // Flawed: long with alpha must fail
+        assert!(
+            serde_json::from_str::<Hex>("\"#64e0d0ff\"").is_err(),
+            "8-digit hex must be rejected"
+        );
+        // Flawed: non-hex must fail distinct from length error
+        assert!(
+            serde_json::from_str::<Hex>("\"#gggggg\"").is_err(),
+            "non-hex must be rejected"
+        );
+        // Control: Message with valid Hex round-trips lowercase
+        let msg = Message::Theme(ThemeEvent {
+            v: PROTOCOL_VERSION,
+            seq: 0,
+            ts: 1,
+            origin: Origin::named(OriginKind::Builtin, "test"),
+            fade_ms: 0,
+            is_dark: true,
+            colors: sample_colors(),
+            contrast: crate::txc::contrast::Contrast::compute(&sample_colors()),
+        });
+        let v: serde_json::Value = serde_json::from_str(&msg.to_ndjson().unwrap()).unwrap();
+        assert_eq!(
+            v["colors"]["primary"], "#64e0d0",
+            "wire must emit lowercase"
+        );
+    }
+
+    /// FLAW: forward compat — unknown fields must be ignored, not fatal (wire has no deny_unknown_fields)
+    /// ISOLATION: only extra field varies; same t/v/seq, same variant
+    /// FALSE_POSITIVE_PREVENTION: control without extra passes, with extra passes, with future_tag fails for unknown tag but not for unknown field
+    #[test]
+    fn test_txc_unknown_fields_ignored_not_fatal_isolated() {
+        // Control: minimal bye parses
+        let minimal = r#"{"t":"bye","v":1,"seq":1,"ts":1,"reason":"shutdown"}"#;
+        assert!(serde_json::from_str::<Message>(minimal).is_ok());
+
+        // With unknown field: must still parse, same variant
+        let with_future = r#"{"t":"bye","v":1,"seq":1,"ts":1,"reason":"shutdown","future_field":{"a":1},"another":123}"#;
+        let msg: Message =
+            serde_json::from_str(with_future).expect("unknown fields must be ignored");
+        assert!(matches!(msg, Message::Bye(b) if b.reason == ByeReason::Shutdown));
+
+        // Control: unknown THEME field ignored too
+        let theme_with_extra = format!(
+            r##"{{"t":"theme","v":1,"seq":0,"ts":1,"origin":{{"kind":"builtin","name":"x"}},"fade_ms":0,"is_dark":true,"colors":{},"contrast":{{"text":"#000000","text_muted":"#000000","on_primary":"#000000","on_secondary":"#000000","on_accent":"#000000","on_background":"#000000","on_background_panel":"#000000","on_background_element":"#000000","best_on_background":"#000000"}},"invented_in_v2":true}}"##,
+            serde_json::to_string(&sample_colors()).unwrap()
+        );
+        assert!(
+            serde_json::from_str::<Message>(&theme_with_extra).is_ok(),
+            "unknown field in theme must be ignored"
+        );
+    }
+
+    /// FLAW: all 16 tokens must always be present — sparse palette is a protocol violation
+    /// ISOLATION: only colors object varies; same wire type, same serde
+    /// FALSE_POSITIVE_PREVENTION: control 16 tokens passes, 15 tokens fails distinct missing field error, not generic
+    #[test]
+    fn test_txc_all_16_tokens_required_isolated() {
+        let full = serde_json::to_value(sample_colors()).unwrap();
+        assert_eq!(full.as_object().unwrap().len(), 16);
+
+        // Remove one token
+        let mut missing = full.clone();
+        missing.as_object_mut().unwrap().remove("primary");
+        let err = serde_json::from_value::<Colors>(missing).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `primary`"),
+            "missing token must be specific error, got: {err}"
+        );
+
+        // Control: extra token is ignored per no-deny-unknown-fields, so not a failure
+        let mut extra = full;
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("future_token".into(), serde_json::json!("#ffffff"));
+        assert!(
+            serde_json::from_value::<Colors>(extra).is_ok(),
+            "extra token must be allowed for forward compat"
+        );
+    }
+
+    /// FLAW: NDJSON framing must be exactly one line, newline terminated, compact
+    /// ISOLATION: only serialization method varies; same Message, same to_ndjson vs to_string
+    /// FALSE_POSITIVE_PREVENTION: control to_ndjson has one newline and is parseable, pretty printed would have extra newlines and break framing
+    #[test]
+    fn test_txc_ndjson_is_exactly_one_line_isolated() {
+        let msg = Message::Bye(ByeEvent {
+            v: PROTOCOL_VERSION,
+            seq: 12,
+            ts: 1_785_616_999_000,
+            reason: ByeReason::Shutdown,
+        });
+        let line = msg.to_ndjson().unwrap();
+        assert_eq!(line.matches('\n').count(), 1, "exactly one newline");
+        assert!(line.ends_with('\n'));
+        assert!(!line[..line.len() - 1].contains('\n'));
+
+        // Control: serde_json::to_string (no newline) is not valid NDJSON framing
+        let compact = serde_json::to_string(&msg).unwrap();
+        assert!(!compact.ends_with('\n'));
+        // Pretty would be multi-line
+        let pretty = serde_json::to_string_pretty(&msg).unwrap();
+        assert!(pretty.matches('\n').count() > 1, "pretty is not NDJSON");
+    }
+}

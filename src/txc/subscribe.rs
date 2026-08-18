@@ -298,3 +298,281 @@ mod tests {
                     }
                 }
             });
+            Fixture {
+                path,
+                server: Some(server),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Unlink first: a still-blocked `accept()` is released by nothing
+            // else, so we also just detach rather than join unconditionally.
+            let _ = std::fs::remove_file(&self.path);
+            if let Some(h) = self.server.take() {
+                if h.is_finished() {
+                    let _ = h.join();
+                }
+            }
+        }
+    }
+
+    fn sample_colors() -> Colors {
+        Colors {
+            primary: Hex(Rgb::new(0x64, 0xe0, 0xd0)),
+            secondary: Hex(Rgb::new(0x4a, 0x9f, 0xd8)),
+            accent: Hex(Rgb::new(0xf4, 0xaa, 0x48)),
+            error: Hex(Rgb::new(0xe0, 0x55, 0x61)),
+            warning: Hex(Rgb::new(0xd9, 0xa4, 0x41)),
+            success: Hex(Rgb::new(0x61, 0xc7, 0x66)),
+            info: Hex(Rgb::new(0x64, 0xe0, 0xd0)),
+            text: Hex(Rgb::new(0xd8, 0xef, 0xff)),
+            text_muted: Hex(Rgb::new(0x7a, 0x90, 0xa4)),
+            background: Hex(Rgb::new(0x08, 0x10, 0x18)),
+            background_panel: Hex(Rgb::new(0x10, 0x1d, 0x2a)),
+            background_element: Hex(Rgb::new(0x18, 0x29, 0x3a)),
+            border: Hex(Rgb::new(0x22, 0x37, 0x4a)),
+            border_active: Hex(Rgb::new(0x42, 0xd9, 0xd0)),
+            border_subtle: Hex(Rgb::new(0x18, 0x28, 0x38)),
+            border_dimmest: Hex(Rgb::new(0x10, 0x1c, 0x28)),
+        }
+    }
+
+    /// A valid `theme` message, built through the wire types rather than
+    /// hand-written JSON so these fixtures cannot drift from the real schema.
+    fn theme_msg(seq: u64) -> Message {
+        Message::Theme(ThemeEvent {
+            v: PROTOCOL_VERSION,
+            seq,
+            ts: 1_785_616_484_123,
+            origin: Origin::named(OriginKind::AlbumArt, "Blue Monday"),
+            fade_ms: 600,
+            is_dark: true,
+            colors: sample_colors(),
+            contrast: Contrast::compute(&sample_colors()),
+        })
+    }
+
+    fn theme_line(seq: u64) -> String {
+        theme_msg(seq).to_ndjson().unwrap()
+    }
+
+    fn seq_of(msg: &Message) -> u64 {
+        match msg {
+            Message::Theme(t) => t.seq,
+            Message::Bye(b) => b.seq,
+        }
+    }
+
+    #[test]
+    fn known_tags_covers_every_message_variant() {
+        // Guards the pre-parse skip: if a variant is added to `Message` and
+        // not to KNOWN_TAGS, real messages would be silently dropped.
+        let variants = [
+            theme_msg(0),
+            Message::Bye(ByeEvent {
+                v: PROTOCOL_VERSION,
+                seq: 1,
+                ts: 1,
+                reason: ByeReason::Shutdown,
+            }),
+        ];
+        for m in variants {
+            let v: serde_json::Value = serde_json::from_str(&m.to_ndjson().unwrap()).unwrap();
+            let tag = v["t"].as_str().unwrap().to_string();
+            assert!(
+                KNOWN_TAGS.contains(&tag.as_str()),
+                "{tag} missing from KNOWN_TAGS"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_theme_line_parses() {
+        let fx = Fixture::spawn(1, |_, s| {
+            let _ = s.write_all(theme_line(7).as_bytes());
+        });
+        let mut sub = Subscriber::connect(fx.path()).unwrap();
+        let msg = sub.next_message().unwrap().expect("a message");
+        match msg {
+            Message::Theme(t) => {
+                assert_eq!(t.seq, 7);
+                assert_eq!(t.colors.primary.to_string(), "#64e0d0");
+                assert_eq!(t.origin.kind, OriginKind::AlbumArt);
+            }
+            other => panic!("expected theme, got {other:?}"),
+        }
+    }
+
+    /// The regression test for the chunked-read bug described in the module
+    /// docs: the message crosses two `write` syscalls with a gap between them,
+    /// so any implementation that treats one `read` as one message fails here.
+    #[test]
+    fn message_split_across_two_writes_still_parses() {
+        let fx = Fixture::spawn(1, |_, s| {
+            let line = theme_line(42);
+            let half = line.len() / 2;
+            let _ = s.write_all(&line.as_bytes()[..half]);
+            let _ = s.flush();
+            // Long enough that the reader has certainly been woken with a
+            // partial line before the remainder (and the newline) arrives.
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = s.write_all(&line.as_bytes()[half..]);
+        });
+        let mut sub = Subscriber::connect(fx.path()).unwrap();
+        let msg = sub.next_message().unwrap().expect("a message");
+        assert_eq!(seq_of(&msg), 42, "split message must reassemble intact");
+    }
+
+    #[test]
+    fn unknown_tag_is_skipped_and_next_message_still_arrives() {
+        let fx = Fixture::spawn(1, |_, s| {
+            let _ =
+                s.write_all(b"{\"t\":\"future_thing\",\"v\":1,\"seq\":1,\"ts\":1,\"wat\":[1,2]}\n");
+            let _ = s.write_all(theme_line(2).as_bytes());
+        });
+        let mut sub = Subscriber::connect(fx.path()).unwrap();
+        let msg = sub.next_message().unwrap().expect("a message");
+        assert_eq!(seq_of(&msg), 2, "the future-tagged line must be skipped");
+    }
+
+    #[test]
+    fn unknown_fields_do_not_break_a_theme() {
+        let fx = Fixture::spawn(1, |_, s| {
+            // Inject an extra key into an otherwise real theme line.
+            let mut v: serde_json::Value = serde_json::from_str(theme_line(3).trim()).unwrap();
+            v["invented_in_v2"] = serde_json::json!({"nested": true});
+            let _ = s.write_all(format!("{v}\n").as_bytes());
+        });
+        let mut sub = Subscriber::connect(fx.path()).unwrap();
+        let msg = sub.next_message().unwrap().expect("a message");
+        assert_eq!(seq_of(&msg), 3);
+    }
+
+    #[test]
+    fn newer_protocol_version_errors_instead_of_being_misread() {
+        let fx = Fixture::spawn(1, |_, s| {
+            let mut v: serde_json::Value = serde_json::from_str(theme_line(4).trim()).unwrap();
+            v["v"] = serde_json::json!(PROTOCOL_VERSION + 1);
+            let _ = s.write_all(format!("{v}\n").as_bytes());
+        });
+        let mut sub = Subscriber::connect(fx.path()).unwrap();
+        let err = sub
+            .next_message()
+            .expect_err("version skew must be an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("newer than this client"),
+            "error must be legible, got: {err}"
+        );
+        // And the connection is poisoned, not looping.
+        assert!(sub.next_message().unwrap().is_none());
+    }
+
+    #[test]
+    fn blank_and_malformed_lines_are_skipped() {
+        let fx = Fixture::spawn(1, |_, s| {
+            let _ = s.write_all(b"\n");
+            let _ = s.write_all(b"   \n");
+            let _ = s.write_all(b"{not json at all,,,\n");
+            let _ = s.write_all(b"[1,2,3]\n");
+            let _ = s.write_all(b"{\"t\":\"theme\",\"v\":1}\n"); // known tag, junk body
+            let _ = s.write_all(theme_line(5).as_bytes());
+        });
+        let mut sub = Subscriber::connect(fx.path()).unwrap();
+        let msg = sub.next_message().unwrap().expect("a message");
+        assert_eq!(seq_of(&msg), 5);
+    }
+
+    #[test]
+    fn clean_eof_yields_none_and_ends_the_iterator() {
+        let fx = Fixture::spawn(1, |_, s| {
+            let _ = s.write_all(theme_line(1).as_bytes());
+        });
+        let mut sub = Subscriber::connect(fx.path()).unwrap();
+        assert_eq!(seq_of(&sub.next_message().unwrap().unwrap()), 1);
+        assert!(
+            sub.next_message().unwrap().is_none(),
+            "clean EOF is Ok(None)"
+        );
+
+        let fx2 = Fixture::spawn(1, |_, s| {
+            let _ = s.write_all(theme_line(1).as_bytes());
+        });
+        let collected: Vec<_> = Subscriber::connect(fx2.path())
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(collected.len(), 1, "iterator terminates at EOF");
+    }
+
+    #[test]
+    fn connect_fails_immediately_when_nobody_is_listening() {
+        let err = Subscriber::connect(&temp_sock()).expect_err("must not block");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn watch_reconnects_after_the_publisher_drops_the_connection() {
+        // Connection 0 sends seq 100 then closes; connection 1 sends seq 200.
+        // A client that dies on EOF sees only the first.
+        let fx = Fixture::spawn(2, |i, s| {
+            let seq = if i == 0 { 100 } else { 200 };
+            let _ = s.write_all(theme_line(seq).as_bytes());
+        });
+        let path = fx.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut seen = 0usize;
+            watch(&path, |msg| {
+                let _ = tx.send(seq_of(&msg));
+                seen += 1;
+                if seen == 2 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+        });
+
+        let first = rx.recv_timeout(GENEROUS).expect("first message");
+        let second = rx.recv_timeout(GENEROUS).expect("message after reconnect");
+        assert_eq!((first, second), (100, 200));
+        worker.join().expect("watch thread").expect("watch ok");
+    }
+
+    #[test]
+    fn watch_waits_for_a_publisher_that_is_not_up_yet() {
+        // Backoff must not spin, and must still pick the publisher up once it
+        // appears. We start `watch` against a path with no listener, then bind
+        // it a moment later.
+        let path = temp_sock();
+        let watch_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            watch(&watch_path, |msg| {
+                let _ = tx.send(seq_of(&msg));
+                ControlFlow::Break(())
+            })
+        });
+        std::thread::sleep(Duration::from_millis(250));
+
+        let listener = UnixListener::bind(&path).expect("late bind");
+        let server = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(theme_line(9).as_bytes());
+                let _ = s.flush();
+            }
+        });
+
+        assert_eq!(rx.recv_timeout(GENEROUS).expect("late publisher"), 9);
+        worker.join().expect("watch thread").expect("watch ok");
+        let _ = server.join();
+        let _ = std::fs::remove_file(&path);
+    }
+}
