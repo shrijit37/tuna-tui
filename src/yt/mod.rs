@@ -366,8 +366,8 @@ fn largest_thumbnail(v: &serde_json::Value) -> Option<String> {
 /// anyway and block for a permit) — a permit-shaped `None` must never surface
 /// as a request failure, because `yt_stdout`'s `None` is a dropped stream to
 /// the engine. In production `None` only appears under pathological
-/// contention, where the fail-open fallback degrades to today's unbounded
-/// behavior.
+/// contention, where the fail-open fallback blocks until a permit frees
+/// (unbounded wait; the single-permit cap is retained).
 fn wait_for_permit(p: &Semaphore, deadline: Instant) -> Option<SemaphorePermit<'_>> {
     loop {
         if let Ok(permit) = p.try_acquire() {
