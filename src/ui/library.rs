@@ -165,8 +165,11 @@ pub(crate) fn render_library(
             theme.muted()
         };
         // Mark rows that `P` can play outright (playlist / album / artist), so
-        // they're distinguishable from tracks at a glance.
-        let playable_ctx = context_target(item).is_some() && !item.is_play;
+        // they're distinguishable from tracks at a glance. Inline predicate,
+        // algebraically equal to context_target().is_some() && !is_play on the
+        // row kinds asserted by enter_label_matches_context_target, and without
+        // the uri + name clones that is_some() discarded.
+        let playable_ctx = !item.is_header && !item.is_track && !item.is_play;
         // The currently playing track, wherever it appears in the list (#33).
         let now_here =
             item.is_track && app.playback.now.as_ref().is_some_and(|n| n.uri == item.uri);
@@ -196,7 +199,11 @@ pub(crate) fn render_library(
             };
             spans.push(Span::styled(" ●", marker_style));
         }
-        spans.push(Span::styled(format!(" {label}"), style));
+        // Two spans instead of format!(" {label}"): truncate already borrows
+        // in the common case, and the format! only reallocated. `as_ref()` —
+        // moving `label` in would break label.chars().count() below.
+        spans.push(Span::styled(" ", style));
+        spans.push(Span::styled(label.as_ref(), style));
         if !item.subtitle.is_empty() {
             let used = label.chars().count() + 1;
             let room = max.saturating_sub(used + 3);
@@ -238,15 +245,14 @@ pub(crate) fn render_library(
             } else {
                 ("\u{258F}", theme.border_dimmest) // 1/8 block - track
             };
-            f.render_widget(
-                Paragraph::new(Span::styled(glyph, Style::default().fg(color.into()))),
-                Rect {
-                    x: sb_x,
-                    y,
-                    width: 1,
-                    height: 1,
-                },
-            );
+            // Direct cell writes — a 1x1 Paragraph per cell is pure overhead
+            // (sibling progress/visualizer renders do the same). set_fg only:
+            // the old Paragraph patched just fg, and partial-block glyphs show
+            // bg through, so set_bg would change the look.
+            if let Some(cell) = f.buffer_mut().cell_mut((sb_x, y)) {
+                cell.set_symbol(glyph);
+                cell.set_fg(color.into());
+            }
         }
         out.hits.scroll = Some(Rect {
             x: sb_x,
