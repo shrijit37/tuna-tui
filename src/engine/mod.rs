@@ -300,6 +300,45 @@ enum LoadDisposition {
     Failed,
 }
 
+/// Remove `dead` from the queue (and its history rows, shifting survivors
+/// past the slot) and return the slot to start next: the replacement
+/// occupant of the removed slot when one exists, the queue head when repeat
+/// is on and the queue rolled over, or `None` when the queue is over. Pure
+/// queue bookkeeping — the playback branch of [`Worker::give_up_on`] —
+/// extracted so the skip logic is testable offline.
+fn successor_slot(
+    tracks: &mut Vec<String>,
+    history: &mut Vec<usize>,
+    repeat: bool,
+    cursor: usize,
+    dead: &str,
+) -> Option<usize> {
+    // Cursor-anchored, like the original: normally `dead` sits at the
+    // cursor and the slot is removed; a duplicate elsewhere keeps the
+    // cursor slot and retains the dead uri out of the rest of the queue.
+    let slot = if tracks.get(cursor).map(String::as_str) == Some(dead) {
+        tracks.remove(cursor);
+        cursor
+    } else {
+        tracks.retain(|t| t != dead);
+        cursor
+    };
+    // History indices shift past the removed slot.
+    history.retain(|&h| h != slot);
+    for h in history {
+        if *h > slot {
+            *h -= 1;
+        }
+    }
+    if slot < tracks.len() {
+        Some(slot)
+    } else if repeat && !tracks.is_empty() {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 /// Does a landed load result end the in-flight recovery of the old track?
 /// `Applied` replaces the queue outright; `Fenced` means the newer load's
 /// result is ahead and will replace it. `Failed` does not — no replacement
@@ -1164,10 +1203,7 @@ impl Worker {
             let _ = cur.child.wait();
             self.drop_streak += 1;
             if self.drop_streak >= RECOVERY_ATTEMPTS {
-                liblog(format!(
-                    "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
-                ));
-                self.give_up_on(uri);
+                self.give_up_on(uri, &format!("{RECOVERY_ATTEMPTS} consecutive failed EOFs"));
                 return;
             }
             if dropped {
@@ -1185,38 +1221,27 @@ impl Worker {
         self.advance();
     }
 
-    /// The track is given up on after too many consecutive failures: remove it
-    /// from the queue (keeping the queue view mirror in sync) and play its
-    /// successor — or stop cleanly when the queue is over and repeat is off,
-    /// mirroring `advance()`'s queue-exhausted behavior.
-    fn give_up_on(&mut self, uri: String) {
+    /// Give up on `uri`: remove it from the queue (keeping the queue view
+    /// mirror in sync) and play its successor — or stop cleanly when the
+    /// queue is over and repeat is off, mirroring `advance()`'s behavior.
+    /// Two callers: a track that exceeded the EOF-recovery budget, and a
+    /// fresh start whose stream could never be built (Myx-a4e.10 — skipping
+    /// beats a minute of dead air). `reason` lands in the log.
+    fn give_up_on(&mut self, uri: String, reason: &str) {
         self.recovery = None;
         self.drop_streak = 0;
-        let dead = self.state.cursor;
-        if dead < self.state.tracks.len() && self.state.tracks[dead] == uri {
-            self.state.tracks.remove(dead);
-        } else {
-            self.state.tracks.retain(|t| *t != uri);
-        }
-        // History indices shift past the removed slot.
-        self.state.history.retain(|&h| h != dead);
-        for h in &mut self.state.history {
-            if *h > dead {
-                *h -= 1;
-            }
-        }
+        let next = successor_slot(
+            &mut self.state.tracks,
+            &mut self.state.history,
+            self.state.repeat,
+            self.state.cursor,
+            &uri,
+        );
         *self.queue_snapshot.lock().unwrap() = self.state.tracks.clone();
-        liblog(format!(
-            "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
-        ));
-        if self.state.tracks.is_empty() {
-            self.stop_tail();
-        } else if dead < self.state.tracks.len() {
-            self.start_track_at(dead, 0);
-        } else if self.state.repeat {
-            self.start_track_at(0, 0);
-        } else {
-            self.stop_tail();
+        liblog(format!("engine: giving up on {uri}: {reason}"));
+        match next {
+            Some(idx) => self.start_track_at(idx, 0),
+            None => self.stop_tail(),
         }
     }
 
@@ -1287,7 +1312,10 @@ impl Worker {
             }
         }
         self.recovery = None;
-        self.give_up_on(uri);
+        self.give_up_on(
+            uri,
+            &format!("{RECOVERY_ATTEMPTS} failed recovery attempts"),
+        );
     }
 
     /// Stop playback and reset every track-related state: cancel the current
@@ -1359,7 +1387,12 @@ impl Worker {
 
         if let Err(e) = self.build_stream(&uri, pos, true, true) {
             liblog(format!("engine: start {uri} failed: {e}"));
-            self.recover_into(uri, pos);
+            // A fresh start that never produced audio is deterministic at
+            // this moment — retrying inside the 5-120s recovery backoff
+            // would leave dead air for a minute per unplayable track
+            // (deleted videos in playlists). Skip to the successor
+            // immediately (Myx-a4e.10).
+            self.give_up_on(uri, "fresh build failed — skipping");
         }
     }
 
@@ -1742,6 +1775,79 @@ mod tests {
             !supersedes_recovery(LoadDisposition::Failed),
             "a failed load leaves the queue untouched — the old track's              recovery must continue, not be abandoned"
         );
+    }
+
+    /// Skip-on-error (Myx-a4e.10): a dead track is removed and its successor
+    /// slides into the same slot — the next `start_track_at` plays it.
+    #[test]
+    fn skip_removes_the_dead_track_and_plays_its_successor() {
+        let mut tracks = vec!["a".into(), "dead".into(), "c".into()];
+        let mut history = vec![2usize, 0];
+        let next = successor_slot(&mut tracks, &mut history, false, 1, "dead");
+        assert_eq!(next, Some(1), "the successor takes the dead track's slot");
+        assert_eq!(tracks, vec!["a", "c"]);
+        // History rows past the removed slot shift down; the slot itself is
+        // dropped (it can no longer point at a real track).
+        assert_eq!(history, vec![1usize, 0]);
+    }
+
+    /// Dead at the tail of a non-repeating queue: nothing left to play — the
+    /// caller stops cleanly, mirroring `advance()`'s queue-exhausted path.
+    #[test]
+    fn skip_on_the_tail_stops_when_repeat_is_off() {
+        let mut tracks = vec!["a".into(), "dead".into()];
+        let mut history = vec![];
+        let next = successor_slot(&mut tracks, &mut history, false, 1, "dead");
+        assert_eq!(next, None, "queue over, repeat off — no successor");
+        assert_eq!(tracks, vec!["a"]);
+    }
+
+    /// Repeat wraps to the queue head after the tail dies.
+    #[test]
+    fn skip_on_the_tail_wraps_when_repeat_is_on() {
+        let mut tracks = vec!["a".into(), "dead".into()];
+        let mut history = vec![];
+        let next = successor_slot(&mut tracks, &mut history, true, 1, "dead");
+        assert_eq!(next, Some(0), "repeat rolls over to the head");
+        assert_eq!(tracks, vec!["a"]);
+    }
+
+    /// The cursor-anchored retain path: `dead` elsewhere in the queue (a
+    /// duplicate the user appended) leaves the cursor slot intact and the
+    /// successor is whatever now sits there.
+    #[test]
+    fn a_dead_duplicate_elsewhere_keeps_the_cursor_slot() {
+        let mut tracks = vec!["a".into(), "b".into(), "dead".into(), "dead".into()];
+        let mut history = vec![2usize, 3];
+        let next = successor_slot(&mut tracks, &mut history, false, 1, "dead");
+        assert_eq!(next, Some(1), "the cursor slot survives");
+        assert_eq!(tracks, vec!["a", "b"]);
+        // History rows that pointed at the removed slots survive and shift
+        // down (pre-existing semantics, kept unchanged): anything that falls
+        // off the queue's end is dropped harmlessly by `start_track_at`'s
+        // `.get()` guard when `prev` later consumes it.
+        assert_eq!(history, vec![1usize, 2]);
+    }
+
+    /// A single dead track empties the queue: stop, never loop.
+    #[test]
+    fn a_single_dead_track_stops_without_looping() {
+        let mut tracks = vec!["dead".into()];
+        let mut history = vec![];
+        let next = successor_slot(&mut tracks, &mut history, true, 0, "dead");
+        assert_eq!(next, None, "repeat cannot resurrect an empty queue");
+        assert!(tracks.is_empty());
+    }
+
+    /// Absent uri is a no-op: nothing removed, the current slot stays.
+    #[test]
+    fn an_absent_dead_uri_is_a_no_op() {
+        let mut tracks = vec!["a".into(), "b".into()];
+        let mut history = vec![0usize];
+        let next = successor_slot(&mut tracks, &mut history, true, 1, "ghost");
+        assert_eq!(next, Some(1));
+        assert_eq!(tracks, vec!["a", "b"]);
+        assert_eq!(history, vec![0usize]);
     }
 
     /// The facade must not expand synchronously: `play_context` queues the
