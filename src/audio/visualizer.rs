@@ -32,6 +32,11 @@ pub struct VisBands {
     pub updated_at: Instant,
     pub peak_envelope: f32,
     pub is_active: bool,
+    /// Render-gated: the UI sets this from the NowPlaying view expression
+    /// every tick; `feed_interleaved` early-returns while it is false (perf
+    /// audit F7). Defaults to true — the tee is never off unless the view
+    /// that consumes it is explicitly not on screen.
+    pub enabled: bool,
 }
 
 impl VisBands {
@@ -41,6 +46,7 @@ impl VisBands {
             updated_at: Instant::now(),
             peak_envelope: 1e-6,
             is_active: false,
+            enabled: true,
         }
     }
 
@@ -100,11 +106,28 @@ impl Visualizer {
         &self.bands
     }
 
+    #[cfg(test)]
+    fn sample_buf_len(&self) -> usize {
+        self.sample_buf.len()
+    }
+
     /// Feed one chunk of interleaved stereo s16 PCM (whatever the decoder
     /// produced); the FFT bands update in place.
     pub fn feed_interleaved(&mut self, samples: &[i16]) {
+        // Render-gated tee (perf audit F7): while no view consumes the bands
+        // the whole pipeline is skipped BEFORE the extend — a gate after it
+        // would grow sample_buf unboundedly and burst-lag re-enable.
+        // updated_at is deliberately untouched while disabled: stale means
+        // decay≈0, so the first frame after re-enable replaces the stale
+        // peaks immediately (the Myx-a4.14 frozen-spectrum class must not
+        // come back).
+        // try_lock on the audio path (perf audit F7): a UI thread holding
+        // the bands lock must never block the pump — a missed gate read just
+        // means the next chunk re-checks.
+        if !self.bands.try_lock().map(|g| g.enabled).unwrap_or(true) {
+            return;
+        }
         // Interleaved stereo -> mono.
-        // Interleaved stereo -> mono (i16 PCM; the librespot era fed f64).
         self.sample_buf.extend(samples.chunks(2).map(|c| {
             if c.len() == 2 {
                 (c[0] as f32 + c[1] as f32) * 0.5
@@ -152,7 +175,9 @@ impl Visualizer {
             fill_log_bands(&self.magnitudes, &self.band_ranges, &mut self.new_bands);
             smooth_bands(&mut self.new_bands, &mut self.smooth_scratch);
 
-            if let Ok(mut g) = self.bands.lock() {
+            // try_lock: a dropped update is fine — the next hop re-fills the
+            // bands, and the pump thread never waits on the UI.
+            if let Ok(mut g) = self.bands.try_lock() {
                 let elapsed_hops =
                     g.updated_at.elapsed().as_secs_f32() * self.sample_rate / HOP_SIZE as f32;
                 let decay = DECAY_FACTOR.powf(elapsed_hops);
@@ -218,6 +243,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enabled_defaults_to_true() {
+        // Default-true pins the oracle contract: feeding must work out of
+        // the box (the `fft_tee_keeps_feeding_*` family, silence_stays_quiet,
+        // a_loud_tone_moves_the_low_bands — all assume the tee is on).
+        let bands = VisBands::shared();
+        assert!(bands.lock().unwrap().enabled);
+    }
+
+    #[test]
+    fn disabled_feed_does_not_accumulate() {
+        let bands = VisBands::shared();
+        bands.lock().unwrap().enabled = false;
+        let mut v = Visualizer::new(Arc::clone(&bands), 44_100.0);
+        let residue = v.sample_buf_len();
+        let before_updated = bands.lock().unwrap().updated_at;
+        // A loud tone must not even enter the buffer while the tee is off.
+        let tone = loud_tone();
+        for chunk in tone.chunks(4096) {
+            v.feed_interleaved(chunk);
+        }
+        {
+            let g = bands.lock().unwrap();
+            assert_eq!(v.sample_buf_len(), residue, "disabled feed grew the buffer");
+            assert!(
+                g.values.iter().all(|x| *x == 0.0),
+                "disabled feed moved the bands"
+            );
+            assert_eq!(
+                g.updated_at, before_updated,
+                "disabled feed touched updated_at"
+            );
+        } // guard dropped: the re-lock below must not self-deadlock
+          // Re-enable: the same signal must energize the bands.
+        bands.lock().unwrap().enabled = true;
+        for chunk in tone.chunks(4096) {
+            v.feed_interleaved(chunk);
+        }
+        let g = bands.lock().unwrap();
+        let peak = g.values.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            peak > 1_000.0,
+            "re-enabled feed should energize the bands, got {peak}"
+        );
+    }
+
+    /// 220 Hz square-ish tone at full scale, interleaved stereo (L == R) —
+    /// the same signal `a_loud_tone_moves_the_low_bands` uses.
+    fn loud_tone() -> Vec<i16> {
+        let frame = 44_100 / 220;
+        let mut tone = Vec::with_capacity(44_100 * 2);
+        for i in 0..44_100 {
+            let s = if (i / frame) % 2 == 0 { 32000 } else { -32000 };
+            tone.push(s);
+            tone.push(s);
+        }
+        tone
+    }
+
+    #[test]
     fn silence_stays_quiet() {
         let bands = VisBands::shared();
         let mut v = Visualizer::new(Arc::clone(&bands), 44_100.0);
@@ -236,15 +320,7 @@ mod tests {
         let bands = VisBands::shared();
         let mut v = Visualizer::new(Arc::clone(&bands), 44_100.0);
         // 220 Hz square-ish tone at full scale.
-        let frame = 44_100 / 220;
-        let mut tone = Vec::with_capacity(44_100);
-        let mut phase = 0i16;
-        for i in 0..44_100 {
-            let s = if (i / frame) % 2 == 0 { 32000 } else { -32000 };
-            tone.push(s);
-            tone.push(s);
-            phase = phase.wrapping_add(1);
-        }
+        let tone = loud_tone();
         for chunk in tone.chunks(4096) {
             v.feed_interleaved(chunk);
         }
