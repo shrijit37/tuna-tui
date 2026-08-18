@@ -18,6 +18,7 @@
 pub mod expander;
 mod ffmpeg_source;
 
+use std::collections::VecDeque;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -195,6 +196,94 @@ impl LoadGate {
         if let Some(c) = self.cancel.take() {
             c.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+/// A queued metadata delivery: the resolved track whose cover/theme derive
+/// still needs shipping to the app.
+struct MetaJob {
+    uri: String,
+    info: ResolvedTrack,
+}
+
+/// Metadata jobs a single worker still owes (audit F6, bead Myx-a7o):
+/// bounded FIFO, oldest dropped on overflow. FIFO order among the survivors
+/// matters — the app's `meta_is_current` guard relies on delivery order.
+const META_QUEUE_CAP: usize = 16;
+
+/// The queue half of the metadata worker, split out so the boundedness and
+/// drop-oldest rules are unit-testable without threads.
+struct MetaQueue {
+    inner: Mutex<VecDeque<MetaJob>>,
+}
+
+impl MetaQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::with_capacity(META_QUEUE_CAP)),
+        }
+    }
+
+    /// Push a job. A full queue drops the OLDEST — a recovery's duplicate
+    /// for an already-covered track is worth less than the current track's
+    /// cover (drop-newest would lose exactly the cover the user can see).
+    fn push(&self, job: MetaJob) {
+        let mut q = self.inner.lock().unwrap();
+        if q.len() >= META_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(job);
+    }
+
+    fn pop(&self) -> Option<MetaJob> {
+        self.inner.lock().unwrap().pop_front()
+    }
+}
+
+/// One persistent metadata worker owned by the engine. Every resolved track
+/// used to spawn a fresh detached "tuna-meta" thread — at track start AND at
+/// every successful recovery rebuild — each re-fetching (httpcache), decoding
+/// and re-theming the unchanged cover, and re-running the app's
+/// `record_played` (Home count inflation). Now one thread drains the bounded
+/// queue; `push` never blocks the command loop (a full queue drops the
+/// oldest job instead of stalling the worker's state machine).
+struct MetaWorker {
+    queue: Arc<MetaQueue>,
+    /// Coalesced wakeups: pushes `try_send`; the thread drains until empty.
+    wake_tx: flume::Sender<()>,
+}
+
+impl MetaWorker {
+    fn spawn(client: reqwest::blocking::Client, meta_tx: flume::Sender<EngineMeta>) -> Self {
+        // The queue is shared with the thread (which pops) and the pushes.
+        let queue = Arc::new(MetaQueue::new());
+        let (wake_tx, wake_rx) = flume::bounded::<()>(1);
+        let q = Arc::clone(&queue);
+        std::thread::Builder::new()
+            .name("tuna-meta".into())
+            .spawn(move || {
+                // The wake channel disconnects when the meta worker drops
+                // (engine teardown) — the thread exits with it.
+                while wake_rx.recv().is_ok() {
+                    while let Some(job) = q.pop() {
+                        let meta = engine_meta(&job.uri, &job.info, &client);
+                        if meta_tx.send(meta).is_err() {
+                            return; // the app is gone — queued jobs are worthless
+                        }
+                    }
+                }
+            })
+            .expect("spawn meta worker");
+        Self { queue, wake_tx }
+    }
+
+    /// Queue a metadata delivery for `uri`. Fresh track starts only: a
+    /// recovery rebuild delivers the same track's metadata again, and the
+    /// cover/theme work + the app's `record_played` must not repeat (F6).
+    fn push(&self, uri: String, info: ResolvedTrack) {
+        self.queue.push(MetaJob { uri, info });
+        // Coalesced: one wake per drain cycle is enough.
+        let _ = self.wake_tx.try_send(());
     }
 }
 
@@ -526,7 +615,7 @@ pub fn run(
         queue,
         bands: Arc::clone(&bands),
         events,
-        meta_tx,
+        meta_worker: MetaWorker::spawn(crate::httpcache::blocking_client().clone(), meta_tx),
         cmds: cmds_rx,
         expander: Arc::clone(&expander),
         queue_snapshot: Arc::clone(&queue_snapshot),
@@ -545,13 +634,11 @@ pub fn run(
         drop_streak: 0,
         last_seen_frames: 0,
         last_seen_sourced: 0,
+        meta_queued: None,
         load_gate: LoadGate::new(),
         load_tx,
         load_rx,
         last_correction: Instant::now(),
-        // Cloning the once-built blocking client (Arc-fee) — constructed by
-        // `httpcache::warm_blocking_client` before the runtime started.
-        client: crate::httpcache::blocking_client().clone(),
         pending: None,
         recovery: None,
         paused: None,
@@ -611,7 +698,13 @@ struct Worker {
     queue: Arc<rodio::queue::SourcesQueueInput>,
     bands: Arc<Mutex<VisBands>>,
     events: flume::Sender<EngineEvent>,
-    meta_tx: flume::Sender<EngineMeta>,
+    /// The bounded metadata worker every resolved track's cover/theme derive
+    /// is queued on (audit F6 — was a fresh detached thread per start AND
+    /// per recovery rebuild).
+    meta_worker: MetaWorker,
+    /// The uri whose metadata is queued or delivered; a recovery rebuild of
+    /// the same uri must not queue a duplicate (F6).
+    meta_queued: Option<String>,
     cmds: flume::Receiver<Cmd>,
     expander: Arc<dyn Expander>,
     /// The public mirror of the loaded list (`Engine::queue`).
@@ -628,7 +721,6 @@ struct Worker {
     /// this while `last_seen_frames` sits still.
     last_seen_sourced: u64,
     last_correction: Instant,
-    client: reqwest::blocking::Client,
     /// A user command that pre-empted a recovery retry-sleep; handled before
     /// anything queued behind it.
     pending: Option<Cmd>,
@@ -1129,7 +1221,7 @@ impl Worker {
             if attempt > 0 {
                 let _ = self.events.send(EngineEvent::Reconnecting);
             }
-            match self.build_stream(&uri, pos, play) {
+            match self.build_stream(&uri, pos, play, false) {
                 Ok(()) => {
                     if attempt > 0 {
                         let _ = self.events.send(EngineEvent::Reconnected);
@@ -1232,7 +1324,7 @@ impl Worker {
             .events
             .send(EngineEvent::TrackChanged { uri: uri.clone() });
 
-        if let Err(e) = self.build_stream(&uri, pos, true) {
+        if let Err(e) = self.build_stream(&uri, pos, true, true) {
             liblog(format!("engine: start {uri} failed: {e}"));
             self.recover_into(uri, pos);
         }
@@ -1294,7 +1386,7 @@ impl Worker {
     /// Resolve `uri`, spawn ffmpeg, append the source and announce Playing — or,
     /// when `play` is false, announce Paused and keep the mixer suspended (a
     /// recovery rebuilding a track the user had paused must not force-play it).
-    fn build_stream(&mut self, uri: &str, pos: u32, play: bool) -> Result<()> {
+    fn build_stream(&mut self, uri: &str, pos: u32, play: bool, fresh: bool) -> Result<()> {
         let resolved = self.expander.resolve(uri).map_err(|e| anyhow!(e))?;
         let url = resolved.url.clone();
         self.restart_stream(&url, uri, resolved.duration_ms, pos, play)?;
@@ -1310,22 +1402,21 @@ impl Worker {
                 position_ms: pos,
             }
         });
-        // In-band metadata for every resolved track (the app has no other metadata
-        // source since the Web API died). Sent on a detached thread — the cover
-        // fetch + theme derive must not block the worker's state machine while
-        // a slow request stalls.
-        let metatx = self.meta_tx.clone();
-        let client = self.client.clone();
-        let u = uri.to_string();
-        let info = resolved.clone();
-        if std::thread::Builder::new()
-            .name("tuna-meta".into())
-            .spawn(move || {
-                let _ = metatx.send(engine_meta(&u, &info, &client));
-            })
-            .is_err()
-        {
-            liblog("engine: failed to spawn meta thread");
+        // In-band metadata for every resolved track (the app has no other
+        // metadata source since the Web API died) — queued on the bounded
+        // meta worker, so the cover fetch + theme derive never block the
+        // worker's state machine (audit F6 / bead Myx-a7o: was a fresh
+        // detached thread per track start AND per recovery rebuild).
+        //
+        // `fresh` is false only for a recovery rebuild of the SAME uri: the
+        // track's metadata was already delivered on its first start, and
+        // re-delivering it would repeat the cover/theme work and the app's
+        // `record_played` (Home count inflation). Exception: when the first
+        // attempt failed at resolve, nothing was ever queued — this recovery
+        // is the track's only chance to ship metadata, so it must queue.
+        if fresh || self.meta_queued.as_deref() != Some(uri) {
+            self.meta_queued = Some(uri.to_string());
+            self.meta_worker.push(uri.to_string(), resolved);
         }
         Ok(())
     }
@@ -1534,6 +1625,35 @@ mod tests {
     /// The context-load gate: every new load supersedes the previous one —
     /// flipping its cancel flag so the orphaned yt-dlp chain stops spawning —
     /// and stale generations are fenced out of the queue (bead Myx-a4.8).
+    /// The metadata queue (audit F6) is bounded and drops the OLDEST on
+    /// overflow, keeping FIFO order among the survivors — the ordering the
+    /// app's `meta_is_current` guard relies on.
+    #[test]
+    fn meta_queue_is_bounded_and_drops_the_oldest() {
+        let q = MetaQueue::new();
+        for i in 0..(META_QUEUE_CAP + 5) {
+            q.push(MetaJob {
+                uri: format!("u{i}"),
+                info: ResolvedTrack {
+                    url: String::new(),
+                    title: String::new(),
+                    artist: String::new(),
+                    album: None,
+                    duration_ms: None,
+                    thumbnail: None,
+                },
+            });
+        }
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        // The first five pushes were evicted; the newest cap-worth survive,
+        // in order.
+        let expected: Vec<String> = (5..META_QUEUE_CAP + 5).map(|i| format!("u{i}")).collect();
+        assert_eq!(seen, expected);
+    }
+
     #[test]
     fn a_new_context_load_supersedes_and_cancels_the_previous() {
         let mut gate = LoadGate::new();
