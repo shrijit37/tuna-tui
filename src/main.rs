@@ -613,13 +613,31 @@ async fn run_ui(
                     }
                 }
 
+                // Gate the FFT tee on the view that renders it: nothing
+                // consumes the bands outside NowPlaying, so the ~344
+                // 1024-pt FFTs/s would be pure waste there (perf audit F7).
+                // Set from the SAME expression that gates rendering, before
+                // draw — a flag lagging the view by a tick reintroduces the
+                // frozen-spectrum bug class (Myx-a4.14). One guard also reads
+                // is_active here, so the frame pairs a consistent
+                // (enabled, is_active) snapshot.
+                let now_playing = app.view.mode == RightView::NowPlaying;
+                let is_active = app
+                    .svc
+                    .engine
+                    .bands
+                    .try_lock()
+                    .map(|mut g| {
+                        g.enabled = now_playing;
+                        g.is_active
+                    })
+                    .unwrap_or(false);
                 // The visualizer only animates while it is on screen; on Queue
                 // its frame rate buys nothing. Synced lyrics move too — at the
                 // idle rate the highlighted line lands half a second late.
                 let animating = app.theme.fade.is_some()
                     || (app.view.mode == RightView::Lyrics && app.view.lyrics_synced)
-                    || (app.view.mode == RightView::NowPlaying
-                        && app.svc.engine.bands.try_lock().map(|g| g.is_active).unwrap_or(false));
+                    || (now_playing && is_active);
                 if app.art_repaint != ArtRepaint::Idle {
                     dirty = true;
                 }
