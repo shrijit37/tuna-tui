@@ -109,5 +109,4 @@ live-network tests are `#[ignore]`d.
 
 ## License
 
-MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright (c) 2026
-Haseeb Khalid.
+MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright (c) 2026 Haseeb Khalid, Shrijit Srivastava.

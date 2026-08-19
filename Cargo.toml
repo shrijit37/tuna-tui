@@ -3,7 +3,7 @@ name = "tuna-tui"
 version = "0.4.0"
 edition = "2021"
 description = "A lean, beautiful terminal music player"
-authors = ["Haseeb Khalid"]
+authors = ["Haseeb Khalid", "Shrijit Srivastava"]
 license = "MIT"
 repository = "https://github.com/shrijit37/tuna-tui"
 homepage = "https://github.com/shrijit37/tuna-tui"
@@ -127,7 +127,7 @@ lto = "thin"
 [package.metadata.deb]
 depends = "libasound2, libssl3, yt-dlp, ffmpeg"
 maintainer = "Shrijit Srivastava <shrijitsrivastava@gmail.com>"
-copyright = "2026 Haseeb Khalid"
+copyright = "2026 Haseeb Khalid, Shrijit Srivastava"
 section = "sound"
 priority = "optional"
 assets = [

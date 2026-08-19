@@ -1,5 +1,5 @@
 Tuna TUI
-Copyright (c) 2026 Haseeb Khalid — MIT License (see LICENSE).
+Copyright (c) 2026 Haseeb Khalid, Shrijit Srivastava — MIT License (see LICENSE).
 
 The distributed binary statically links third-party Rust crates; each crate's
 own license governs its contribution, and the full dependency tree is declared
