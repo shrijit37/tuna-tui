@@ -2,6 +2,10 @@
 
 use crate::*;
 
+/// Bound the session meta cache (Myx-trp): a long session with many distinct
+/// tracks must not grow the display-label map without limit.
+const META_CACHE_CAP: usize = 4096;
+
 pub(crate) fn handle_engine_event(app: &mut App, ev: EngineEvent) {
     // Position ticks would bury everything else in the log.
     if !matches!(ev, EngineEvent::PositionCorrection { .. }) {
@@ -128,9 +132,12 @@ pub(crate) fn apply_meta(
 
     // Cache the display triple for the local queue view, and roll the track
     // into the Home/Recent history (counts + last-play ordering).
-    app.session
-        .meta_cache
-        .insert(meta.uri.clone(), (meta.title.clone(), meta.artist.clone()));
+    cache_meta(
+        &mut app.session.meta_cache,
+        meta.uri.clone(),
+        meta.title.clone(),
+        meta.artist.clone(),
+    );
     app.store
         .record_played(&meta.uri, &meta.title, &meta.artist);
     // Third store-mutator site per the F21 binding spec (audit:
@@ -286,5 +293,68 @@ pub(crate) fn play_selected_context(app: &mut App, shuffle: bool) {
     match context_target(&item) {
         Some((uri, name)) => app.play_context_row(uri, name, shuffle),
         None => app.status = "not a playlist, album, or artist".to_string(),
+    }
+}
+
+/// Insert `uri → (title, artist)` into the session meta cache, evicting one
+/// arbitrary row when at [`META_CACHE_CAP`] so a long session stays bounded.
+/// The queue view tolerates a missing row: it falls back to the URI until
+/// the track's next metadata landing re-adds it.
+fn cache_meta(
+    cache: &mut std::collections::HashMap<String, (String, String)>,
+    uri: String,
+    title: String,
+    artist: String,
+) {
+    if cache.len() >= META_CACHE_CAP {
+        if let Some(stale) = cache.keys().next().cloned() {
+            cache.remove(&stale);
+        }
+    }
+    cache.insert(uri, (title, artist));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cache must stay bounded past the cap: inserting beyond it evicts
+    /// one row and the newest entry is always present.
+    #[test]
+    fn meta_cache_stays_bounded_at_the_cap() {
+        let mut cache = std::collections::HashMap::new();
+        for i in 0..META_CACHE_CAP {
+            cache_meta(
+                &mut cache,
+                format!("yt:video:{i}"),
+                format!("t{i}"),
+                "a".into(),
+            );
+        }
+        assert_eq!(cache.len(), META_CACHE_CAP);
+        // One more insert: evict one, add one — never grows past the cap.
+        cache_meta(
+            &mut cache,
+            "yt:video:overflow".into(),
+            "overflow".into(),
+            "a".into(),
+        );
+        assert_eq!(cache.len(), META_CACHE_CAP);
+        assert_eq!(
+            cache.get("yt:video:overflow"),
+            Some(&("overflow".to_string(), "a".to_string()))
+        );
+    }
+
+    /// The newest entry is present even at the very first insertion.
+    #[test]
+    fn meta_cache_inserts_below_the_cap() {
+        let mut cache = std::collections::HashMap::new();
+        cache_meta(&mut cache, "yt:video:1".into(), "t".into(), "a".into());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.get("yt:video:1"),
+            Some(&("t".to_string(), "a".to_string()))
+        );
     }
 }
