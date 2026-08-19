@@ -113,6 +113,68 @@ pub(crate) fn spawn_search(query: String, tx: flume::Sender<Vec<LibItem>>) {
         .expect("spawn search worker");
 }
 
+/// Suggestions: type-ahead completions while the search box is being typed
+/// (Myx-a4e.12). Fed by Google's unauthenticated YouTube suggest, debounced
+/// in this worker, delivered on the same `Vec<LibItem>` search channel as
+/// results. Rows are `LibItem::header`s — inert by construction, so the
+/// existing list nav (which skips headers) can't select them and Enter can't
+/// fire a bogus detail fetch; the real `spawn_search` output replaces them
+/// wholesale when the query is submitted.
+pub(crate) fn spawn_suggestions(rx: flume::Receiver<String>, tx: flume::Sender<Vec<LibItem>>) {
+    std::thread::Builder::new()
+        .name("tuna-suggest".to_string())
+        .spawn(move || {
+            while let Ok(mut query) = rx.recv() {
+                // Debounce: fold every ping that queued while we were busy
+                // into the newest query, then rest for the quiet window.
+                query = newest_pending(&rx, query);
+                let query = query.trim().to_string();
+                if query.is_empty() {
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let hits = yt::autocomplete(&query, SUGGEST_LIMIT);
+                if hits.is_empty() {
+                    continue; // no churn: keep whatever the pane was showing
+                }
+                let mut out = Vec::with_capacity(hits.len() + 1);
+                out.push(LibItem::header("Suggestions"));
+                out.extend(hits.into_iter().map(|s| LibItem::header(&s)));
+                let _ = tx.send(out);
+            }
+        })
+        .expect("spawn suggestions worker");
+}
+
+/// How many completions the suggest row renders. Search depth stays on
+/// `config::search_limit` — this is display-only, so a small fixed cap.
+const SUGGEST_LIMIT: usize = 8;
+
+/// Fold every ping waiting in `rx` into the newest query (debounce helper —
+/// extracted so the fold is testable offline; the network half is `#[ignore]`).
+fn newest_pending(rx: &flume::Receiver<String>, mut latest: String) -> String {
+    while let Ok(newer) = rx.try_recv() {
+        latest = newer;
+    }
+    latest
+}
+
+#[cfg(test)]
+mod suggest_tests {
+    use super::newest_pending;
+
+    #[test]
+    fn folds_pings_to_newest() {
+        let (tx, rx) = flume::unbounded::<String>();
+        let _ = tx.send("a".to_string());
+        let _ = tx.send("ab".to_string());
+        let _ = tx.send("abc".to_string());
+        assert_eq!(newest_pending(&rx, "a".to_string()), "abc");
+        // Empty channel leaves the carried query untouched.
+        assert_eq!(newest_pending(&rx, "abc".to_string()), "abc");
+    }
+}
+
 /// Drill into a context (playlist / channel / album / single video). The
 /// response tuple `(context_uri, title, items)` matches the old fetch.
 pub(crate) fn spawn_detail_fetch(
