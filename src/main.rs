@@ -449,6 +449,7 @@ struct Radio {
 struct UiChannels {
     lib: flume::Sender<(Section, Vec<LibItem>)>,
     search: flume::Sender<Vec<LibItem>>,
+    suggest: flume::Sender<String>,
     lyrics: flume::Sender<(Vec<(u32, String)>, bool)>,
     detail: flume::Sender<(String, String, Vec<LibItem>)>,
     radio: flume::Sender<Result<Radio, String>>,
@@ -485,6 +486,7 @@ async fn run_ui(
 
     let (lib_tx, lib_rx) = flume::unbounded::<(Section, Vec<LibItem>)>();
     let (search_tx, search_rx) = flume::unbounded::<Vec<LibItem>>();
+    let (suggest_tx, suggest_rx) = flume::unbounded::<String>();
     let (lyrics_tx, lyrics_rx) = flume::unbounded::<(Vec<(u32, String)>, bool)>();
     let (detail_tx, detail_rx) = flume::unbounded::<(String, String, Vec<LibItem>)>();
     let (radio_tx, radio_rx) = flume::unbounded::<Result<Radio, String>>();
@@ -492,11 +494,13 @@ async fn run_ui(
     let chans = UiChannels {
         lib: lib_tx,
         search: search_tx,
+        suggest: suggest_tx,
         lyrics: lyrics_tx,
         detail: detail_tx,
         radio: radio_tx,
     };
     spawn_library_fetch(app.store.clone(), chans.lib.clone());
+    browse::spawn_suggestions(suggest_rx, chans.search.clone());
 
     if app.playback.now.is_some() {
         resume_source(&mut app, &chans.radio);
