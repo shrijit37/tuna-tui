@@ -249,8 +249,8 @@ fn pseudo_radio_query(title: &str, artist: &str) -> String {
 /// The entries of a playlist, mix or channel tab, flat-extracted: each row is
 /// the playlist API's own metadata (title, id, duration when present) without
 /// per-video resolution — the cheap `-J --flat-playlist` used for browsing.
-pub fn playlist_entries(url: &str) -> Vec<YtVideo> {
-    let Some(root) = yt_json(&["--flat-playlist", url], None) else {
+pub fn playlist_entries(url: &str, cancel: Option<Arc<AtomicBool>>) -> Vec<YtVideo> {
+    let Some(root) = yt_json(&["--flat-playlist", url], cancel) else {
         return Vec::new();
     };
     // A bare `watch?v=` URL with no `list=` yields a single-video dump with no
@@ -301,10 +301,19 @@ pub fn playlist_entries_capped(url: &str, limit: usize) -> Vec<YtVideo> {
 /// used to re-implement it separately and drifted on the channel URL shape.
 /// `video` is absent on purpose — a single track's contents are itself, and
 /// both callers already pass it through.
-pub fn resolve_kind(kind: &str, id: &str, limit: usize) -> Vec<YtVideo> {
+/// `cancel` is the per-request flag (F13): the playlist legs pass it to the
+/// flat-fetch so a superseded load stops paginating instead of running its
+/// whole chain (bead Myx-a4.8). The album leg is a single bounded search —
+/// no pagination to cancel.
+pub fn resolve_kind(
+    kind: &str,
+    id: &str,
+    limit: usize,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Vec<YtVideo> {
     match kind {
-        "playlist" => playlist_entries(&crate::util::playlist_uri(id)),
-        "channel" => playlist_entries(&crate::util::channel_videos_url(id)),
+        "playlist" => playlist_entries(&crate::util::playlist_uri(id), cancel),
+        "channel" => playlist_entries(&crate::util::channel_videos_url(id), cancel),
         "album" => search(id, limit),
         _ => Vec::new(),
     }

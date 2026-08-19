@@ -45,7 +45,12 @@ pub trait Expander: Send + Sync {
     /// Expand `uri` into the flat list of track uris it represents, in play
     /// order. A bare track passes through as itself; playlists/albums/artists
     /// expand into their tracks. Errors are user-facing ("couldn't play…").
-    fn expand(&self, uri: &str) -> Result<Vec<String>, String>;
+    ///
+    /// `cancel` (F13 pattern, same as [`Expander::radio`]) is the per-request
+    /// flag the engine flips when a newer context load supersedes this one —
+    /// the yt-dlp chain stops spawning children instead of paginating on
+    /// after the queue already moved on (bead Myx-a4.8).
+    fn expand(&self, uri: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String>;
 
     /// Resolve ONE track uri to a direct stream URL (+ the metadata it comes
     /// with). Called from the engine's worker thread for every track start.
@@ -64,7 +69,7 @@ pub trait Expander: Send + Sync {
 pub struct YtExpander;
 
 impl Expander for YtExpander {
-    fn expand(&self, uri: &str) -> Result<Vec<String>, String> {
+    fn expand(&self, uri: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String> {
         let Some(("yt", kind, id)) = uri_parts(uri) else {
             return Err(format!("not a YouTube uri: {uri}"));
         };
@@ -72,8 +77,9 @@ impl Expander for YtExpander {
             "video" => vec![uri.to_string()],
             // Playlists / channels / albums all resolve through the one
             // kind table in yt; YouTube has no first-class albums — a
-            // search-backed expansion is the honest approximation.
-            kind => yt::resolve_kind(kind, id, config::get().search_limit)
+            // search-backed expansion is the honest approximation. The
+            // playlist legs check `cancel` between paginated pages.
+            kind => yt::resolve_kind(kind, id, config::get().search_limit, Some(cancel))
                 .into_iter()
                 .map(|v| v.uri)
                 .collect(),
@@ -201,15 +207,18 @@ mod tests {
 
     #[test]
     fn video_uris_expand_to_themselves() {
-        let uris = YtExpander.expand("yt:video:dQw4w9WgXcQ").unwrap();
+        let uris = YtExpander
+            .expand("yt:video:dQw4w9WgXcQ", Arc::new(AtomicBool::new(false)))
+            .unwrap();
         assert_eq!(uris, vec!["yt:video:dQw4w9WgXcQ".to_string()]);
     }
 
     #[test]
     fn unknown_schemes_are_rejected_with_a_reason() {
-        assert!(YtExpander.expand("spotify:playlist:xyz").is_err());
-        assert!(YtExpander.expand("yt:video").is_err());
-        assert!(YtExpander.expand("yt:podcast:x").is_err());
+        let cancel = || Arc::new(AtomicBool::new(false));
+        assert!(YtExpander.expand("spotify:playlist:xyz", cancel()).is_err());
+        assert!(YtExpander.expand("yt:video", cancel()).is_err());
+        assert!(YtExpander.expand("yt:podcast:x", cancel()).is_err());
     }
 
     #[test]

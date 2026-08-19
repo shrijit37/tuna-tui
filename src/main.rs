@@ -65,16 +65,82 @@ use souvlaki::{
 
 // ------------------------------------------------------------------ main
 
+fn parse_player_args() -> (Vec<String>, Option<u8>) {
+    parse_player_args_from(std::env::args().skip(1))
+}
+
+/// The radio-drain fence: a landed expansion applies only while the user
+/// still wants the radio. Every play path (browse play, drill-in context,
+/// liked list) rewrites `transport.source`, so anything but `Radio` at
+/// drain time means the request was superseded — its outcome must not take
+/// over the queue or the status line (the zombie-radio class).
+fn radio_still_wanted(source: &PlaySource) -> bool {
+    matches!(source, PlaySource::Radio(_))
+}
+
+/// Split player-mode args from player flags. The only flag today is
+/// `--buffer-duration <secs>` (also `--buffer-duration=<secs>`); it is
+/// stripped here so the "first positional argument is a URI" contract in
+/// `boot` holds regardless of flag order, and the `theme` subcommand keeps
+/// working alongside it. A missing or unparseable value silently falls back
+/// to the config file — a typo must never lock someone out.
+fn parse_player_args_from<I>(args: I) -> (Vec<String>, Option<u8>)
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut rest = Vec::new();
+    let mut buffer = None;
+    let mut it = args.into_iter().peekable();
+    while let Some(arg) = it.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f == "--buffer-duration" => (f, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        if flag == "--buffer-duration" {
+            // Space-separated: only a next argv that looks like a value IS
+            // a value — a u8, or any all-digit string (so an out-of-range
+            // number still falls back to config instead of surfacing as a
+            // bogus startup URI). `--buffer-duration https://youtube.com/…`
+            // is a missing value followed by the startup URI — the URI must
+            // survive as the positional, not be eaten as an invalid value
+            // (the old code consumed and dropped it). Anything else stays in
+            // the stream as a positional.
+            let value = match inline {
+                Some(v) => Some(v),
+                None => match it.peek() {
+                    Some(v) if v.parse::<u8>().is_ok() || v.chars().all(|c| c.is_ascii_digit()) => {
+                        it.next()
+                    }
+                    _ => None,
+                },
+            };
+            // The documented contract is 1..=30 (the template's own comment).
+            // Out-of-range values — 0 (buffer silently off) and 31..=255 —
+            // fall back to the config file, same policy as the lenient
+            // config reader.
+            buffer = value
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|v| (1..=30).contains(v));
+            continue;
+        }
+        rest.push(arg);
+    }
+    (rest, buffer)
+}
+
 fn main() -> Result<()> {
+    // Player flags are stripped before anything else, so neither the `theme`
+    // subcommand dispatch nor `boot`'s URI positional ever sees them.
+    let (args, buffer_duration_secs) = parse_player_args();
+
     // `tuna-tui theme …` is a socket client, not a player: it must not start the
     // engine or touch the terminal. Intercepting argv here — before anything
     // else in `main` runs — is what guarantees that, and it also keeps `theme`
     // from reaching the "first positional argument is a URI" path in `boot`.
     #[cfg(all(feature = "txc", unix))]
     {
-        let argv: Vec<String> = std::env::args().collect();
-        if argv.get(1).is_some_and(|a| a == "theme") {
-            std::process::exit(tuna_tui::txc::cli::run(&argv[2..]));
+        if args.first().is_some_and(|a| a == "theme") {
+            std::process::exit(tuna_tui::txc::cli::run(&args[1..]));
         }
     }
 
@@ -114,9 +180,24 @@ fn main() -> Result<()> {
     ));
 
     #[cfg(target_os = "macos")]
-    let res = run_player_macos(terminal, saved, init_vol, picker);
+    let res = run_player_macos(
+        terminal,
+        saved,
+        init_vol,
+        picker,
+        args,
+        buffer_duration_secs,
+    );
     #[cfg(not(target_os = "macos"))]
-    let res = run_player(terminal, saved, init_vol, picker, true);
+    let res = run_player(
+        terminal,
+        saved,
+        init_vol,
+        picker,
+        true,
+        args,
+        buffer_duration_secs,
+    );
     res
 }
 
@@ -126,6 +207,8 @@ fn run_player(
     init_vol: u8,
     picker: Picker,
     media_platform_ready: bool,
+    args: Vec<String>,
+    buffer_duration_secs: Option<u8>,
 ) -> Result<()> {
     // Building reqwest's blocking client creates and drops its own inner
     // runtime, which tokio refuses inside a live runtime — construct it here,
@@ -136,12 +219,15 @@ fn run_player(
         .enable_all()
         .build()
         .context("start tokio runtime")?;
+    let startup_uri = args.first().filter(|a| a.as_str() != "theme").cloned();
     let outcome = runtime.block_on(boot(
         &mut terminal,
         saved,
         init_vol,
         picker,
         media_platform_ready,
+        startup_uri,
+        buffer_duration_secs,
     ));
     let restored = restore_terminal(&mut terminal);
     // Say goodbye *after* the screen is back, so a subscriber that has stopped
@@ -164,7 +250,14 @@ fn run_player(
 /// main thread's run loop, so the winit loop takes the main thread and the
 /// player runs beside it. No loop only costs the native integration.
 #[cfg(target_os = "macos")]
-fn run_player_macos(terminal: Term, saved: SavedState, init_vol: u8, picker: Picker) -> Result<()> {
+fn run_player_macos(
+    terminal: Term,
+    saved: SavedState,
+    init_vol: u8,
+    picker: Picker,
+    args: Vec<String>,
+    buffer_duration_secs: Option<u8>,
+) -> Result<()> {
     use winit::application::ApplicationHandler;
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
     use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -196,13 +289,29 @@ fn run_player_macos(terminal: Term, saved: SavedState, init_vol: u8, picker: Pic
         Ok(event_loop) => event_loop,
         Err(e) => {
             liblog(format!("media event loop unavailable: {e}"));
-            return run_player(terminal, saved, init_vol, picker, false);
+            return run_player(
+                terminal,
+                saved,
+                init_vol,
+                picker,
+                false,
+                args,
+                buffer_duration_secs,
+            );
         }
     };
 
     let proxy = event_loop.create_proxy();
     let player = std::thread::spawn(move || {
-        let res = run_player(terminal, saved, init_vol, picker, true);
+        let res = run_player(
+            terminal,
+            saved,
+            init_vol,
+            picker,
+            true,
+            args,
+            buffer_duration_secs,
+        );
         let _ = proxy.send_event(PlayerDone);
         res
     });
@@ -290,6 +399,8 @@ async fn boot(
     init_vol: u8,
     picker: Picker,
     media_platform_ready: bool,
+    startup_uri: Option<String>,
+    buffer_duration_secs: Option<u8>,
 ) -> Result<TxcHandle> {
     // The engine's in-band metadata channel. Established before the engine
     // starts so no event can land on a missing sender; boot passes the receiver
@@ -301,12 +412,14 @@ async fn boot(
     let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(tuna_tui::engine::YtExpander);
 
     let (ev_tx, ev_rx) = flume::unbounded::<EngineEvent>();
-    let engine = engine::run(ev_tx, engine_meta_tx, init_vol, expander).context("start engine")?;
+    let buffer_secs =
+        buffer_duration_secs.unwrap_or_else(|| tuna_tui::config::get().buffer_duration_secs);
+    let engine = engine::run(ev_tx, engine_meta_tx, init_vol, buffer_secs, expander)
+        .context("start engine")?;
 
     // The one positional argument is a yt: URI (or bare YouTube URL/playlist).
-    // It always wins over a
-    // persisted session; `theme` never reaches here (see `main`).
-    let startup_uri = std::env::args().nth(1).filter(|a| a != "theme");
+    // It always wins over a persisted session; player flags were stripped and
+    // `theme` never reaches here (see `main`).
     if let Some(uri) = startup_uri.as_ref() {
         let _ = engine.play_context(uri.clone(), false);
         // The URI path never sees a `Playing`-handler reapply (the boot is
@@ -593,6 +706,16 @@ async fn run_ui(
                     // The resolve finished (or its timeout path failed): a
                     // fresh request can go out again.
                     app.session.radio_in_flight = false;
+                    // The user may have started something else while the
+                    // expansion ran (browse play, drill-in, liked list) —
+                    // every play path rewrites `transport.source`. A late
+                    // radio outcome must apply to nothing: not the queue
+                    // (zombie radio overriding the user's choice), and not
+                    // the status line (it would speak for a station the user
+                    // abandoned).
+                    if !radio_still_wanted(&app.transport.source) {
+                        continue;
+                    }
                     match rad {
                         Ok(radio) if !radio.uris.is_empty() => {
                             if let Err(e) = app.svc.engine.play_tracks(radio.uris, None, radio.start_position_ms, false) {
@@ -922,6 +1045,10 @@ fn resume_source(app: &mut App, radio_tx: &flume::Sender<Result<Radio, String>>)
 
     match app.transport.source.clone() {
         PlaySource::Context(ctx) => {
+            // The expansion is async now (bead Myx-a4.8): say what is
+            // happening while the worker fills the queue; failures arrive as
+            // EngineEvent::LoadFailed.
+            app.status = "loading playlist…".to_string();
             if let Err(e) = app
                 .svc
                 .engine

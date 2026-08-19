@@ -18,6 +18,7 @@
 pub mod expander;
 mod ffmpeg_source;
 
+use std::collections::VecDeque;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +56,14 @@ pub enum EngineEvent {
     Reconnecting,
     /// Playback control works again; the stream was restarted from its position.
     Reconnected,
+    /// A context load (playlist/channel/album expansion) failed on the worker.
+    /// The facade can no longer return the error — expansion is off the
+    /// caller's thread (bead Myx-a4.8) — so it arrives here instead, with the
+    /// context uri and a user-facing message.
+    LoadFailed {
+        uri: String,
+        message: String,
+    },
     PositionCorrection {
         uri: String,
         position_ms: u32,
@@ -95,11 +104,19 @@ pub struct Engine {
 }
 
 /// Commands the facade hands the worker. `Load` carries a fully-expanded
-/// queue — expansion happens in the facade so a resolve failure surfaces as
-/// the caller's `Err`.
+/// queue; `LoadContext` carries a context URI the worker expands on a helper
+/// thread so the caller never blocks on pagination (bead Myx-a4.8), with the
+/// result fenced by generation and the chain cancellable like the radio path.
+/// Expansion failures surface as [`EngineEvent::LoadFailed`].
 enum Cmd {
     Load {
         tracks: Vec<String>,
+        start_uri: Option<String>,
+        position_ms: u32,
+        shuffle: bool,
+    },
+    LoadContext {
+        context_uri: String,
         start_uri: Option<String>,
         position_ms: u32,
         shuffle: bool,
@@ -118,6 +135,271 @@ enum Cmd {
     Stop,
     /// Watchdog-initiated stream recovery (stall or decode failure).
     Recover,
+}
+
+/// The outcome of a `Cmd::LoadContext` expansion, posted back on its own
+/// channel so a long expansion cannot keep the command channel — and the
+/// worker's exit — alive. `gen` fences superseded loads: a result tagged
+/// with an older generation is dropped.
+struct LoadResult {
+    gen: u64,
+    context_uri: String,
+    tracks: Result<Vec<String>, String>,
+    start_uri: Option<String>,
+    position_ms: u32,
+    shuffle: bool,
+}
+
+/// Generation + cancellation bookkeeping for context loads (bead Myx-a4.8).
+/// Every `begin` supersedes the previous load — flipping its cancel flag so
+/// the orphaned yt-dlp chain stops spawning children (the F13 pattern) — and
+/// hands out a fresh flag. Results are fenced by generation: the last load
+/// wins even when an earlier expansion finishes late. Kept as its own type
+/// so the rules are unit-testable without an engine.
+struct LoadGate {
+    gen: u64,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl LoadGate {
+    fn new() -> Self {
+        Self {
+            gen: 0,
+            cancel: None,
+        }
+    }
+
+    /// Begin a new context load. Returns the new generation and its fresh
+    /// cancel flag (never set, unless superseded or torn down).
+    fn begin(&mut self) -> (u64, Arc<AtomicBool>) {
+        self.gen = self.gen.wrapping_add(1);
+        if let Some(prev) = self.cancel.take() {
+            prev.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(Arc::clone(&cancel));
+        (self.gen, cancel)
+    }
+
+    /// Is `gen` the current load? A current result clears the flag (the load
+    /// finished); a stale one leaves everything alone.
+    fn is_current(&mut self, gen: u64) -> bool {
+        if gen != self.gen {
+            return false;
+        }
+        self.cancel = None;
+        true
+    }
+
+    /// The engine is going away: stop any in-flight chain.
+    fn cancel_inflight(&mut self) {
+        if let Some(c) = self.cancel.take() {
+            c.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A queued metadata delivery: the resolved track whose cover/theme derive
+/// still needs shipping to the app.
+struct MetaJob {
+    uri: String,
+    info: ResolvedTrack,
+}
+
+/// Delivery-side dedup: a job whose uri matches the last DELIVERED one is a
+/// recovery re-push of an already-covered track (F6 — one record_played /
+/// cover / theme per play session). "Queued" is NOT "delivered": a full
+/// queue drops the oldest job (see [`MetaQueue::push`]), so a recovery's
+/// re-push is the authoritative second chance for a dropped metadata job —
+/// skipping duplicates here instead of at push time keeps both guarantees:
+/// the current track's metadata always ships, and the app never gets the
+/// same uri twice in a row.
+fn is_duplicate_delivery(last_sent: Option<&str>, job_uri: &str) -> bool {
+    last_sent == Some(job_uri)
+}
+
+/// Metadata jobs a single worker still owes (audit F6, bead Myx-a7o):
+/// bounded FIFO, oldest dropped on overflow. FIFO order among the survivors
+/// matters — the app's `meta_is_current` guard relies on delivery order.
+const META_QUEUE_CAP: usize = 16;
+
+/// The queue half of the metadata worker, split out so the boundedness and
+/// drop rules are unit-testable without threads.
+///
+/// The current track's job is PINNED: an eviction never picks it. A queued
+/// job for any other track is re-pushed when that track starts, so losing
+/// it at cap pressure only costs a re-fetch later — but the track that is
+/// PLAYING has no second chance (its recovery rebuilt once; the delivery-
+/// side dedup can't conjure a job that never delivered). Dropping the
+/// oldest non-pinned job still respects FIFO among the survivors, which is
+/// what the app's `meta_is_current` ordering guard needs.
+struct MetaQueue {
+    inner: Mutex<VecDeque<MetaJob>>,
+    /// The uri whose queued job must never be evicted — the current track,
+    /// written by `build_stream` before each push.
+    pinned: Mutex<Option<String>>,
+}
+
+impl MetaQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::with_capacity(META_QUEUE_CAP)),
+            pinned: Mutex::new(None),
+        }
+    }
+
+    /// The track whose metadata must survive queue pressure.
+    fn set_pinned(&self, uri: Option<String>) {
+        *self.pinned.lock().unwrap() = uri;
+    }
+
+    /// Push a job. Same-uri jobs CONSOLIDATE (a re-push replaces the stale
+    /// copy instead of stacking — duplicates would burn cap slots, the
+    /// fuel of the double-eviction cascade). A full queue then evicts the
+    /// oldest NON-pinned job, keeping the currently-playing track's
+    /// metadata shippable; only if every queued job were the pinned uri
+    /// (impossible after consolidation) does the head go.
+    fn push(&self, job: MetaJob) {
+        let mut q = self.inner.lock().unwrap();
+        if let Some(i) = q.iter().position(|j| j.uri == job.uri) {
+            q.remove(i);
+        }
+        q.push_back(job);
+        if q.len() > META_QUEUE_CAP {
+            let pin = self.pinned.lock().unwrap().clone();
+            let victim = q
+                .iter()
+                .position(|j| Some(&j.uri) != pin.as_ref())
+                .unwrap_or(0);
+            q.remove(victim);
+        }
+    }
+
+    fn pop(&self) -> Option<MetaJob> {
+        self.inner.lock().unwrap().pop_front()
+    }
+}
+
+/// One persistent metadata worker owned by the engine. Every resolved track
+/// used to spawn a fresh detached "tuna-meta" thread — at track start AND at
+/// every successful recovery rebuild — each re-fetching (httpcache), decoding
+/// and re-theming the unchanged cover, and re-running the app's
+/// `record_played` (Home count inflation). Now one thread drains the bounded
+/// queue; `push` never blocks the command loop (a full queue drops the
+/// oldest job instead of stalling the worker's state machine).
+struct MetaWorker {
+    queue: Arc<MetaQueue>,
+    /// Coalesced wakeups: pushes `try_send`; the thread drains until empty.
+    wake_tx: flume::Sender<()>,
+}
+
+impl MetaWorker {
+    fn spawn(client: reqwest::blocking::Client, meta_tx: flume::Sender<EngineMeta>) -> Self {
+        // The queue is shared with the thread (which pops) and the pushes.
+        let queue = Arc::new(MetaQueue::new());
+        let (wake_tx, wake_rx) = flume::bounded::<()>(1);
+        let q = Arc::clone(&queue);
+        std::thread::Builder::new()
+            .name("tuna-meta".into())
+            .spawn(move || {
+                // The wake channel disconnects when the meta worker drops
+                // (engine teardown) — the thread exits with it. Dedup lives
+                // HERE (delivery side), not at push time: the queue is
+                // best-effort (a full queue drops the oldest job), so
+                // "queued" is not "delivered" and a push-side skip could
+                // permanently lose the current track's metadata. The
+                // recovery re-push in build_stream always lands; a
+                // consecutive same-uri pair is the duplicate worth
+                // dropping.
+                let mut last_sent: Option<String> = None;
+                while wake_rx.recv().is_ok() {
+                    while let Some(job) = q.pop() {
+                        if is_duplicate_delivery(last_sent.as_deref(), &job.uri) {
+                            continue;
+                        }
+                        let meta = engine_meta(&job.uri, &job.info, &client);
+                        if meta_tx.send(meta).is_err() {
+                            return; // the app is gone — queued jobs are worthless
+                        }
+                        last_sent = Some(job.uri);
+                    }
+                }
+            })
+            .expect("spawn meta worker");
+        Self { queue, wake_tx }
+    }
+
+    /// Queue a metadata delivery for `uri` and pin it as the current
+    /// track's — a full queue may evict anything except this job (the
+    /// playing track has no second chance; every other track re-pushes on
+    /// its own start).
+    fn push(&self, uri: String, info: ResolvedTrack) {
+        self.queue.set_pinned(Some(uri.clone()));
+        self.queue.push(MetaJob { uri, info });
+        // Coalesced: one wake per drain cycle is enough.
+        let _ = self.wake_tx.try_send(());
+    }
+}
+
+/// What a landed context-load result did to the player.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoadDisposition {
+    /// The queue was replaced — an in-flight recovery of the old track is
+    /// moot.
+    Applied,
+    /// The result belonged to a superseded generation; a newer load's own
+    /// result will (or already did) replace the queue.
+    Fenced,
+    /// The load failed: the queue still belongs to the old track.
+    Failed,
+}
+
+/// Remove `dead` from the queue (and its history rows, shifting survivors
+/// past the slot) and return the slot to start next: the replacement
+/// occupant of the removed slot when one exists, the queue head when repeat
+/// is on and the queue rolled over, or `None` when the queue is over. Pure
+/// queue bookkeeping — the playback branch of [`Worker::give_up_on`] —
+/// extracted so the skip logic is testable offline.
+fn successor_slot(
+    tracks: &mut Vec<String>,
+    history: &mut Vec<usize>,
+    repeat: bool,
+    cursor: usize,
+    dead: &str,
+) -> Option<usize> {
+    // Cursor-anchored, like the original: normally `dead` sits at the
+    // cursor and the slot is removed; a duplicate elsewhere keeps the
+    // cursor slot and retains the dead uri out of the rest of the queue.
+    let slot = if tracks.get(cursor).map(String::as_str) == Some(dead) {
+        tracks.remove(cursor);
+        cursor
+    } else {
+        tracks.retain(|t| t != dead);
+        cursor
+    };
+    // History indices shift past the removed slot.
+    history.retain(|&h| h != slot);
+    for h in history {
+        if *h > slot {
+            *h -= 1;
+        }
+    }
+    if slot < tracks.len() {
+        Some(slot)
+    } else if repeat && !tracks.is_empty() {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Does a landed load result end the in-flight recovery of the old track?
+/// `Applied` replaces the queue outright; `Fenced` means the newer load's
+/// result is ahead and will replace it. `Failed` does not — no replacement
+/// happened, so the recovery must keep going or the player is left silent
+/// forever (`current` gone, `recovery` armed, watchdog off).
+fn supersedes_recovery(d: LoadDisposition) -> bool {
+    matches!(d, LoadDisposition::Applied | LoadDisposition::Fenced)
 }
 
 /// The local queue: the loaded context plus a replay history for `prev`.
@@ -147,6 +429,10 @@ struct CurrentTrack {
     done: std::sync::mpsc::Receiver<()>,
     /// Per-channel samples delivered (the playhead authority).
     frames: Arc<AtomicU64>,
+    /// Stereo frames DECODED from the pump (the liveness signal). The source
+    /// increments it in `fold`; the watchdog refreshes its stall clock when
+    /// either counter advances, so a slow-but-working pre-roll is alive.
+    sourced: Arc<AtomicU64>,
     /// Shared with the source; flipped before killing the child so the old
     /// sound ends on the next callback instead of draining its backlog.
     cancelled: Arc<AtomicBool>,
@@ -172,6 +458,35 @@ struct Health {
     last_progress: Instant,
 }
 
+/// Re-anchor the watchdog clock when the playhead OR the decoder made
+/// progress; returns whether either did. The decode counter exists because
+/// the pre-roll gate holds pops by design: a slow-but-working link filling a
+/// deep buffer advances `sourced` without a single delivered frame, and must
+/// not look stalled — or the watchdog tears the stream down and the rebuild
+/// restarts the gate, silence forever on the exact links the buffer is for.
+/// A genuinely dead pipeline (ffmpeg hung, network dead) advances neither,
+/// and still fires after [`STALL_AFTER`].
+fn refresh_progress(
+    health: &Mutex<Health>,
+    last_seen_frames: &mut u64,
+    last_seen_sourced: &mut u64,
+    frames: &AtomicU64,
+    sourced: &AtomicU64,
+) -> bool {
+    let f = frames.load(Ordering::Relaxed);
+    let s = sourced.load(Ordering::Relaxed);
+    if f != *last_seen_frames || s != *last_seen_sourced {
+        *last_seen_frames = f;
+        *last_seen_sourced = s;
+        if let Ok(mut h) = health.lock() {
+            h.last_progress = Instant::now();
+        }
+        true
+    } else {
+        false
+    }
+}
+
 impl Engine {
     /// The one `Cmd::Load` construction all play-entry points share.
     fn load(
@@ -191,14 +506,22 @@ impl Engine {
 
     /// Start a context (playlist / album / artist / track URI). When
     /// `shuffle` is set, the whole expanded context shuffles locally.
+    ///
+    /// Non-blocking: the expansion (which can paginate for minutes on a big
+    /// or stalled playlist) runs on a helper thread, so the caller's UI never
+    /// freezes (bead Myx-a4.8). Failures arrive as
+    /// [`EngineEvent::LoadFailed`]; the `Err` here means the engine is gone.
     pub fn play_context(&self, context_uri: impl Into<String>, shuffle: bool) -> Result<()> {
-        let uri = context_uri.into();
-        let tracks = self.inner.expander.expand(&uri).map_err(|e| anyhow!(e))?;
-        self.load(tracks, None, 0, shuffle)
+        self.send(Cmd::LoadContext {
+            context_uri: context_uri.into(),
+            start_uri: None,
+            position_ms: 0,
+            shuffle,
+        })
     }
 
     /// Load a context and start at a specific track + position (context
-    /// resume).
+    /// resume). Non-blocking, like [`Engine::play_context`].
     pub fn play_context_at(
         &self,
         context_uri: String,
@@ -206,12 +529,12 @@ impl Engine {
         position_ms: u32,
         shuffle: bool,
     ) -> Result<()> {
-        let tracks = self
-            .inner
-            .expander
-            .expand(&context_uri)
-            .map_err(|e| anyhow!(e))?;
-        self.load(tracks, track_uri, position_ms, shuffle)
+        self.send(Cmd::LoadContext {
+            context_uri,
+            start_uri: track_uri,
+            position_ms,
+            shuffle,
+        })
     }
 
     /// Play an explicit list of track URIs as a queue. `start_uri` picks the
@@ -335,10 +658,26 @@ const MIN_EOF_POSITION_MS: u32 = 5_000;
 /// we keep retrying this track before walking away" — one number, so tuning
 /// it can't leave the two paths disagreeing about when to give up.
 const RECOVERY_ATTEMPTS: u32 = 8;
+/// A fresh start gets exactly this many consecutive build attempts before
+/// the skip policy treats the track as unplayable (Myx-a4e.10, issue #19).
+/// Resolve failures mix permanent (deleted video) and transient (dead
+/// socket F17, bot-gate, DNS blip) causes, and yt-dlp errors are untyped —
+/// one immediate re-attempt is the cheapest large win on both: a deleted
+/// video fails fast twice, a transient blip recovers on the second attempt,
+/// and no minutes of dead air are spent either way.
+const FRESH_START_ATTEMPTS: u32 = 2;
 /// First and last wait between failed recovery attempts, so an offline spell
 /// doesn't hammer the resolver every five seconds until dawn.
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(120);
+
+/// The skip policy's decision point: give up on a fresh start after
+/// [`FRESH_START_ATTEMPTS`] consecutive build failures. Extracted so the
+/// count is pinned by tests — a change of policy has to change the number
+/// here and the test with it.
+fn fresh_start_gives_up_after(attempt: u32) -> bool {
+    attempt >= FRESH_START_ATTEMPTS
+}
 /// Worker loop wakeup: drains commands, watches for EOF, emits position.
 const TICK: Duration = Duration::from_millis(100);
 /// How often the worker emits a [`EngineEvent::PositionCorrection`] while
@@ -387,6 +726,7 @@ pub fn run(
     events: flume::Sender<EngineEvent>,
     meta_tx: flume::Sender<EngineMeta>,
     initial_volume_pct: u8,
+    buffer_duration_secs: u8,
     expander: Arc<dyn Expander>,
 ) -> Result<Engine> {
     let bands = VisBands::shared();
@@ -397,6 +737,8 @@ pub fn run(
         last_progress: Instant::now(),
     }));
 
+    let (load_tx, load_rx) = flume::unbounded::<LoadResult>();
+
     let queue_snapshot = Arc::new(Mutex::new(Vec::new()));
     let worker = Worker {
         sink,
@@ -404,7 +746,7 @@ pub fn run(
         queue,
         bands: Arc::clone(&bands),
         events,
-        meta_tx,
+        meta_worker: MetaWorker::spawn(crate::httpcache::blocking_client().clone(), meta_tx),
         cmds: cmds_rx,
         expander: Arc::clone(&expander),
         queue_snapshot: Arc::clone(&queue_snapshot),
@@ -419,12 +761,14 @@ pub fn run(
         },
         current: None,
         health: Arc::clone(&health),
+        prebuffer_samples: crate::config::prebuffer_samples(buffer_duration_secs.clamp(1, 30)),
         drop_streak: 0,
         last_seen_frames: 0,
+        last_seen_sourced: 0,
+        load_gate: LoadGate::new(),
+        load_tx,
+        load_rx,
         last_correction: Instant::now(),
-        // Cloning the once-built blocking client (Arc-fee) — constructed by
-        // `httpcache::warm_blocking_client` before the runtime started.
-        client: crate::httpcache::blocking_client().clone(),
         pending: None,
         recovery: None,
         paused: None,
@@ -484,7 +828,12 @@ struct Worker {
     queue: Arc<rodio::queue::SourcesQueueInput>,
     bands: Arc<Mutex<VisBands>>,
     events: flume::Sender<EngineEvent>,
-    meta_tx: flume::Sender<EngineMeta>,
+    /// The bounded metadata worker every resolved track's cover/theme derive
+    /// is queued on (audit F6 — was a fresh detached thread per start AND
+    /// per recovery rebuild).
+    meta_worker: MetaWorker,
+    /// The uri whose metadata is queued or delivered; a recovery rebuild of
+    /// the same uri must not queue a duplicate (F6).
     cmds: flume::Receiver<Cmd>,
     expander: Arc<dyn Expander>,
     /// The public mirror of the loaded list (`Engine::queue`).
@@ -497,8 +846,10 @@ struct Worker {
     drop_streak: u32,
     /// The last frame count seen (stall detection needs deltas).
     last_seen_frames: u64,
+    /// The last decode-side count seen; a pre-roll filling slowly advances
+    /// this while `last_seen_frames` sits still.
+    last_seen_sourced: u64,
     last_correction: Instant,
-    client: reqwest::blocking::Client,
     /// A user command that pre-empted a recovery retry-sleep; handled before
     /// anything queued behind it.
     pending: Option<Cmd>,
@@ -511,6 +862,21 @@ struct Worker {
     /// transition out of the pause state (next/prev/stop/load/teardown) so it
     /// can never resurrect a stale stream on a later resume.
     paused: Option<PausedTrack>,
+    /// The pre-roll depth in float samples (from `config.buffer_duration_secs`,
+    /// clamped 1..=30). This is the gate each `FfmpegSource` holds until that
+    /// much audio is buffered, and the window the watchdog exempts from its
+    /// stall clock.
+    prebuffer_samples: usize,
+    /// Generation + cancellation for `Cmd::LoadContext` expansions: the last
+    /// load wins (stale results fenced out) and its superseded chain is
+    /// cancelled (the F13 pattern).
+    load_gate: LoadGate,
+    /// The expand thread posts its `LoadResult` here instead of the command
+    /// channel, so a long expansion cannot keep the worker's `recv` from ever
+    /// seeing `Disconnected` (a sender clone would delay teardown for the
+    /// whole fetch).
+    load_tx: flume::Sender<LoadResult>,
+    load_rx: flume::Receiver<LoadResult>,
 }
 
 impl Worker {
@@ -532,6 +898,12 @@ impl Worker {
                     }
                 }
             }
+            // Context-load results land on their own channel — a sender clone
+            // on the command channel would keep this `recv` from ever seeing
+            // `Disconnected` while a long expansion runs. Non-blocking drain.
+            while let Ok(r) = self.load_rx.try_recv() {
+                self.handle_load_result(r);
+            }
         }
         self.teardown();
     }
@@ -542,13 +914,13 @@ impl Worker {
         // borrow of `current` is released (`track_ended` needs `&mut self`).
         let mut ended = false;
         if let Some(cur) = self.current.as_mut() {
-            let f = cur.frames.load(Ordering::Relaxed);
-            if f != self.last_seen_frames {
-                self.last_seen_frames = f;
-                if let Ok(mut h) = self.health.lock() {
-                    h.last_progress = Instant::now();
-                }
-            }
+            refresh_progress(
+                &self.health,
+                &mut self.last_seen_frames,
+                &mut self.last_seen_sourced,
+                &cur.frames,
+                &cur.sourced,
+            );
             // Track end: rodio fired the sound-done signal.
             ended = cur.done.try_recv().is_ok();
             if !ended && self.state.playing && self.last_correction.elapsed() >= POSITION_EVERY {
@@ -590,6 +962,67 @@ impl Worker {
         }
     }
 
+    /// The shared tail of `Cmd::Load` and a landed `LoadResult`: replace the
+    /// queue, reset the player state and start at `start_uri` (or the top).
+    fn apply_load(
+        &mut self,
+        tracks: Vec<String>,
+        start_uri: Option<String>,
+        position_ms: u32,
+        shuffle: bool,
+    ) {
+        self.shutdown_current();
+        // A fresh context supersedes any in-flight recovery.
+        self.recovery = None;
+        let start = start_uri
+            .as_deref()
+            .and_then(|u| tracks.iter().position(|t| t == u))
+            .unwrap_or(0);
+        if let Ok(mut q) = self.queue_snapshot.lock() {
+            *q = tracks.clone();
+        }
+        self.state = PlayerState {
+            // `start` is the cursor: advance picks up after the first
+            // track, and history grows from it — not from 0.
+            tracks,
+            cursor: start,
+            history: Vec::new(),
+            shuffle,
+            repeat: self.state.repeat,
+            volume: self.state.volume,
+            playing: true,
+        };
+        self.start_track_at(start, position_ms);
+    }
+
+    /// A context expansion finished (or failed) on its helper thread. Stale
+    /// generations are dropped — a newer load superseded this one — and an
+    /// expansion error surfaces as [`EngineEvent::LoadFailed`] since the
+    /// facade already returned. Returns what the result did to the player so
+    /// the recovery loop can decide whether its track is still the truth.
+    fn handle_load_result(&mut self, r: LoadResult) -> LoadDisposition {
+        if !self.load_gate.is_current(r.gen) {
+            return LoadDisposition::Fenced; // superseded — the current load's own result decides
+        }
+        match r.tracks {
+            Ok(tracks) => {
+                self.apply_load(tracks, r.start_uri, r.position_ms, r.shuffle);
+                LoadDisposition::Applied
+            }
+            Err(message) => {
+                liblog(format!(
+                    "engine: context load failed for {}: {message}",
+                    r.context_uri
+                ));
+                let _ = self.events.send(EngineEvent::LoadFailed {
+                    uri: r.context_uri,
+                    message,
+                });
+                LoadDisposition::Failed
+            }
+        }
+    }
+
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Load {
@@ -597,29 +1030,33 @@ impl Worker {
                 start_uri,
                 position_ms,
                 shuffle,
+            } => self.apply_load(tracks, start_uri, position_ms, shuffle),
+            Cmd::LoadContext {
+                context_uri,
+                start_uri,
+                position_ms,
+                shuffle,
             } => {
-                self.shutdown_current();
-                // A fresh context supersedes any in-flight recovery.
-                self.recovery = None;
-                let start = start_uri
-                    .as_deref()
-                    .and_then(|u| tracks.iter().position(|t| t == u))
-                    .unwrap_or(0);
-                if let Ok(mut q) = self.queue_snapshot.lock() {
-                    *q = tracks.clone();
-                }
-                self.state = PlayerState {
-                    // `start` is the cursor: advance picks up after the first
-                    // track, and history grows from it — not from 0.
-                    tracks,
-                    cursor: start,
-                    history: Vec::new(),
-                    shuffle,
-                    repeat: self.state.repeat,
-                    volume: self.state.volume,
-                    playing: true,
-                };
-                self.start_track_at(start, position_ms);
+                // Bump the generation and cancel the previous in-flight
+                // expansion: the last load wins, and the orphaned chain stops
+                // spawning yt-dlp children (the F13 pattern, LoadGate).
+                let (gen, cancel) = self.load_gate.begin();
+                let tx = self.load_tx.clone();
+                let expander = Arc::clone(&self.expander);
+                std::thread::Builder::new()
+                    .name("context-expand".into())
+                    .spawn(move || {
+                        let tracks = expander.expand(&context_uri, cancel);
+                        let _ = tx.send(LoadResult {
+                            gen,
+                            context_uri,
+                            tracks,
+                            start_uri,
+                            position_ms,
+                            shuffle,
+                        });
+                    })
+                    .expect("spawn context expand");
             }
             Cmd::Resume => {
                 if !self.state.playing && self.current.is_none() {
@@ -834,10 +1271,7 @@ impl Worker {
             let _ = cur.child.wait();
             self.drop_streak += 1;
             if self.drop_streak >= RECOVERY_ATTEMPTS {
-                liblog(format!(
-                    "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
-                ));
-                self.give_up_on(uri);
+                self.give_up_on(uri, &format!("{RECOVERY_ATTEMPTS} consecutive failed EOFs"));
                 return;
             }
             if dropped {
@@ -855,38 +1289,27 @@ impl Worker {
         self.advance();
     }
 
-    /// The track is given up on after too many consecutive failures: remove it
-    /// from the queue (keeping the queue view mirror in sync) and play its
-    /// successor — or stop cleanly when the queue is over and repeat is off,
-    /// mirroring `advance()`'s queue-exhausted behavior.
-    fn give_up_on(&mut self, uri: String) {
+    /// Give up on `uri`: remove it from the queue (keeping the queue view
+    /// mirror in sync) and play its successor — or stop cleanly when the
+    /// queue is over and repeat is off, mirroring `advance()`'s behavior.
+    /// Two callers: a track that exceeded the EOF-recovery budget, and a
+    /// fresh start whose stream could never be built (Myx-a4e.10 — skipping
+    /// beats a minute of dead air). `reason` lands in the log.
+    fn give_up_on(&mut self, uri: String, reason: &str) {
         self.recovery = None;
         self.drop_streak = 0;
-        let dead = self.state.cursor;
-        if dead < self.state.tracks.len() && self.state.tracks[dead] == uri {
-            self.state.tracks.remove(dead);
-        } else {
-            self.state.tracks.retain(|t| *t != uri);
-        }
-        // History indices shift past the removed slot.
-        self.state.history.retain(|&h| h != dead);
-        for h in &mut self.state.history {
-            if *h > dead {
-                *h -= 1;
-            }
-        }
+        let next = successor_slot(
+            &mut self.state.tracks,
+            &mut self.state.history,
+            self.state.repeat,
+            self.state.cursor,
+            &uri,
+        );
         *self.queue_snapshot.lock().unwrap() = self.state.tracks.clone();
-        liblog(format!(
-            "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
-        ));
-        if self.state.tracks.is_empty() {
-            self.stop_tail();
-        } else if dead < self.state.tracks.len() {
-            self.start_track_at(dead, 0);
-        } else if self.state.repeat {
-            self.start_track_at(0, 0);
-        } else {
-            self.stop_tail();
+        liblog(format!("engine: giving up on {uri}: {reason}"));
+        match next {
+            Some(idx) => self.start_track_at(idx, 0),
+            None => self.stop_tail(),
         }
     }
 
@@ -938,12 +1361,29 @@ impl Worker {
                         self.pending = Some(pre);
                         return;
                     }
+                    // A context load landed during the backoff. Only a
+                    // result that replaces the queue ends the recovery —
+                    // `Applied` (this load owns the stage) or `Fenced` (a
+                    // newer load's result behind it will). A `Failed` load
+                    // must NOT: the queue still belongs to the old track,
+                    // and abandoning the recovery there leaves `current`
+                    // gone, `recovery` armed, `playing` true and the
+                    // watchdog off — a silent dead player that only a stop,
+                    // next or fresh load can revive.
+                    if let Ok(r) = self.load_rx.try_recv() {
+                        if supersedes_recovery(self.handle_load_result(r)) {
+                            return;
+                        }
+                    }
                     backoff = next_backoff(backoff);
                 }
             }
         }
         self.recovery = None;
-        self.give_up_on(uri);
+        self.give_up_on(
+            uri,
+            &format!("{RECOVERY_ATTEMPTS} failed recovery attempts"),
+        );
     }
 
     /// Stop playback and reset every track-related state: cancel the current
@@ -1012,10 +1452,29 @@ impl Worker {
         let _ = self
             .events
             .send(EngineEvent::TrackChanged { uri: uri.clone() });
-
-        if let Err(e) = self.build_stream(&uri, pos, true) {
-            liblog(format!("engine: start {uri} failed: {e}"));
-            self.recover_into(uri, pos);
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            match self.build_stream(&uri, pos, true) {
+                Ok(()) => break,
+                Err(e) => {
+                    liblog(format!(
+                        "engine: start {uri} failed (attempt {attempts}): {e}"
+                    ));
+                    // One immediate re-attempt before the skip applies:
+                    // resolve() failures are NOT all permanent — a dead
+                    // socket (F17), a bot-gate or a DNS blip at fresh start
+                    // is transient, and recover_into's 5-120s ladder (built
+                    // for mid-track drops) was the only thing that used to
+                    // absorb it. The skip must not delete a playable track
+                    // on a blip; a deleted video fails fast on both attempts
+                    // (Myx-a4e.10 / issue #19).
+                    if fresh_start_gives_up_after(attempts) {
+                        self.give_up_on(uri, "fresh build failed twice — skipping");
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1037,12 +1496,15 @@ impl Worker {
         let pos = truncate_seconds(pos);
         let (child, stdout) = spawn_ffmpeg(url, pos)?;
         let frames = Arc::new(AtomicU64::new(0));
+        let sourced = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let source = FfmpegSource::new(
             stdout,
             Arc::clone(&frames),
+            Arc::clone(&sourced),
             Arc::clone(&self.bands),
             Arc::clone(&cancelled),
+            self.prebuffer_samples,
         );
         let done = self.queue.append_with_signal(source);
         if play {
@@ -1058,9 +1520,11 @@ impl Worker {
             child,
             done,
             frames,
+            sourced,
             cancelled,
         });
         self.last_seen_frames = 0;
+        self.last_seen_sourced = 0;
         self.set_health(play);
         self.set_active(play);
         self.last_correction = Instant::now();
@@ -1086,23 +1550,21 @@ impl Worker {
                 position_ms: pos,
             }
         });
-        // In-band metadata for every resolved track (the app has no other metadata
-        // source since the Web API died). Sent on a detached thread — the cover
-        // fetch + theme derive must not block the worker's state machine while
-        // a slow request stalls.
-        let metatx = self.meta_tx.clone();
-        let client = self.client.clone();
-        let u = uri.to_string();
-        let info = resolved.clone();
-        if std::thread::Builder::new()
-            .name("tuna-meta".into())
-            .spawn(move || {
-                let _ = metatx.send(engine_meta(&u, &info, &client));
-            })
-            .is_err()
-        {
-            liblog("engine: failed to spawn meta thread");
-        }
+        // In-band metadata for every resolved track (the app has no other
+        // metadata source since the Web API died) — queued on the bounded
+        // meta worker, so the cover fetch + theme derive never block the
+        // worker's state machine (audit F6 / bead Myx-a7o: was a fresh
+        // detached thread per track start AND per recovery rebuild).
+        //
+        // EVERY successful build queues — fresh start or recovery rebuild —
+        // and the meta thread's delivery-side dedup turns a same-uri
+        // duplicate into a no-op. The queue is best-effort (drop-oldest on
+        // overflow), so "queued" is not "delivered": if the fresh job lost
+        // its slot to the cap, the recovery's re-push is the metadata's
+        // second chance — the old push-side `meta_queued` skip permanently
+        // lost the current track's cover/theme and Home history exactly in
+        // that drop-then-stall case.
+        self.meta_worker.push(uri.to_string(), resolved);
         Ok(())
     }
 
@@ -1157,6 +1619,9 @@ impl Worker {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
         }
+        // Stop any in-flight context expansion's yt-dlp chain — its result is
+        // worthless once the engine is gone.
+        self.load_gate.cancel_inflight();
         self.paused = None;
         self.set_active(false);
         self.set_health(false);
@@ -1210,12 +1675,67 @@ fn truncate_seconds(pos: u32) -> u32 {
 
 /// Build in-band metadata for a yt: track, fetching its cover + theme the
 /// same way the api layer did (httpcache-keyed, 24 h TTL).
+/// Cover consumers re-sample at terminal scale (ratatui-image) and the
+/// theme palette is dominated by large regions — neither needs the source
+/// JPEG's resolution (usually 1280px). Downscale once, at the source: the
+/// shipped/cached EngineMeta carries ~1/16 of the pixels, and
+/// derive_theme runs on the small image (Myx-o0g). Shrinking the derive
+/// cost also shortens the meta thread's per-job latency — the drain
+/// window behind the cascade bead. Pinned by `covers_are_capped_before_shipping`.
+fn downscale_cover(img: image::DynamicImage) -> image::DynamicImage {
+    img.thumbnail(320, 320)
+}
+
 fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client) -> EngineMeta {
+    // Spotify canonical metadata enriches the YouTube-derived row: the
+    // query is the raw resolved title ("Artist — Title" flat rows parse
+    // straight in), a hit wins for title/artist/album, and its duration
+    // also corrects the YouTube-length drift that makes lrclib exact-
+    // duration matching miss (Myx-a4e.7). A miss degrades silently — the
+    // keyless route can be throttled at any time and nothing depends on it.
+    let spot = {
+        let query = if r.artist.is_empty() {
+            r.title.clone()
+        } else {
+            format!("{} {}", r.artist, r.title)
+        };
+        // Confidence gate on the hit (itunes::artist_overlap): a fuzzy
+        // search's top hit can be a DIFFERENT song, and only an
+        // artist-overlapping hit may override the row — wrongness is not
+        // the same as failure (the search `None`s on failure; this gates
+        // on wrongness).
+        match crate::itunes::search_track(client, &query) {
+            Some(s) if crate::itunes::artist_overlap(&r.artist, &r.title, &s.artist) => Some(s),
+            _ => None,
+        }
+    };
+    let (title, artist, album, duration_ms) = match &spot {
+        Some(s) => (
+            s.title.clone(),
+            s.artist.clone(),
+            s.album.clone(),
+            s.duration_ms,
+        ),
+        None => (
+            r.title.clone(),
+            r.artist.clone(),
+            r.album.clone().unwrap_or_default(),
+            r.duration_ms.unwrap_or(0),
+        ),
+    };
+    // Cover: the YouTube thumbnail is the primary source; when the track
+    // row has none (flat playlist rows often lack one), the Spotify hit's
+    // album art fills the gap — better covers, better themes, same cache.
+    let cover_url = r
+        .thumbnail
+        .as_deref()
+        .or(spot.as_ref().and_then(|s| s.artwork_url.as_deref()));
     let mut image = None;
     let mut theme = None;
-    if let Some(url) = &r.thumbnail {
+    if let Some(url) = cover_url {
         if let Some(bytes) = fetch_cover(client, url) {
             if let Ok(img) = image::load_from_memory(&bytes) {
+                let img = downscale_cover(img);
                 theme = Some(crate::reactive::derive_theme(&img, "album ✦"));
                 image = Some(img);
             }
@@ -1223,11 +1743,11 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
     }
     EngineMeta {
         uri: uri.to_string(),
-        title: r.title.clone(),
-        artist: r.artist.clone(),
-        album: r.album.clone().unwrap_or_default(),
-        duration_ms: r.duration_ms.unwrap_or(0),
-        image_url: r.thumbnail.clone(),
+        title,
+        artist,
+        album,
+        duration_ms,
+        image_url: cover_url.map(str::to_owned),
         image,
         theme,
     }
@@ -1252,6 +1772,421 @@ fn fetch_cover(client: &reqwest::blocking::Client, url: &str) -> Option<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The watchdog clock refreshes on decode progress while pops are gated
+    /// (the pre-roll), so a slow-but-working link filling a deep buffer is
+    /// never called a stall and torn down.
+    #[test]
+    fn decode_progress_refreshes_the_stall_clock_while_pops_are_gated() {
+        let health = Arc::new(Mutex::new(Health {
+            playing: true,
+            last_progress: Instant::now() - Duration::from_secs(60), // long-stale
+        }));
+        let frames = AtomicU64::new(0); // pops: gated, frozen
+        let sourced = AtomicU64::new(4096); // decoder: advancing
+        let (mut last_frames, mut last_sourced) = (0u64, 0u64);
+        let advanced = refresh_progress(
+            &health,
+            &mut last_frames,
+            &mut last_sourced,
+            &frames,
+            &sourced,
+        );
+        assert!(advanced, "decode progress must count as liveness");
+        assert!(
+            health.lock().unwrap().last_progress.elapsed() < Duration::from_secs(1),
+            "the clock must be re-anchored"
+        );
+    }
+
+    /// No progress at all leaves the clock stale: a dead pipeline still
+    /// fires after [`STALL_AFTER`].
+    #[test]
+    fn no_progress_leaves_the_stall_clock_stale() {
+        let health = Arc::new(Mutex::new(Health {
+            playing: true,
+            last_progress: Instant::now() - Duration::from_secs(60),
+        }));
+        let frames = AtomicU64::new(0);
+        let sourced = AtomicU64::new(0);
+        let (mut last_frames, mut last_sourced) = (0u64, 0u64);
+        let advanced = refresh_progress(
+            &health,
+            &mut last_frames,
+            &mut last_sourced,
+            &frames,
+            &sourced,
+        );
+        assert!(!advanced, "no progress is a stall");
+        assert!(
+            health.lock().unwrap().last_progress.elapsed() > Duration::from_secs(30),
+            "the clock must stay stale"
+        );
+    }
+
+    /// The context-load gate: every new load supersedes the previous one —
+    /// flipping its cancel flag so the orphaned yt-dlp chain stops spawning —
+    /// and stale generations are fenced out of the queue (bead Myx-a4.8).
+    /// The metadata queue (audit F6) is bounded and drops the OLDEST on
+    /// overflow, keeping FIFO order among the survivors — the ordering the
+    /// app's `meta_is_current` guard relies on.
+    #[test]
+    fn meta_queue_is_bounded_and_drops_the_oldest() {
+        let q = MetaQueue::new();
+        for i in 0..(META_QUEUE_CAP + 5) {
+            q.push(MetaJob {
+                uri: format!("u{i}"),
+                info: ResolvedTrack {
+                    url: String::new(),
+                    title: String::new(),
+                    artist: String::new(),
+                    album: None,
+                    duration_ms: None,
+                    thumbnail: None,
+                },
+            });
+        }
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        // The first five pushes were evicted; the newest cap-worth survive,
+        // in order.
+        let expected: Vec<String> = (5..META_QUEUE_CAP + 5).map(|i| format!("u{i}")).collect();
+        assert_eq!(seen, expected);
+    }
+
+    /// The queued≠delivered invariant: an overflow drop evicts a job, but a
+    /// recovery's re-push must still LAND behind everything currently
+    /// pending — delivery-side dedup (not push-side) is what keeps the
+    /// dropped track's metadata shippable.
+    #[test]
+    fn an_overflow_drop_does_not_erase_the_recovery_repush() {
+        let q = MetaQueue::new();
+        for i in 0..META_QUEUE_CAP {
+            q.push(MetaJob {
+                uri: format!("u{i}"),
+                info: ResolvedTrack {
+                    url: String::new(),
+                    title: String::new(),
+                    artist: String::new(),
+                    album: None,
+                    duration_ms: None,
+                    thumbnail: None,
+                },
+            });
+        }
+        // u0's fresh job is evicted by the next push...
+        q.push(MetaJob {
+            uri: "filler".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        // ...and the recovery of the stalled u0 re-pushes it: it must
+        // survive to delivery (it lands at the back of the FIFO).
+        q.push(MetaJob {
+            uri: "u0".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        assert!(
+            seen.iter().any(|u| u == "u0"),
+            "the recovery re-push must land even after its fresh job was dropped: {seen:?}"
+        );
+    }
+
+    /// The double-eviction cascade (bead): under sustained cap pressure —
+    /// a meta thread blocked in one slow fetch while a cap-worth of new
+    /// jobs lands — the current track's queued job must never be the
+    /// eviction victim. It is the only job with no second chance: every
+    /// other uri re-pushes on its own start.
+    #[test]
+    fn eviction_never_drops_the_pinned_current_job() {
+        let q = MetaQueue::new();
+        q.set_pinned(Some("u0".into()));
+        for i in 0..=META_QUEUE_CAP {
+            q.push(MetaJob {
+                uri: format!("u{i}"),
+                info: ResolvedTrack {
+                    url: String::new(),
+                    title: String::new(),
+                    artist: String::new(),
+                    album: None,
+                    duration_ms: None,
+                    thumbnail: None,
+                },
+            });
+        }
+        // Two pushes past the cap: u0 must survive both, older non-pinned
+        // jobs are the victims, and the pinned job still delivers FIRST
+        // (FIFO among survivors keeps the app's ordering guard intact).
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        assert!(
+            seen.contains(&"u0".to_string()),
+            "pinned job survived: {seen:?}"
+        );
+        assert_eq!(seen[0], "u0", "FIFO order among survivors: {seen:?}");
+        assert_eq!(seen.len(), META_QUEUE_CAP, "cap still bounds the queue");
+        assert!(
+            !seen.contains(&"u1".to_string()),
+            "u1 was the eviction victim: {seen:?}"
+        );
+    }
+
+    /// Same-uri re-pushes consolidate instead of stacking: duplicates are
+    /// the cascade's fuel — 16 copies of one track's job could evict
+    /// everything else's.
+    #[test]
+    fn a_same_uri_repush_consolidates_instead_of_stacking() {
+        let q = MetaQueue::new();
+        q.push(MetaJob {
+            uri: "u0".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        q.push(MetaJob {
+            uri: "u0".into(),
+            info: ResolvedTrack {
+                url: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: None,
+                duration_ms: None,
+                thumbnail: None,
+            },
+        });
+        let mut seen = Vec::new();
+        while let Some(job) = q.pop() {
+            seen.push(job.uri);
+        }
+        assert_eq!(seen, vec!["u0"], "one job per uri, not a stack");
+    }
+
+    /// Cover sources (the yt-dlp thumbnails) are typically 1280px; the
+    /// shipped/cached image and the theme derive both cap well below that.
+    /// The downscale must live at the source — a removal of the cap is a
+    /// memory regression in the channel AND the meta cache.
+    #[test]
+    fn covers_are_capped_before_shipping() {
+        let big = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1280,
+            720,
+            image::Rgba([255u8; 4]),
+        ));
+        let capped = downscale_cover(big);
+        let (w, h) = (capped.width(), capped.height());
+        assert!(w <= 320 && h <= 320, "cover fits the 320px bound: {w}x{h}");
+    }
+
+    /// Delivery-side dedup skips only a CONSECUTIVE same-uri delivery: a
+    /// re-started same-uri track (repeat, reload) is a legit delivery, and a
+    /// uri change always ships.
+    #[test]
+    fn delivery_dedup_skips_only_consecutive_duplicates() {
+        assert!(is_duplicate_delivery(Some("u1"), "u1"));
+        assert!(!is_duplicate_delivery(Some("u1"), "u2"));
+        assert!(!is_duplicate_delivery(None, "u1"));
+    }
+
+    #[test]
+    fn a_new_context_load_supersedes_and_cancels_the_previous() {
+        let mut gate = LoadGate::new();
+        let (g1, c1) = gate.begin();
+        let (g2, c2) = gate.begin();
+        assert_ne!(g1, g2, "each load gets a fresh generation");
+        assert!(
+            c1.load(Ordering::Relaxed),
+            "the superseded chain's cancel must flip"
+        );
+        assert!(
+            !c2.load(Ordering::Relaxed),
+            "the current chain is untouched"
+        );
+        assert!(gate.is_current(g2), "the newest generation is current");
+        assert!(
+            !gate.is_current(g1),
+            "a late result for the old generation is fenced out"
+        );
+    }
+
+    /// Finishing the current load clears its flag; teardown cancels whatever
+    /// is still in flight.
+    #[test]
+    fn finishing_a_load_clears_it_and_teardown_cancels_the_rest() {
+        let mut gate = LoadGate::new();
+        let (g1, _) = gate.begin();
+        assert!(gate.is_current(g1), "the fresh load is current");
+        let (g2, c2) = gate.begin();
+        gate.cancel_inflight();
+        assert!(
+            c2.load(Ordering::Relaxed),
+            "teardown stops the in-flight chain"
+        );
+        assert!(
+            !gate.is_current(g1),
+            "a stale gen stays fenced after teardown"
+        );
+        assert!(gate.is_current(g2), "the last gen is still current");
+    }
+
+    /// A FAILED context load must not supersede an in-flight recovery: the
+    /// queue still belongs to the old track, and abandoning the rebuild
+    /// there leaves the player silent forever (current gone, recovery armed,
+    /// watchdog off). Only a load that actually replaces the queue — or
+    /// belongs to a superseded generation whose newer result will — ends
+    /// the recovery.
+    #[test]
+    fn a_failed_load_does_not_supersede_an_in_flight_recovery() {
+        assert!(supersedes_recovery(LoadDisposition::Applied));
+        assert!(supersedes_recovery(LoadDisposition::Fenced));
+        assert!(
+            !supersedes_recovery(LoadDisposition::Failed),
+            "a failed load leaves the queue untouched — the old track's              recovery must continue, not be abandoned"
+        );
+    }
+
+    /// Skip-on-error (Myx-a4e.10): a dead track is removed and its successor
+    /// slides into the same slot — the next `start_track_at` plays it.
+    #[test]
+    fn skip_removes_the_dead_track_and_plays_its_successor() {
+        let mut tracks = vec!["a".into(), "dead".into(), "c".into()];
+        let mut history = vec![2usize, 0];
+        let next = successor_slot(&mut tracks, &mut history, false, 1, "dead");
+        assert_eq!(next, Some(1), "the successor takes the dead track's slot");
+        assert_eq!(tracks, vec!["a", "c"]);
+        // History rows past the removed slot shift down; the slot itself is
+        // dropped (it can no longer point at a real track).
+        assert_eq!(history, vec![1usize, 0]);
+    }
+
+    /// Dead at the tail of a non-repeating queue: nothing left to play — the
+    /// caller stops cleanly, mirroring `advance()`'s queue-exhausted path.
+    #[test]
+    fn skip_on_the_tail_stops_when_repeat_is_off() {
+        let mut tracks = vec!["a".into(), "dead".into()];
+        let mut history = vec![];
+        let next = successor_slot(&mut tracks, &mut history, false, 1, "dead");
+        assert_eq!(next, None, "queue over, repeat off — no successor");
+        assert_eq!(tracks, vec!["a"]);
+    }
+
+    /// Repeat wraps to the queue head after the tail dies.
+    #[test]
+    fn skip_on_the_tail_wraps_when_repeat_is_on() {
+        let mut tracks = vec!["a".into(), "dead".into()];
+        let mut history = vec![];
+        let next = successor_slot(&mut tracks, &mut history, true, 1, "dead");
+        assert_eq!(next, Some(0), "repeat rolls over to the head");
+        assert_eq!(tracks, vec!["a"]);
+    }
+
+    /// The cursor-anchored retain path: `dead` elsewhere in the queue (a
+    /// duplicate the user appended) leaves the cursor slot intact and the
+    /// successor is whatever now sits there.
+    #[test]
+    fn a_dead_duplicate_elsewhere_keeps_the_cursor_slot() {
+        let mut tracks = vec!["a".into(), "b".into(), "dead".into(), "dead".into()];
+        let mut history = vec![2usize, 3];
+        let next = successor_slot(&mut tracks, &mut history, false, 1, "dead");
+        assert_eq!(next, Some(1), "the cursor slot survives");
+        assert_eq!(tracks, vec!["a", "b"]);
+        // History rows that pointed at the removed slots survive and shift
+        // down (pre-existing semantics, kept unchanged): anything that falls
+        // off the queue's end is dropped harmlessly by `start_track_at`'s
+        // `.get()` guard when `prev` later consumes it.
+        assert_eq!(history, vec![1usize, 2]);
+    }
+
+    /// The fresh-start retry policy (issue #19): exactly one immediate
+    /// re-attempt before the skip applies — a transient resolve blip (dead
+    /// socket, bot-gate, DNS) must not delete a playable track from the
+    /// queue, while a deleted video fails fast on both attempts anyway.
+    #[test]
+    fn a_fresh_start_gets_one_retry_before_the_skip_applies() {
+        assert!(!fresh_start_gives_up_after(1), "attempt 1 is retried");
+        assert!(fresh_start_gives_up_after(2), "attempt 2 is the last");
+        assert!(fresh_start_gives_up_after(3), "no attempt after 2");
+    }
+
+    /// A single dead track empties the queue: stop, never loop.
+    #[test]
+    fn a_single_dead_track_stops_without_looping() {
+        let mut tracks = vec!["dead".into()];
+        let mut history = vec![];
+        let next = successor_slot(&mut tracks, &mut history, true, 0, "dead");
+        assert_eq!(next, None, "repeat cannot resurrect an empty queue");
+        assert!(tracks.is_empty());
+    }
+
+    /// Absent uri is a no-op: nothing removed, the current slot stays.
+    #[test]
+    fn an_absent_dead_uri_is_a_no_op() {
+        let mut tracks = vec!["a".into(), "b".into()];
+        let mut history = vec![0usize];
+        let next = successor_slot(&mut tracks, &mut history, true, 1, "ghost");
+        assert_eq!(next, Some(1));
+        assert_eq!(tracks, vec!["a", "b"]);
+        assert_eq!(history, vec![0usize]);
+    }
+
+    /// The facade must not expand synchronously: `play_context` queues the
+    /// command and returns, so a big or stalled playlist cannot freeze the
+    /// caller's UI thread (bead Myx-a4.8 — the old facade expanded in-place,
+    /// and this call would do a live network fetch).
+    #[test]
+    fn play_context_queues_the_load_without_expanding() {
+        let (tx, rx) = flume::unbounded::<Cmd>();
+        let engine = Engine {
+            bands: VisBands::shared(),
+            inner: Arc::new(Inner {
+                cmds: tx,
+                expander: Arc::new(YtExpander),
+                queue: Arc::new(Mutex::new(Vec::new())),
+            }),
+        };
+        let t0 = Instant::now();
+        engine.play_context("yt:playlist:PLabc", false).unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "play_context must not block on expansion"
+        );
+        match rx.try_recv() {
+            Ok(Cmd::LoadContext {
+                context_uri,
+                shuffle,
+                ..
+            }) => {
+                assert_eq!(context_uri, "yt:playlist:PLabc");
+                assert!(!shuffle);
+            }
+            _ => panic!("expected Cmd::LoadContext on the command channel"),
+        }
+    }
 
     #[test]
     fn a_failing_recovery_backs_off_up_to_the_cap() {
@@ -1398,7 +2333,14 @@ mod tests {
         let (mut child, stdout) = spawn_ffmpeg(wav.to_str().unwrap(), 0).expect("spawn ffmpeg");
         let frames = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let source = FfmpegSource::new(stdout, Arc::clone(&frames), VisBands::shared(), cancelled);
+        let source = FfmpegSource::new(
+            stdout,
+            Arc::clone(&frames),
+            Arc::new(AtomicU64::new(0)),
+            VisBands::shared(),
+            cancelled,
+            8 * 1024,
+        );
         queue_in.append_with_signal(source);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -1469,8 +2411,10 @@ mod tests {
         let mut source = FfmpegSource::new(
             stdout,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             Arc::clone(&bands),
             Arc::new(AtomicBool::new(false)),
+            8 * 1024,
         );
         // ~3 s of playback, paced to realtime: 441 pops are 10 ms of audio,
         // and each 10 ms of audio is paid with a 10 ms sleep. The device is
@@ -1541,7 +2485,14 @@ mod tests {
         let bands = VisBands::shared();
         let frames = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let source = FfmpegSource::new(stdout, Arc::clone(&frames), Arc::clone(&bands), cancelled);
+        let source = FfmpegSource::new(
+            stdout,
+            Arc::clone(&frames),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&bands),
+            cancelled,
+            8 * 1024,
+        );
         queue_in.append_with_signal(source);
         // Prebuffer + playback start (~1.2 s is well past the 93 ms gate).
         std::thread::sleep(Duration::from_millis(1200));

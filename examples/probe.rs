@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
     let (tx, rx) = flume::unbounded::<EngineEvent>();
     let (meta_tx, _meta_rx) = flume::unbounded::<engine::EngineMeta>();
     let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(engine::YtExpander);
-    let engine = engine::run(tx, meta_tx, 50, expander)?;
+    let engine = engine::run(tx, meta_tx, 50, 2, expander)?;
     println!("tuna-tui-probe: engine live; yt-dlp + ffmpeg pipelines ready.");
 
     // If a URI was passed, start playing it immediately.
@@ -55,6 +55,9 @@ fn main() -> anyhow::Result<()> {
                     println!("⏸ paused    {uri} @ {position_ms}ms")
                 }
                 EngineEvent::Stopped => println!("⏹ stopped"),
+                EngineEvent::LoadFailed { uri, message } => {
+                    println!("✗ load failed {uri}: {message}")
+                }
                 EngineEvent::Reconnecting => println!("⟳ stream lost, reconnecting"),
                 EngineEvent::Reconnected => println!("⟳ reconnected"),
                 EngineEvent::PositionCorrection { uri, position_ms } => {

@@ -14,6 +14,7 @@ pub mod components;
 pub mod cover;
 pub mod gradient;
 pub mod httpcache;
+pub mod itunes;
 pub mod liblog;
 pub mod lyrics;
 #[cfg(feature = "streaming")]
