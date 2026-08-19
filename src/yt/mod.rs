@@ -69,7 +69,6 @@ pub struct StreamInfo {
     pub video: YtVideo,
 }
 
-
 /// YouTube type-ahead completions for the search box (Myx-a4e.12).
 ///
 /// Google's unauthenticated suggest service — the same one YouTube's own
@@ -1015,7 +1014,6 @@ mod tests {
         assert_eq!(playlist_end_arg(30), "30");
     }
 }
-
 
 #[cfg(test)]
 mod autocomplete_tests {
