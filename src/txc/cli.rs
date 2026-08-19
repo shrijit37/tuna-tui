@@ -398,3 +398,407 @@ impl ExecRunner {
             // should print where the user is looking. stdin is closed so a hook
             // that reads by accident fails fast instead of stealing the terminal.
             .stdin(Stdio::null());
+        for (k, v) in pairs {
+            command.env(k, v);
+        }
+
+        match command.spawn() {
+            Ok(mut child) => {
+                if wait {
+                    let _ = child.wait();
+                } else {
+                    self.inflight.push(child);
+                }
+            }
+            Err(e) => eprintln!("tuna-tui theme: --exec failed to start: {e}"),
+        }
+    }
+}
+
+/// Print one message and, if configured, run the `--exec` hook.
+///
+/// Returns the write result so the caller can stop on a closed pipe. The
+/// explicit flush is the difference between a working `| while read` and an
+/// apparent hang — see the module docs.
+fn emit(
+    msg: &Message,
+    format: Format,
+    exec: Option<&mut ExecRunner>,
+    wait_for_exec: bool,
+) -> io::Result<()> {
+    let out = io::stdout();
+    let mut lock = out.lock();
+    writeln!(lock, "{}", format_message(msg, format))?;
+    lock.flush()?;
+
+    if let (Some(runner), Message::Theme(ev)) = (exec, msg) {
+        runner.run(&env_pairs(ev), wait_for_exec);
+    }
+    Ok(())
+}
+
+/// Run `tuna-tui theme …` and return the process exit code.
+///
+/// `argv` is everything after the `theme` word. Never panics and never returns
+/// to the player: `main.rs` exits with this code.
+pub fn run(argv: &[String]) -> i32 {
+    let args = match parse_args(argv) {
+        Ok(Parsed::Run(a)) => a,
+        Ok(Parsed::Help) => {
+            print!("{USAGE}");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("tuna-tui theme: {e}\n\n{USAGE}");
+            return EXIT_USAGE;
+        }
+    };
+
+    // Undo the runtime's SIG_IGN so `| head -1` is a clean death, not an error.
+    restore_default_sigpipe();
+
+    let path = args.socket.clone().unwrap_or_else(crate::txc::socket_path);
+    let mut exec = args.exec.clone().map(ExecRunner::new);
+
+    match args.cmd {
+        Cmd::Get => {
+            let mut sub = match Subscriber::connect(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "tuna-tui theme: no publisher at {}: {e}\n\
+                         (is tuna-tui running? TUNA_NO_COLOR_SOCKET disables publishing)",
+                        path.display()
+                    );
+                    return EXIT_RUNTIME;
+                }
+            };
+            match sub.next_message() {
+                // `get` waits for the hook: the process is about to exit, and
+                // an orphan would be killed mid-run.
+                Ok(Some(msg)) => match emit(&msg, args.format, exec.as_mut(), true) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("tuna-tui theme: {e}");
+                        EXIT_RUNTIME
+                    }
+                },
+                Ok(None) => {
+                    eprintln!("tuna-tui theme: publisher closed without sending a palette");
+                    EXIT_RUNTIME
+                }
+                Err(e) => {
+                    eprintln!("tuna-tui theme: {e}");
+                    EXIT_RUNTIME
+                }
+            }
+        }
+        Cmd::Watch => {
+            // `watch` never gives up: reconnecting across a tuna-tui restart is the
+            // entire contract. The only way out is a write failure (the pipe
+            // closed) or a signal.
+            let _ = subscribe::watch(&path, |msg| {
+                match emit(&msg, args.format, exec.as_mut(), false) {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(_) => ControlFlow::Break(()),
+                }
+            });
+            0
+        }
+    }
+}
+
+/// Put `SIGPIPE` back to `SIG_DFL` for this process.
+///
+/// The inverse of `publish::ignore_sigpipe`, and safe only because the CLI
+/// path never binds a publisher: here, a downstream `head` closing the pipe
+/// *should* end us, exactly as it ends `cat`.
+fn restore_default_sigpipe() {
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    // SAFETY: `signal` touches no memory we own and cannot fail in a way that
+    // matters here; the previous disposition is intentionally discarded.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gradient::Rgb;
+    use crate::txc::contrast::Contrast;
+    use crate::txc::wire::{ByeEvent, ByeReason, Colors, Hex, Origin, ThemeEvent};
+    use crate::txc::PROTOCOL_VERSION;
+
+    fn sample_colors() -> Colors {
+        Colors {
+            primary: Hex(Rgb::new(0x64, 0xe0, 0xd0)),
+            secondary: Hex(Rgb::new(0x4a, 0x9f, 0xd8)),
+            accent: Hex(Rgb::new(0xf4, 0xaa, 0x48)),
+            error: Hex(Rgb::new(0xe0, 0x55, 0x61)),
+            warning: Hex(Rgb::new(0xd9, 0xa4, 0x41)),
+            success: Hex(Rgb::new(0x61, 0xc7, 0x66)),
+            info: Hex(Rgb::new(0x64, 0xe0, 0xd0)),
+            text: Hex(Rgb::new(0xd8, 0xef, 0xff)),
+            text_muted: Hex(Rgb::new(0x7a, 0x90, 0xa4)),
+            background: Hex(Rgb::new(0x08, 0x10, 0x18)),
+            background_panel: Hex(Rgb::new(0x10, 0x1d, 0x2a)),
+            background_element: Hex(Rgb::new(0x18, 0x29, 0x3a)),
+            border: Hex(Rgb::new(0x22, 0x37, 0x4a)),
+            border_active: Hex(Rgb::new(0x42, 0xd9, 0xd0)),
+            border_subtle: Hex(Rgb::new(0x18, 0x28, 0x38)),
+            border_dimmest: Hex(Rgb::new(0x10, 0x1c, 0x28)),
+        }
+    }
+
+    /// The reference event every formatter test asserts against. `name` is
+    /// deliberately hostile: a real track title with an apostrophe.
+    fn event(name: &str) -> ThemeEvent {
+        ThemeEvent {
+            v: PROTOCOL_VERSION,
+            seq: 0,
+            ts: 1_785_616_484_123,
+            origin: Origin {
+                kind: OriginKind::AlbumArt,
+                name: name.to_string(),
+                track: Some(name.to_string()),
+                artist: Some("New Order".into()),
+                album: None,
+                track_id: Some("yt:video:dQw4w9WgXcQ".into()),
+            },
+            fade_ms: 1500,
+            is_dark: true,
+            colors: sample_colors(),
+            contrast: Contrast::compute(&sample_colors()),
+        }
+    }
+
+    #[test]
+    fn sh_format_is_exact() {
+        assert_eq!(
+            format_sh(&event("Blue Monday")),
+            "\
+TUNA_PRIMARY='#64e0d0'
+TUNA_SECONDARY='#4a9fd8'
+TUNA_ACCENT='#f4aa48'
+TUNA_ERROR='#e05561'
+TUNA_WARNING='#d9a441'
+TUNA_SUCCESS='#61c766'
+TUNA_INFO='#64e0d0'
+TUNA_TEXT='#d8efff'
+TUNA_TEXT_MUTED='#7a90a4'
+TUNA_BACKGROUND='#081018'
+TUNA_BACKGROUND_PANEL='#101d2a'
+TUNA_BACKGROUND_ELEMENT='#18293a'
+TUNA_BORDER='#22374a'
+TUNA_BORDER_ACTIVE='#42d9d0'
+TUNA_BORDER_SUBTLE='#182838'
+TUNA_BORDER_DIMMEST='#101c28'
+TUNA_ON_PRIMARY='#0b0b0b'
+TUNA_ON_SECONDARY='#0b0b0b'
+TUNA_ON_ACCENT='#0b0b0b'
+TUNA_ON_BACKGROUND='#d8efff'
+TUNA_IS_DARK='1'
+TUNA_ORIGIN_KIND='album_art'
+TUNA_ORIGIN_NAME='Blue Monday'
+TUNA_FADE_MS='1500'"
+        );
+    }
+
+    /// The one that matters: origin names are untrusted metadata about to be
+    /// `eval`'d. A naive `'{}'` would let `'; rm -rf ~; '` out of the quotes.
+    #[test]
+    fn sh_format_escapes_single_quotes_in_origin_name() {
+        let out = format_sh(&event("Don't Stop '; rm -rf ~; '"));
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("TUNA_ORIGIN_NAME="))
+            .expect("origin name line");
+        assert_eq!(
+            line,
+            r#"TUNA_ORIGIN_NAME='Don'\''t Stop '\''; rm -rf ~; '\'''"#
+        );
+        // And prove it: `eval` the emitted line exactly the way a user does
+        // (`eval "$(tuna-tui theme get)"` — one unsplit argument) and check the
+        // variable comes back byte-for-byte, with nothing executed.
+        if let Ok(out) = Command::new("sh")
+            .arg("-c")
+            .arg(r#"eval "$1"; printf %s "$TUNA_ORIGIN_NAME""#)
+            .arg("sh") // $0
+            .arg(line) // $1
+            .output()
+        {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "Don't Stop '; rm -rf ~; '"
+            );
+        }
+    }
+
+    #[test]
+    fn sh_quote_round_trips_through_a_real_shell_when_available() {
+        // Belt and braces: ask `sh` itself what the quoting means.
+        let hostile = "a'b\"c $HOME `id` \\ d";
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {}", sh_quote(hostile)))
+            .output();
+        if let Ok(out) = out {
+            assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
+        }
+    }
+
+    #[test]
+    fn css_format_is_exact() {
+        assert_eq!(
+            format_css(&event("Blue Monday")),
+            "\
+:root {
+  --tuna-primary: #64e0d0;
+  --tuna-secondary: #4a9fd8;
+  --tuna-accent: #f4aa48;
+  --tuna-error: #e05561;
+  --tuna-warning: #d9a441;
+  --tuna-success: #61c766;
+  --tuna-info: #64e0d0;
+  --tuna-text: #d8efff;
+  --tuna-text-muted: #7a90a4;
+  --tuna-background: #081018;
+  --tuna-background-panel: #101d2a;
+  --tuna-background-element: #18293a;
+  --tuna-border: #22374a;
+  --tuna-border-active: #42d9d0;
+  --tuna-border-subtle: #182838;
+  --tuna-border-dimmest: #101c28;
+  --tuna-on-primary: #0b0b0b;
+  --tuna-on-secondary: #0b0b0b;
+  --tuna-on-accent: #0b0b0b;
+  --tuna-on-background: #d8efff;
+}"
+        );
+    }
+
+    #[test]
+    fn hex_format_is_tab_separated_two_columns() {
+        let out = format_hex(&event("Blue Monday"));
+        assert_eq!(out.lines().count(), 20);
+        assert_eq!(out.lines().next().unwrap(), "primary\t#64e0d0");
+        assert_eq!(out.lines().last().unwrap(), "on_background\t#d8efff");
+        for line in out.lines() {
+            let (token, hex) = line.split_once('\t').expect("exactly one tab");
+            assert!(!token.contains(' '), "token must be cut-friendly: {token}");
+            assert!(hex.starts_with('#') && hex.len() == 7, "bad hex {hex}");
+        }
+    }
+
+    #[test]
+    fn json_format_is_the_ndjson_line_without_its_newline() {
+        let msg = Message::Theme(event("Blue Monday"));
+        let out = format_message(&msg, Format::Json);
+        assert!(!out.ends_with('\n'));
+        assert_eq!(format!("{out}\n"), msg.to_ndjson().unwrap());
+        // And it really is a single parseable line.
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["colors"]["primary"], "#64e0d0");
+    }
+
+    #[test]
+    fn bye_becomes_a_comment_in_each_text_format() {
+        let bye = Message::Bye(ByeEvent {
+            v: PROTOCOL_VERSION,
+            seq: 9,
+            ts: 1,
+            reason: ByeReason::Shutdown,
+        });
+        assert_eq!(
+            format_message(&bye, Format::Sh),
+            "# tuna-tui: publisher going away (Shutdown)"
+        );
+        assert_eq!(
+            format_message(&bye, Format::Hex),
+            "# tuna-tui: publisher going away (Shutdown)"
+        );
+        assert_eq!(
+            format_message(&bye, Format::Css),
+            "/* tuna-tui: publisher going away (Shutdown) */"
+        );
+        assert!(format_message(&bye, Format::Json).contains(r#""t":"bye""#));
+    }
+
+    // ------------------------------------------------------------ parsing
+
+    fn parse(args: &[&str]) -> Result<Parsed, String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&owned)
+    }
+
+    fn run_args(args: &[&str]) -> Args {
+        match parse(args).expect("should parse") {
+            Parsed::Run(a) => a,
+            Parsed::Help => panic!("expected a runnable invocation"),
+        }
+    }
+
+    #[test]
+    fn defaults_are_get_sh_default_socket_no_exec() {
+        let a = run_args(&["get"]);
+        assert_eq!(a.cmd, Cmd::Get);
+        assert_eq!(a.format, Format::Sh);
+        assert_eq!(a.socket, None);
+        assert_eq!(a.exec, None);
+    }
+
+    #[test]
+    fn every_format_name_parses() {
+        for (name, want) in [
+            ("sh", Format::Sh),
+            ("css", Format::Css),
+            ("hex", Format::Hex),
+            ("json", Format::Json),
+        ] {
+            assert_eq!(run_args(&["watch", "--format", name]).format, want);
+            // `--format=json` must mean the same thing as `--format json`.
+            let joined = format!("--format={name}");
+            assert_eq!(run_args(&["watch", &joined]).format, want);
+        }
+    }
+
+    #[test]
+    fn flags_may_precede_the_subcommand() {
+        let a = run_args(&["--format", "css", "--socket", "/tmp/x.sock", "watch"]);
+        assert_eq!(a.cmd, Cmd::Watch);
+        assert_eq!(a.format, Format::Css);
+        assert_eq!(a.socket, Some(PathBuf::from("/tmp/x.sock")));
+    }
+
+    #[test]
+    fn exec_captures_the_whole_command_string() {
+        let a = run_args(&["watch", "--exec", "notify-send \"$TUNA_PRIMARY\""]);
+        assert_eq!(a.exec.as_deref(), Some("notify-send \"$TUNA_PRIMARY\""));
+    }
+
+    #[test]
+    fn help_is_not_an_error() {
+        assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
+        assert_eq!(parse(&["get", "-h"]), Ok(Parsed::Help));
+    }
+
+    #[test]
+    fn bad_input_is_rejected_with_a_message_not_a_panic() {
+        for bad in [
+            vec![],                          // no subcommand
+            vec!["frobnicate"],              // unknown subcommand
+            vec!["get", "--format"],         // missing value
+            vec!["get", "--format", "yaml"], // unknown format
+            vec!["get", "--socket"],         // missing value
+            vec!["get", "--nope"],           // unknown flag
+            vec!["get", "watch"],            // two subcommands
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?} must be a usage error");
+        }
+    }
+}
