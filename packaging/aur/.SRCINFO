@@ -1,0 +1,21 @@
+pkgbase = tuna-tui
+	pkgdesc = A lean, beautiful terminal music player
+	pkgver = 0.4.0
+	pkgrel = 1
+	url = https://github.com/shrijit37/tuna-tui
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = alsa-lib
+	makedepends = openssl
+	depends = gcc-libs
+	depends = alsa-lib
+	depends = openssl
+	depends = yt-dlp
+	depends = ffmpeg
+	options = !lto
+	source = https://github.com/shrijit37/tuna-tui/archive/refs/tags/v0.4.0.tar.gz
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+
+pkgname = tuna-tui

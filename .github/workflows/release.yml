@@ -421,7 +421,7 @@ jobs:
           arch=('x86_64' 'aarch64')
           url="https://github.com/shrijit37/tuna-tui"
           license=('MIT')
-          depends=('gcc-libs' 'alsa-lib' 'openssl')
+          depends=('gcc-libs' 'alsa-lib' 'openssl' 'yt-dlp' 'ffmpeg')
           makedepends=('cargo' 'alsa-lib' 'openssl')
           options=(!lto)
           source=("\$url/archive/refs/tags/v\$pkgver.tar.gz")
@@ -462,6 +462,8 @@ jobs:
           	depends = gcc-libs
           	depends = alsa-lib
           	depends = openssl
+          	depends = yt-dlp
+          	depends = ffmpeg
           	options = !lto
           	source = https://github.com/shrijit37/tuna-tui/archive/refs/tags/v${VERSION}.tar.gz
           	sha256sums = ${SHA256}

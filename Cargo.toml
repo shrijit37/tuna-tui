@@ -122,8 +122,12 @@ lto = "thin"
 # Debian packaging (audit H7): the binary links libasound2 (rodio/cpal ALSA)
 # and libssl3 (reqwest native-tls), so the .deb must declare them or `dpkg -i`
 # installs a binary that fails to start with missing shared libraries.
+# yt-dlp + ffmpeg are spawned at runtime (search/resolve/stream), so they are
+# Debian deps too — a package without them cannot play anything.
 [package.metadata.deb]
-depends = "libasound2, libssl3"
+depends = "libasound2, libssl3, yt-dlp, ffmpeg"
+maintainer = "Shrijit Srivastava <shrijitsrivastava@gmail.com>"
+copyright = "2026 Haseeb Khalid"
 section = "sound"
 priority = "optional"
 assets = [
