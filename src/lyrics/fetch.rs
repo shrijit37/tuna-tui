@@ -47,17 +47,23 @@ pub fn fetch_lyrics_blocking(
     duration_ms: u32,
 ) -> (Vec<(u32, String)>, bool) {
     let client = CLIENT.get_or_init(|| crate::httpcache::blocking_client().clone());
+    let url = search_url(artist, title, album);
+    fetch_lyrics_memo(client, &url, duration_ms as f64 / 1000.0)
+}
+
+/// Build the lrclib search URL for artist/title(/album). The album is
+/// appended only when we actually have one — an empty album_name parameter
+/// would over-constrain the search to untitled records.
+fn search_url(artist: &str, title: &str, album: &str) -> String {
     let mut url = format!(
         "https://lrclib.net/api/search?artist_name={}&track_name={}",
         urlencode(artist),
         urlencode(title),
     );
-    // Album only when we actually have one: an empty album_name parameter
-    // would over-constrain the search to untitled records.
     if !album.is_empty() {
         url.push_str(&format!("&album_name={}", urlencode(album)));
     }
-    fetch_lyrics_memo(client, &url, duration_ms as f64 / 1000.0)
+    url
 }
 
 /// How far a search candidate's length may drift from the video's (in
@@ -78,7 +84,11 @@ fn pick_search_match(
     arr.iter()
         .filter_map(|v| v["duration"].as_f64().map(|d| (d, v)))
         .filter(|(d, _)| (d - expected_duration_s).abs() <= DURATION_TOLERANCE_S)
-        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .min_by(|(a, _), (b, _)| {
+            (a - expected_duration_s)
+                .abs()
+                .total_cmp(&(b - expected_duration_s).abs())
+        })
         .map(|(_, v)| v)
 }
 
@@ -245,6 +255,37 @@ mod tests {
         assert_eq!(picked["trackName"], "winner");
     }
 
+    /// The window is inclusive at exactly ±10 s: a candidate exactly at the
+    /// boundary is in, a hair past it is out. Pins the `<=` semantics a
+    /// hostile review might misread as `<`.
+    #[test]
+    fn search_match_boundary_is_inclusive_at_exactly_ten_seconds() {
+        let at_boundary = json!([
+            { "trackName": "edge", "duration": 110.0, "plainLyrics": "x" },
+        ]);
+        let picked = pick_search_match(&at_boundary, 100.0).expect("exactly 10 s off is in");
+        assert_eq!(picked["trackName"], "edge");
+
+        let past_boundary = json!([
+            { "trackName": "past", "duration": 110.000001, "plainLyrics": "x" },
+        ]);
+        assert!(pick_search_match(&past_boundary, 100.0).is_none());
+    }
+
+    /// Equidistant candidates (95 s and 105 s vs a 100 s video) tie on
+    /// distance; the picker keeps the first in array order, i.e. lrclib's
+    /// own ordering — no synced-over-plain preference is introduced, which
+    /// the bead doesn't call for.
+    #[test]
+    fn search_match_tie_breaks_to_first_candidate_in_array_order() {
+        let search = json!([
+            { "trackName": "first", "duration": 95.0, "plainLyrics": "x" },
+            { "trackName": "second", "duration": 105.0, "syncedLyrics": "[00:01.00]y" },
+        ]);
+        let picked = pick_search_match(&search, 100.0).expect("both candidates tie in range");
+        assert_eq!(picked["trackName"], "first");
+    }
+
     /// Every candidate outside the ±10 s window is a miss — a same-titled
     /// cover or a live take must not masquerade as this track.
     #[test]
@@ -254,6 +295,34 @@ mod tests {
             { "trackName": "close but no 2", "duration": 111.0, "plainLyrics": "y" },
         ]);
         assert!(pick_search_match(&search, 100.0).is_none());
+    }
+
+    /// F6's catch (R1): among several in-tolerance candidates the picker
+    /// must return the NEAREST to the expected length, not the smallest one.
+    /// 90.5 is 9.5 s off and sorts first; 96.0 is 4.0 s off — the nearest
+    /// wins even though it is the larger duration.
+    #[test]
+    fn search_match_prefers_nearest_not_smallest_in_tolerance() {
+        let search = json!([
+            { "trackName": "smaller", "duration": 90.5, "syncedLyrics": "[00:01.00]x" },
+            { "trackName": "nearest", "duration": 96.0, "syncedLyrics": "[00:01.00]y" },
+        ]);
+        let picked = pick_search_match(&search, 100.0).expect("a candidate is in range");
+        assert_eq!(picked["trackName"], "nearest");
+    }
+
+    /// R2 (F6's review): the search URL carries album only when one is known
+    /// — an empty album must not over-constrain the query.
+    #[test]
+    fn search_url_includes_album_only_when_non_empty() {
+        assert_eq!(
+            search_url("a b", "c d", ""),
+            "https://lrclib.net/api/search?artist_name=a%20b&track_name=c%20d"
+        );
+        assert_eq!(
+            search_url("a b", "c d", "e f"),
+            "https://lrclib.net/api/search?artist_name=a%20b&track_name=c%20d&album_name=e%20f"
+        );
     }
 
     /// A non-array response (or an array with no usable record) is a miss.
