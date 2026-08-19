@@ -398,3 +398,346 @@ fn peer_loop(mut stream: UnixStream, rx: Receiver<Outbound>) {
             return;
         }
         seq += 1;
+    }
+}
+
+/// Make `SIGPIPE` a non-event, process-wide.
+///
+/// The default disposition *terminates the process*. Writing to a socket whose
+/// subscriber just pressed Ctrl-C would therefore kill the music player. With
+/// the signal ignored, the same condition surfaces as an `EPIPE` error return
+/// that [`peer_loop`] handles as a plain disconnect.
+///
+/// Rust's runtime already does this for `bin` targets, but TXC is also usable
+/// as a library from a host that may have reset the disposition, so we assert
+/// it ourselves. Idempotent and cheap.
+fn ignore_sigpipe() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        const SIGPIPE: i32 = 13;
+        const SIG_IGN: usize = 1;
+        extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        // SAFETY: `signal` with `SIG_IGN` touches no memory we own and cannot
+        // fail in a way that matters here; the result is intentionally ignored.
+        unsafe {
+            signal(SIGPIPE, SIG_IGN);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gradient::Rgb;
+    use crate::theme::TOKYONIGHT;
+    use crate::txc::wire::OriginKind;
+    use std::io::{BufRead, BufReader};
+    use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
+
+    /// Generous ceiling for "this arrived / this finished". Everything here is
+    /// local IPC that completes in microseconds, so a multi-second bound is
+    /// pure slack for loaded CI rather than a real timing dependency.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// Unique, *short* socket path. `sun_path` is ~108 bytes, so a long temp
+    /// dir plus a verbose test name would silently fail to bind.
+    fn sock() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("txc{pid}-{n}.s"))
+    }
+
+    /// A theme whose palette differs from every other `tweak(i)`, so dedupe
+    /// never swallows a message a test is waiting for.
+    fn tweak(i: u8) -> Theme {
+        let mut t = TOKYONIGHT;
+        t.background = Rgb::new(i, 0x10, 0x18);
+        t
+    }
+
+    fn origin() -> Origin {
+        Origin::named(OriginKind::Builtin, "test")
+    }
+
+    /// A subscriber with a read timeout, so a missing message fails the test
+    /// instead of hanging the suite forever.
+    struct Client(BufReader<UnixStream>);
+
+    impl Client {
+        fn connect(path: &Path) -> Client {
+            let s = UnixStream::connect(path).expect("connect");
+            s.set_read_timeout(Some(PATIENCE)).unwrap();
+            Client(BufReader::new(s))
+        }
+
+        /// Next NDJSON line, parsed. `None` at clean EOF.
+        fn next(&mut self) -> Option<Message> {
+            let mut line = String::new();
+            match self.0.read_line(&mut line) {
+                Ok(0) => None,
+                Ok(_) => Some(serde_json::from_str(&line).expect("valid TXC json")),
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+
+        fn theme(&mut self) -> ThemeEvent {
+            match self.next().expect("expected a message, got EOF") {
+                Message::Theme(t) => t,
+                other => panic!("expected theme, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_is_the_first_line_and_starts_at_seq_zero() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+        pubr.publish(origin(), &tweak(1), 600);
+
+        let mut c = Client::connect(&path);
+        let ev = c.theme();
+
+        assert_eq!(ev.seq, 0, "the snapshot is always seq 0");
+        assert_eq!(ev.v, PROTOCOL_VERSION);
+        assert_eq!(ev.colors, Colors::from(&tweak(1)));
+        assert_eq!(ev.fade_ms, 600);
+        // Derived fields must be filled by the publisher, not the caller.
+        assert_eq!(ev.contrast, Contrast::compute(&ev.colors));
+        assert!(ev.is_dark);
+    }
+
+    #[test]
+    fn connecting_before_any_publish_yields_silence_not_a_fake_palette() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+
+        let mut c = Client::connect(&path);
+        // Give the accept thread time to register us, then confirm the peer is
+        // live but has been sent nothing.
+        wait_for(|| pubr.subscriber_count() == 1);
+
+        pubr.publish(origin(), &tweak(7), 0);
+        let ev = c.theme();
+        assert_eq!(ev.seq, 0, "first message on a connection is seq 0");
+        assert_eq!(ev.colors, Colors::from(&tweak(7)));
+    }
+
+    /// The property a FIFO structurally cannot provide: two independent
+    /// readers, both getting the whole stream.
+    #[test]
+    fn two_subscribers_both_receive_the_same_broadcast() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+        pubr.publish(origin(), &tweak(1), 0);
+
+        // Reading each snapshot is the handshake that proves both peers are
+        // registered — far more reliable than sleeping before publishing.
+        let mut a = Client::connect(&path);
+        assert_eq!(a.theme().colors, Colors::from(&tweak(1)));
+        let mut b = Client::connect(&path);
+        assert_eq!(b.theme().colors, Colors::from(&tweak(1)));
+
+        pubr.publish(origin(), &tweak(2), 0);
+
+        let (ea, eb) = (a.theme(), b.theme());
+        assert_eq!(ea.colors, Colors::from(&tweak(2)));
+        assert_eq!(eb.colors, Colors::from(&tweak(2)));
+        assert_eq!(ea.ts, eb.ts, "one event, fanned out — not two builds");
+    }
+
+    #[test]
+    fn seq_is_per_connection_not_global() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+        pubr.publish(origin(), &tweak(1), 0);
+
+        let mut a = Client::connect(&path);
+        assert_eq!(a.theme().seq, 0);
+        pubr.publish(origin(), &tweak(2), 0);
+        assert_eq!(a.theme().seq, 1);
+
+        // A late joiner starts its own count from scratch...
+        let mut b = Client::connect(&path);
+        assert_eq!(b.theme().seq, 0, "late subscriber restarts at 0");
+
+        pubr.publish(origin(), &tweak(3), 0);
+        let (ea, eb) = (a.theme(), b.theme());
+        // ...while the incumbent keeps climbing, on the very same message.
+        assert_eq!(ea.seq, 2);
+        assert_eq!(eb.seq, 1);
+        assert_eq!(ea.colors, eb.colors);
+    }
+
+    #[test]
+    fn identical_palettes_are_published_once() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+        pubr.publish(origin(), &tweak(1), 0);
+
+        let mut c = Client::connect(&path);
+        assert_eq!(c.theme().colors, Colors::from(&tweak(1)));
+
+        // Same palette, different origin metadata: still a duplicate on the
+        // only axis a renderer cares about.
+        pubr.publish(
+            Origin::named(OriginKind::AlbumArt, "different name"),
+            &tweak(1),
+            250,
+        );
+        pubr.publish(origin(), &tweak(2), 0);
+
+        let ev = c.theme();
+        assert_eq!(
+            ev.colors,
+            Colors::from(&tweak(2)),
+            "the duplicate must not appear on the wire at all"
+        );
+        assert_eq!(ev.seq, 1, "a deduped publish does not consume a seq");
+    }
+
+    #[test]
+    fn publishing_with_no_subscribers_is_free_and_safe() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+
+        let start = Instant::now();
+        for i in 0..1_000u16 {
+            pubr.publish(origin(), &tweak(i as u8), 0);
+        }
+        assert_eq!(pubr.subscriber_count(), 0);
+        assert!(
+            start.elapsed() < PATIENCE,
+            "zero-consumer publish must be trivial, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn shutdown_sends_a_parseable_bye_as_the_last_line() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+        pubr.publish(origin(), &tweak(1), 0);
+
+        let mut c = Client::connect(&path);
+        assert_eq!(c.theme().seq, 0);
+
+        pubr.shutdown(ByeReason::Reload);
+        pubr.shutdown(ByeReason::Shutdown); // idempotent: must not send twice
+
+        let mut last = None;
+        while let Some(msg) = c.next() {
+            last = Some(msg);
+        }
+        match last.expect("stream ended without a bye") {
+            Message::Bye(b) => {
+                assert_eq!(b.reason, ByeReason::Reload);
+                assert_eq!(b.v, PROTOCOL_VERSION);
+                assert_eq!(b.seq, 1, "bye continues this connection's sequence");
+            }
+            other => panic!("last line must be bye, got {other:?}"),
+        }
+        assert!(!path.exists(), "shutdown must unlink the socket");
+    }
+
+    /// The headline invariant: a subscriber that stops reading is the
+    /// subscriber's problem, never the publisher's.
+    #[test]
+    fn a_wedged_subscriber_cannot_block_publish() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let hung_path = path.clone();
+        let hung = std::thread::spawn(move || {
+            let s = UnixStream::connect(&hung_path).expect("connect");
+            ready_tx.send(()).unwrap();
+            // Connected and deliberately never reading a single byte.
+            std::thread::sleep(Duration::from_millis(600));
+            drop(s);
+        });
+        ready_rx.recv_timeout(PATIENCE).expect("client connected");
+        wait_for(|| pubr.subscriber_count() == 1);
+
+        // Far more than PEER_QUEUE distinct palettes, so the bounded queue is
+        // guaranteed to be exercised rather than merely brushed.
+        let start = Instant::now();
+        for i in 0..(PEER_QUEUE as u16 * 8) {
+            pubr.publish(origin(), &tweak(i as u8), 0);
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < PATIENCE,
+            "publish blocked on a wedged peer: {elapsed:?} for {} sends",
+            PEER_QUEUE * 8
+        );
+        // The wedged client's own sleep is ~600ms; had publish been coupled to
+        // it, the loop above could not have beaten that.
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "publish appears coupled to consumer progress: {elapsed:?}"
+        );
+        hung.join().unwrap();
+    }
+
+    #[test]
+    fn a_disconnected_peer_is_reaped() {
+        let path = sock();
+        let pubr = Publisher::bind(&path).unwrap();
+
+        let c = Client::connect(&path);
+        wait_for(|| pubr.subscriber_count() == 1);
+        drop(c);
+
+        // EPIPE only surfaces on an actual write, and the first one after a
+        // close often still "succeeds" (the RST has not landed yet), so keep
+        // publishing distinct palettes until the peer is gone.
+        let start = Instant::now();
+        let mut i = 0u16;
+        while pubr.subscriber_count() > 0 && start.elapsed() < PATIENCE {
+            pubr.publish(origin(), &tweak(i as u8), 0);
+            i = i.wrapping_add(1);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pubr.subscriber_count(), 0, "dead peer was leaked");
+    }
+
+    #[test]
+    fn binding_over_a_stale_socket_file_succeeds() {
+        let path = sock();
+
+        // Simulate a crash: a socket file left behind with nobody behind it.
+        {
+            let _dead = Publisher::bind(&path).unwrap();
+            std::mem::forget(_dead); // skip Drop, so the file survives
+        }
+        assert!(path.exists(), "precondition: stale file is present");
+
+        let pubr = Publisher::bind(&path).unwrap();
+        pubr.publish(origin(), &tweak(9), 0);
+        let mut c = Client::connect(&path);
+        assert_eq!(c.theme().colors, Colors::from(&tweak(9)));
+    }
+
+    /// Poll a condition until it holds or [`PATIENCE`] runs out.
+    ///
+    /// Used only for state that is settled by another thread's progress
+    /// (accept registration), where there is no channel to wait on. Polling
+    /// with a generous ceiling is stable; a fixed sleep is what makes a test
+    /// flaky.
+    fn wait_for(mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < PATIENCE {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("condition never became true within {PATIENCE:?}");
+    }
+}
