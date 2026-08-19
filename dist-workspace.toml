@@ -28,3 +28,11 @@ allow-dirty = ["ci"]
 libasound2-dev = '*'
 libssl-dev = '*'
 pkg-config = '*'
+
+# Runtime deps for the Homebrew formula: the app spawns yt-dlp (search/
+# resolve) and ffmpeg (stream decode) at runtime, so the generated formula
+# must declare them. stage=["run"] makes the homebrew installer emit
+# depends_on for them (build-stage deps would only land in the CI Brewfile).
+[dist.dependencies.homebrew]
+yt-dlp = { stage = ["run"] }
+ffmpeg = { stage = ["run"] }

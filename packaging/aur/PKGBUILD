@@ -1,0 +1,44 @@
+# Maintainer: Shrijit Srivastava <shrijitsrivastava@gmail.com>
+#
+# Canonical copy of the PKGBUILD the release pipeline writes to the AUR
+# (see .github/workflows/release.yml, publish-aur job). Keep the two in sync:
+# the CI heredoc is what actually ships on release; this file is the
+# reviewable, in-tree source of truth for it.
+#
+# sha256sums is filled by CI from the release tarball; the zero hash here is
+# a placeholder for review only — the committed AUR package always has the
+# real digest.
+pkgname=tuna-tui
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="A lean, beautiful terminal music player"
+arch=('x86_64' 'aarch64')
+url="https://github.com/shrijit37/tuna-tui"
+license=('MIT')
+# Runtime: the binary links alsa-lib/openssl/gcc-libs and spawns yt-dlp
+# (search/resolve) + ffmpeg (stream decode) — a package without the last two
+# installs a player that cannot play anything.
+depends=('gcc-libs' 'alsa-lib' 'openssl' 'yt-dlp' 'ffmpeg')
+makedepends=('cargo' 'alsa-lib' 'openssl')
+options=(!lto)
+source=("$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+prepare() {
+  cd "tuna-tui-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "tuna-tui-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package() {
+  cd "tuna-tui-$pkgver"
+  install -Dm755 "target/release/tuna-tui" "$pkgdir/usr/bin/tuna-tui"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
