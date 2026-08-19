@@ -487,6 +487,7 @@ async fn run_ui(
     let (lib_tx, lib_rx) = flume::unbounded::<(Section, Vec<LibItem>)>();
     let (search_tx, search_rx) = flume::unbounded::<Vec<LibItem>>();
     let (suggest_tx, suggest_rx) = flume::unbounded::<String>();
+    let (suggestions_tx, suggestions_rx) = flume::unbounded::<Vec<LibItem>>();
     let (lyrics_tx, lyrics_rx) = flume::unbounded::<(Vec<(u32, String)>, bool)>();
     let (detail_tx, detail_rx) = flume::unbounded::<(String, String, Vec<LibItem>)>();
     let (radio_tx, radio_rx) = flume::unbounded::<Result<Radio, String>>();
@@ -500,7 +501,7 @@ async fn run_ui(
         radio: radio_tx,
     };
     spawn_library_fetch(app.store.clone(), chans.lib.clone());
-    browse::spawn_suggestions(suggest_rx, chans.search.clone());
+    browse::spawn_suggestions(suggest_rx, suggestions_tx);
 
     if app.playback.now.is_some() {
         resume_source(&mut app, &chans.radio);
@@ -817,6 +818,20 @@ async fn run_ui(
                     } else {
                         String::new()
                     };
+                }
+                true
+            }
+            sg = suggestions_rx.recv_async() => {
+                if let Ok(rows) = sg {
+                    // A submit beats a late reply (S29-4): once a real search
+                    // is in flight, suggestion rows must not clobber the
+                    // "searching…" state; once out of input mode, stale rows
+                    // must not resurface (S29-1).
+                    if app.search.input_mode && !app.search.in_flight {
+                        app.search.search_results = rows;
+                        app.browse.selected = app.first_selectable();
+                        app.status = String::new();
+                    }
                 }
                 true
             }

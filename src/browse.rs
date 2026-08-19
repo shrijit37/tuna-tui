@@ -124,23 +124,48 @@ pub(crate) fn spawn_suggestions(rx: flume::Receiver<String>, tx: flume::Sender<V
     std::thread::Builder::new()
         .name("tuna-suggest".to_string())
         .spawn(move || {
-            while let Ok(mut query) = rx.recv() {
-                // Debounce: fold every ping that queued while we were busy
-                // into the newest query, then rest for the quiet window.
-                query = newest_pending(&rx, query);
-                let query = query.trim().to_string();
+            let debounce = std::time::Duration::from_millis(SUGGEST_DEBOUNCE_MS);
+            // Newest ping seen, carried across rounds so a superseded round
+            // re-fires for it without blocking on recv. The fold happens at
+            // fire time, not wakeup time: a slow suggest can never replay a
+            // queue of stale queries after typing stops (S29-2).
+            let mut latest = String::new();
+            loop {
+                // Wait for a ping, unless a superseded round already carries
+                // a newer query to re-fire.
+                if latest.trim().is_empty() {
+                    match rx.recv() {
+                        Ok(first) => latest = newest_pending(&rx, first),
+                        Err(_) => break,
+                    }
+                } else {
+                    latest = newest_pending(&rx, latest);
+                }
+                // Quiet window first: let the typing burst settle, then fold
+                // again so pings that landed mid-window win.
+                std::thread::sleep(debounce);
+                latest = newest_pending(&rx, latest);
+                let query = latest.trim().to_string();
                 if query.is_empty() {
+                    latest.clear();
                     continue;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(250));
                 let hits = yt::autocomplete(&query, SUGGEST_LIMIT);
-                if hits.is_empty() {
-                    continue; // no churn: keep whatever the pane was showing
+                // Anything queued while the request was in flight means this
+                // reply is already stale — drop it, the carried latest
+                // re-fires for the newer query next round.
+                if newest_pending(&rx, latest) != query {
+                    continue;
                 }
-                let mut out = Vec::with_capacity(hits.len() + 1);
-                out.push(LibItem::header("Suggestions"));
-                out.extend(hits.into_iter().map(|s| LibItem::header(&s)));
-                let _ = tx.send(out);
+                if !hits.is_empty() {
+                    let mut out = Vec::with_capacity(hits.len() + 1);
+                    out.push(LibItem::header("Suggestions"));
+                    out.extend(hits.into_iter().map(|s| LibItem::header(&s)));
+                    let _ = tx.send(out);
+                }
+                // Round complete — wait for the next ping rather than
+                // re-firing the same query.
+                latest.clear();
             }
         })
         .expect("spawn suggestions worker");
@@ -149,6 +174,10 @@ pub(crate) fn spawn_suggestions(rx: flume::Receiver<String>, tx: flume::Sender<V
 /// How many completions the suggest row renders. Search depth stays on
 /// `config::search_limit` — this is display-only, so a small fixed cap.
 const SUGGEST_LIMIT: usize = 8;
+
+/// Quiet window before a suggest request fires (ms). Trailing-edge: the
+/// burst settles first, then the newest ping wins.
+const SUGGEST_DEBOUNCE_MS: u64 = 250;
 
 /// Fold every ping waiting in `rx` into the newest query (debounce helper —
 /// extracted so the fold is testable offline; the network half is `#[ignore]`).

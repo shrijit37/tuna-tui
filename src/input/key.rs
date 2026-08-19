@@ -34,7 +34,10 @@ pub(crate) fn handle_key(
     // --- Search input mode captures everything ---
     if app.search.input_mode {
         match code {
-            KeyCode::Esc => app.search.input_mode = false,
+            KeyCode::Esc => {
+                app.search.input_mode = false;
+                app.search.search_results.clear(); // S29-1: Esc drops stale rows
+            },
             KeyCode::Enter => {
                 app.search.input_mode = false;
                 let q = app.search.query().trim().to_string();
@@ -85,9 +88,13 @@ pub(crate) fn handle_key(
         KeyCode::Esc => {
             if let Some(d) = app.browse.details.pop() {
                 app.browse.selected = d.parent_selected;
-            } else if app.search.searching {
-                app.search.searching = false;
-                app.browse.selected = 0;
+            } else {
+                if app.search.searching {
+                    app.search.searching = false;
+                    app.browse.selected = 0;
+                }
+                // S29-1: Esc fully out of a search drops its stale rows.
+                app.search.search_results.clear();
             }
             // Nothing to back out of — Esc no longer quits (use q or Ctrl-C twice).
         }
