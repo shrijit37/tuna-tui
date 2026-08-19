@@ -75,6 +75,7 @@ pub struct StreamInfo {
 /// search box drives. Purely additive: never called on the UI path, failures
 /// degrade to an empty vec so the caller keeps whatever it was showing.
 pub fn autocomplete(query: &str, limit: usize) -> Vec<String> {
+    let query = query.trim();
     let url = format!(
         "https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q={}",
         percent_encode(query)
@@ -1044,5 +1045,15 @@ mod autocomplete_tests {
     fn percent_encodes_query() {
         assert_eq!(percent_encode("a b&c"), "a%20b%26c");
         assert_eq!(percent_encode("queen"), "queen");
+    }
+
+    /// Live smoke against the real suggest endpoint. `#[ignore]`d per the
+    /// project convention (needs network; run with `--ignored`).
+    #[test]
+    #[ignore]
+    fn autocomplete_live_smoke() {
+        let hits = super::autocomplete("bohemian rhapsody", 5);
+        assert!(!hits.is_empty(), "suggest should answer a common query");
+        assert!(hits.iter().any(|h| h.to_lowercase().contains("rhapsody")));
     }
 }
