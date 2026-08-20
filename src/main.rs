@@ -298,3 +298,303 @@ async fn boot(
     // busy UI must shed the OLDEST pending message instead of queueing images
     // without bound — and saturation never blocks the engine's meta worker.
     let (engine_meta_tx, engine_meta_rx) = flume::bounded::<tuna_tui::engine::EngineMeta>(4);
+
+    // The pure-YouTube expander: every uri the app produces is `yt:` now, so
+    // there is nothing for a hybrid bridge to do.
+    let expander: Arc<dyn tuna_tui::engine::Expander> =
+        Arc::new(tuna_tui::engine::YtExpander::default());
+
+    let (ev_tx, ev_rx) = flume::unbounded::<EngineEvent>();
+    let engine = engine::run(
+        ev_tx,
+        engine_meta_tx,
+        engine_meta_rx.clone(),
+        init_vol,
+        expander,
+    )
+    .context("start engine")?;
+
+    // The one positional argument is a yt: URI (or bare YouTube URL/playlist).
+    // It always wins over a
+    // persisted session; `theme` never reaches here (see `main`).
+    let startup_uri = std::env::args().nth(1).filter(|a| a != "theme");
+    if let Some(uri) = startup_uri.as_ref() {
+        let _ = engine.play_context(uri.clone(), false);
+        // The URI path never sees a `Playing`-handler reapply (the boot is
+        // marked started already) — hand the persisted modes over now.
+        let _ = engine.shuffle(saved.shuffle);
+        let _ = engine.repeat(saved.repeat);
+    }
+
+    let restore_on_startup = should_restore_saved_playback(
+        tuna_tui::config::get().restore_on_startup,
+        startup_uri.as_deref(),
+        &saved,
+    );
+    let now = restore_on_startup
+        .then_some(saved.last_played.as_ref())
+        .flatten()
+        .map(|last_played| NowPlaying {
+            uri: last_played.uri.clone(),
+            title: last_played.title.clone(),
+            artist: last_played.artist.clone(),
+            album: last_played.album.clone(),
+            duration_ms: last_played.duration_ms,
+            position_ms: last_played.position_ms,
+            position_at: Instant::now(),
+            is_playing: false,
+            cover: None,
+        });
+    let restore_uri = now.as_ref().map(|track| track.uri.clone());
+    let (queue, queue_uris, source, source_name) = if restore_on_startup {
+        (
+            saved.queue,
+            saved.queue_uris,
+            saved.source,
+            saved.source_name,
+        )
+    } else {
+        (Vec::new(), Vec::new(), PlaySource::default(), String::new())
+    };
+
+    // HWND is a Windows-specific API.
+    #[cfg(unix)]
+    let hwnd = None;
+
+    // Tuna TUI is a TUI with no window of its own, get the console's window instead.
+    #[cfg(windows)]
+    let hwnd = Some(unsafe { windows_win::sys::GetConsoleWindow() });
+
+    let media_controls = optional_integration(media_platform_ready, || {
+        MediaControls::new(PlatformConfig {
+            dbus_name: "tuna-tui",
+            display_name: "Tuna TUI",
+            hwnd,
+        })
+    });
+    if media_platform_ready && media_controls.is_none() {
+        liblog("media controls unavailable; continuing without native integration");
+    }
+
+    let app = App {
+        svc: Services { engine, picker },
+        media_controls,
+        #[cfg(all(feature = "txc", unix))]
+        txc: bind_publisher(),
+        playback: PlaybackState {
+            last_advance: None,
+            now,
+            seek_target: None,
+            seek_last_step: Instant::now(),
+            seek_last_input: Instant::now(),
+        },
+        theme: ThemeState {
+            displayed: TOKYONIGHT,
+            target: TOKYONIGHT,
+            fade: None,
+        },
+        status: "loading library…".to_string(),
+        browse: BrowseState {
+            library: Library::default(),
+            section: Section::Home,
+            selected: 0,
+            sort: SortMode::Added,
+            details: Vec::new(),
+            playlist_input: None,
+        },
+        transport: Transport {
+            shuffle: saved.shuffle,
+            repeat: saved.repeat,
+            volume: if saved.volume == 0 {
+                80
+            } else {
+                saved.volume.min(100)
+            },
+            queue,
+            queue_uris,
+            playback_started: startup_uri.is_some(),
+            source,
+            source_name,
+        },
+        search: SearchState {
+            input_mode: false,
+            input: Default::default(),
+            searching: false,
+            in_flight: false,
+            search_results: Vec::new(),
+        },
+        view: ViewState {
+            mode: RightView::NowPlaying,
+            zen: tuna_tui::config::get().zen_default,
+            lyrics: Vec::new(),
+            lyrics_synced: false,
+            actions: None,
+            settings: None,
+            queue_selected: 0,
+        },
+        config: tuna_tui::config::get().clone(),
+        session: SessionState {
+            restore_uri,
+            pending_meta: None,
+            last_ctrl_c: None,
+            last_click: None,
+            radio_in_flight: false,
+            meta_cache: {
+                let mut cache = std::collections::HashMap::new();
+                if let Some(last) = &saved.last_played {
+                    if !last.title.is_empty() {
+                        cache.insert(last.uri.clone(), (last.title.clone(), last.artist.clone()));
+                    }
+                }
+                for h in &saved.store.history {
+                    if !h.title.is_empty() {
+                        cache.insert(h.uri.clone(), (h.title.clone(), h.artist.clone()));
+                    }
+                }
+                for l in &saved.store.liked {
+                    if !l.name.is_empty() {
+                        cache.insert(l.uri.clone(), (l.name.clone(), l.subtitle.clone()));
+                    }
+                }
+                cache
+            },
+        },
+        store: saved.store.clone(),
+        store_dirty: false,
+        queue_dirty: false,
+        art_repaint: ArtRepaint::Idle,
+    };
+
+    run_ui(terminal, app, ev_rx, engine_meta_rx).await
+}
+
+struct Radio {
+    start_position_ms: u32,
+    uris: Vec<String>,
+    meta: Vec<(String, String, String)>,
+}
+
+/// Every `Sender` the UI loop hands to input handlers and spawned fetches.
+/// Receivers stay local to `run_ui` because `select!` needs them there.
+///
+/// The menu, action-status and live-queue channels died with the Spotify API:
+/// the menu is instant (`build_action_menu`), actions write locally, and the
+/// queue renders the engine's loaded list.
+pub(crate) struct UiChannels {
+    pub(crate) lib: flume::Sender<(Section, Vec<LibItem>)>,
+    pub(crate) search: flume::Sender<Vec<LibItem>>,
+    pub(crate) suggest: flume::Sender<String>,
+    pub(crate) lyrics: flume::Sender<(Vec<(u32, String)>, bool)>,
+    pub(crate) detail: flume::Sender<(String, String, Vec<LibItem>)>,
+    pub(crate) radio: flume::Sender<Result<Radio, String>>,
+}
+
+/// Should the 24s sync tick re-run `refresh_local_queue`?
+///
+/// The refresh is the only mechanism that upgrades raw-URI queue rows to
+/// "title — artist" as `EngineMeta` lands one track at a time, and the only
+/// re-sync after recovery-removal and resume-restore — so it must run when
+/// the engine queue or the metadata cache changed length. The `usize::MAX`
+/// sentinel makes the first tick after launch always refresh (covering the
+/// resume-restore path, where the lengths can already be in steady state).
+fn refresh_needed(qlen: usize, mlen: usize, last_q: usize, last_m: usize) -> bool {
+    qlen != last_q || mlen != last_m
+}
+
+async fn run_ui(
+    terminal: &mut Term,
+    mut app: App,
+    ev_rx: flume::Receiver<EngineEvent>,
+    engine_meta_rx: flume::Receiver<tuna_tui::engine::EngineMeta>,
+) -> Result<TxcHandle> {
+    let (in_tx, in_rx) = flume::unbounded::<Event>();
+    std::thread::spawn(move || loop {
+        if matches!(event::poll(Duration::from_millis(200)), Ok(true)) {
+            if let Ok(ev) = event::read() {
+                if in_tx.send(ev).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let (lib_tx, lib_rx) = flume::unbounded::<(Section, Vec<LibItem>)>();
+    let (search_tx, search_rx) = flume::unbounded::<Vec<LibItem>>();
+    let (suggest_tx, suggest_rx) = flume::unbounded::<String>();
+    let (suggestions_tx, suggestions_rx) = flume::unbounded::<Vec<LibItem>>();
+    let (lyrics_tx, lyrics_rx) = flume::unbounded::<(Vec<(u32, String)>, bool)>();
+    let (detail_tx, detail_rx) = flume::unbounded::<(String, String, Vec<LibItem>)>();
+    let (radio_tx, radio_rx) = flume::unbounded::<Result<Radio, String>>();
+    let (souvlaki_tx, souvlaki_rx) = flume::unbounded::<MediaControlEvent>();
+    let chans = UiChannels {
+        lib: lib_tx,
+        search: search_tx,
+        suggest: suggest_tx,
+        lyrics: lyrics_tx,
+        detail: detail_tx,
+        radio: radio_tx,
+    };
+    spawn_library_fetch(app.store.clone(), chans.lib.clone());
+    browse::spawn_suggestions(suggest_rx, suggestions_tx);
+
+    if app.playback.now.is_some() {
+        resume_source(&mut app, &chans.radio);
+        app.transport.playback_started = true;
+    }
+
+    // Book the pending guard for the restored last-played track: its metadata
+    // arrives in-band once playback starts (`EngineMeta`), and the guard keeps
+    // any older track's reply from overwriting it.
+    if let Some(uri) = app.session.restore_uri.take() {
+        app.session.pending_meta = Some(uri);
+    }
+
+    if let Some(controls) = app.media_controls.as_mut() {
+        if controls
+            .attach(move |event| {
+                let _ = souvlaki_tx.send(event);
+            })
+            .is_err()
+        {
+            liblog("media controls failed to attach; continuing without native integration");
+            app.media_controls = None;
+        }
+    }
+    let mut media_events_open = true;
+
+    // A persistent interval must live OUTSIDE the select loop. Recreating a
+    // `sleep()` every loop starves forever when player events are continuously
+    // ready: the future gets cancelled/reset before its deadline. That was the
+    // frozen-UI bug.
+    let mut frame = tokio::time::interval(Duration::from_millis(8));
+    frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_draw = Instant::now() - IDLE_REDRAW;
+    let mut last_sync = Instant::now();
+    // Last observed engine-queue / metadata-cache lengths for the sync tick's
+    // refresh gate. The `usize::MAX` sentinel forces a refresh on the first
+    // tick after launch — the resume-restore path needs it even when the
+    // lengths are already in steady state.
+    let mut last_queue_len = usize::MAX;
+    let mut last_meta_len = usize::MAX;
+    // Last-saved transport fields for the F21 save gate: a stopped-session
+    // mixer tweak (volume/shuffle/repeat — mutated in the protected input
+    // files) must still persist within the 24s cadence, so the tick compares
+    // the live fields against what the previous save wrote.
+    let mut last_saved_volume = app.transport.volume;
+    let mut last_saved_shuffle = app.transport.shuffle;
+    let mut last_saved_repeat = app.transport.repeat;
+    // Nothing is on screen yet, so the first tick must draw.
+    let mut dirty = true;
+    let mut last_layout = (app.view.mode, app.view.zen);
+    let mut overlay_open = app.view.actions.is_some();
+    // What the renderer writes. Lives across frames: the hit rects are what the
+    // mouse handler reads between draws, and `lib_offset` is fed back into the
+    // next frame's sticky-viewport calculation.
+    let mut out = FrameOut::default();
+
+    loop {
+        let touched = tokio::select! {
+            biased;
+            _ = frame.tick() => {
+                app.playback.flush_seek(&app.svc.engine, Instant::now());
+                // Drain library updates deterministically before rendering. Keeping
