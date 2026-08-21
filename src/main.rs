@@ -598,3 +598,303 @@ async fn run_ui(
             _ = frame.tick() => {
                 app.playback.flush_seek(&app.svc.engine, Instant::now());
                 // Drain library updates deterministically before rendering. Keeping
+                // this solely as a select arm could starve under a hot player-event
+                // stream / 60fps visualizer — which looked like a frozen library.
+                let mut landed = false;
+                while let Ok((section, mut items)) = lib_rx.try_recv() {
+                    let count = items.len();
+                    dirty = true;
+                    landed = true;
+                    liblog(format!("ui: received {} rows for {}", count, section.label()));
+                    for (i, it) in items.iter_mut().enumerate() {
+                        it.order = i as u32;
+                    }
+                    app.browse.library.set(section, items);
+                    sort_list(app.browse.library.items_mut(section), app.browse.sort);
+                    if section == app.browse.section {
+                        app.normalize_selection();
+                    }
+                    app.status = format!("loaded {}", section.label());
+                }
+                // Local delivery cannot fail (the store is on disk, the sections are
+                // built from it), so once the last section of a drain lands the
+                // loading status clears — there is no retry or failure path anymore.
+                // (The interim "loaded <section>" lines never render; the clear
+                // happens in the same tick, before the frame is drawn.)
+                if landed {
+                    app.status.clear();
+                }
+                // Radio results are drained here (not as a `select!` arm) for the
+                // same reason as the library: under the biased 16ms frame tick a
+                // pure recv arm starves and the station never plays.
+                while let Ok(rad) = radio_rx.try_recv() {
+                    dirty = true;
+                    // The resolve finished (or its timeout path failed): a
+                    // fresh request can go out again.
+                    app.session.radio_in_flight = false;
+                    match rad {
+                        Ok(radio) if !radio.uris.is_empty() => {
+                            for (uri, title, artist) in radio.meta {
+                                app.session.meta_cache.insert(uri, (title, artist));
+                            }
+                            if let Err(e) = app.svc.engine.play_tracks(radio.uris, None, radio.start_position_ms, false) {
+                                app.status = format!("couldn't play radio: {e:#}");
+                            }
+                            // Repeat/volume — deliberately not shuffle: the mix
+                            // must keep its order.
+                            push_transport_modes(&mut app);
+                            app.transport.playback_started = true;
+                            app.status = "radio started".to_string();
+                            app.absorb_meta_hints();
+                            app.refresh_local_queue();
+                        }
+                        Ok(_) => {
+                            app.status = "radio: no tracks returned".to_string();
+                        }
+                        Err(e) => {
+                            app.status = format!("radio failed: {e}");
+                        }
+                    }
+                }
+
+                // Gate the FFT tee on the view that renders it: nothing
+                // consumes the bands outside NowPlaying, so the ~344
+                // 1024-pt FFTs/s would be pure waste there (perf audit F7).
+                // Set from the SAME expression that gates rendering, before
+                // draw — a flag lagging the view by a tick reintroduces the
+                // frozen-spectrum bug class (Myx-a4.14). One guard also reads
+                // is_active here, so the frame pairs a consistent
+                // (enabled, is_active) snapshot.
+                let now_playing = app.view.mode == RightView::NowPlaying;
+                let is_active = app
+                    .svc
+                    .engine
+                    .bands
+                    .try_lock()
+                    .map(|mut g| {
+                        g.enabled = now_playing;
+                        g.is_active
+                    })
+                    .unwrap_or(false);
+                // The visualizer only animates while it is on screen; on Queue
+                // its frame rate buys nothing. Synced lyrics move too — at the
+                // idle rate the highlighted line lands half a second late.
+                let animating = app.theme.fade.is_some()
+                    || (app.view.mode == RightView::Lyrics && app.view.lyrics_synced)
+                    || (now_playing && is_active);
+                if app.art_repaint != ArtRepaint::Idle {
+                    dirty = true;
+                }
+                if (app.view.mode, app.view.zen) != last_layout {
+                    last_layout = (app.view.mode, app.view.zen);
+                    app.art_repaint = ArtRepaint::Wipe;
+                    dirty = true;
+                }
+                // An overlay draws over the art and the terminal loses those
+                // pixels, so the cover has to be sent again once it closes.
+                // Opening one must not wipe: the image would be redrawn a frame
+                // later, back on top of the popup.
+                let overlay = app.view.actions.is_some() || app.view.settings.is_some();
+                if overlay != overlay_open {
+                    overlay_open = overlay;
+                    if !overlay {
+                        app.art_repaint = ArtRepaint::Wipe;
+                    }
+                    dirty = true;
+                }
+                let anim_frame = Duration::from_millis(
+                    (1000 / app.config.animation_fps.max(1)).max(1) as u64,
+                );
+                if should_draw(dirty, animating, last_draw.elapsed(), anim_frame) {
+                    app.theme.advance();
+                    // Present the frame atomically. Without this the terminal
+                    // renders whatever has arrived so far, and a recolour that
+                    // touches every glyph on screen shows up half-applied.
+                    // Terminals that don't know the mode ignore it.
+                    let _ = execute!(io::stdout(), BeginSynchronizedUpdate);
+                    let repaint = app.art_repaint;
+                    let drawn = terminal.draw(|f| render(f, &app, &mut out, repaint));
+                    let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+                    drawn?;
+                    app.art_repaint = app.art_repaint.advance();
+                    last_draw = Instant::now();
+                    dirty = false;
+                }
+                if last_sync.elapsed() >= SYNC_EVERY {
+                    last_sync = Instant::now();
+                    let qlen = app.svc.engine.queue_len();
+                    let mlen = app.session.meta_cache.len();
+                    // Refresh the local queue from the engine while playing so
+                    // the snapshot stays current, then persist it (survives
+                    // reboot). The write runs on a blocking thread — serializing
+                    // the store + fs-write must not freeze the render loop.
+                    //
+                    // The refresh is gated on the queue / metadata-cache
+                    // lengths changing: it re-formats every label, so at idle
+                    // (nothing landing, no recovery-removal) it would only
+                    // re-clone and re-format the same rows every 24s. `refresh_needed`
+                    // fires on every metadata landing (label upgrade) and on
+                    // recovery-removal (the engine snapshot shrinks).
+                    if app.transport.playback_started {
+                        if refresh_needed(qlen, mlen, last_queue_len, last_meta_len) {
+                            app.refresh_local_queue();
+                            // F22: the display cache is bounded by the queue,
+                            // not by age — drop labels for tracks that left
+                            // the engine queue so a long radio session can't
+                            // grow it without bound (the only reader is the
+                            // queue view's labels).
+                            let mut keep: std::collections::HashSet<&String> =
+                                app.transport.queue_uris.iter().collect();
+                            if let Some(now) = app.playback.now.as_ref() {
+                                keep.insert(&now.uri);
+                            }
+                            app.session.meta_cache.retain(|uri, _| keep.contains(uri));
+                        }
+                        last_queue_len = app.transport.queue_uris.len();
+                        last_meta_len = app.session.meta_cache.len();
+                    } else {
+                        // While stopped the sentinel must survive untouched so
+                        // the first playing tick always refreshes (resume-
+                        // restore path); tracking lengths here would consume
+                        // it without ever refreshing.
+                        last_queue_len = usize::MAX;
+                        last_meta_len = usize::MAX;
+                    }
+                    // Dirty gate for the save: at idle the snapshot only
+                    // changes while playing (position ticks) — and a playing
+                    // transport keeps the save cadence on its own. Store
+                    // mutations flag `store_dirty`; queue appends flag
+                    // `queue_dirty`. When both are clean and playback is
+                    // idle, skip the full-store clone + serialize + write.
+                    // Per the F21 binding spec, transport-dirty is
+                    // `playback_started || transport_changed_since_save`. The
+                    // volume/shuffle/repeat mutators live in protected input
+                    // files, so the change is computed here — comparing the
+                    // live fields against the last-saved copy (O(1)).
+                    let transport_changed = app.transport.volume != last_saved_volume
+                        || app.transport.shuffle != last_saved_shuffle
+                        || app.transport.repeat != last_saved_repeat;
+                    let transport_dirty =
+                        app.transport.playback_started || app.queue_dirty || transport_changed;
+                    if app.store_dirty || transport_dirty {
+                        app.store_dirty = false;
+                        app.queue_dirty = false;
+                        last_saved_volume = app.transport.volume;
+                        last_saved_shuffle = app.transport.shuffle;
+                        last_saved_repeat = app.transport.repeat;
+                        let snapshot = save_state(&app);
+                        tokio::task::spawn_blocking(move || snapshot.save());
+
+                    }
+                }
+                false
+            }
+            ev = ev_rx.recv_async() => {
+                let Ok(ev) = ev else { break };
+                handle_engine_event(&mut app, ev);
+                true
+            }
+            ev = in_rx.recv_async() => {
+                match ev {
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        let quit = handle_key(&mut app, key.code, key.modifiers, &chans);
+                        if quit {
+                            // The last save must land before exit — await it.
+                            let snapshot = save_state(&app);
+                            let _ = tokio::task::spawn_blocking(move || snapshot.save()).await;
+                            break;
+                        }
+                    }
+                    Ok(Event::Mouse(m)) => {
+                        let quit = handle_mouse(&mut app, &out, m, &chans);
+                        if quit {
+                            // The last save must land before exit — await it.
+                            let snapshot = save_state(&app);
+                            let _ = tokio::task::spawn_blocking(move || snapshot.save()).await;
+                            break;
+                        }
+                    }
+                    // Resizes lose inline art. Focus only does so when tmux
+                    // repaints a pane; compositor focus-follows-mouse events do
+                    // not and must not make the cover flash.
+                    Ok(Event::Resize(..)) => {
+                        app.art_repaint = ArtRepaint::Wipe;
+                    }
+                    Ok(Event::FocusGained) if std::env::var_os("TMUX").is_some() => {
+                        app.art_repaint = ArtRepaint::Wipe;
+                    }
+                    _ => {}
+                }
+                true
+            }
+            ev = souvlaki_rx.recv_async(), if media_events_open => {
+                match consume_media_event(ev, &mut media_events_open) {
+                    Some(ev) => handle_media_control_event(&mut app, ev, &chans.radio),
+                    None => {
+                        app.media_controls = None;
+                        liblog("media controls event channel closed; native integration disabled");
+                    }
+                }
+                true
+            }
+            // In-band engine metadata: the only TrackMeta source left. The engine
+            // already fetched the cover + theme; map onto the app's TrackMeta
+            // and let the usual pipeline take over.
+            em = engine_meta_rx.recv_async() => {
+                if let Ok(em) = em {
+                    apply_meta(
+                        &mut app,
+                        TrackMeta {
+                            uri: em.uri,
+                            title: em.title,
+                            artist: em.artist,
+                            album: em.album,
+                            duration_ms: em.duration_ms,
+                            image: TrackImage {
+                                url: em.image_url,
+                                image: em.image,
+                            },
+                            theme: em.theme,
+                        },
+                        &chans.lyrics,
+                    );
+                }
+                true
+            }
+            s = search_rx.recv_async() => {
+                if let Ok(results) = s {
+                    for item in &results {
+                        if !item.is_header && !item.name.is_empty() {
+                            app.session.meta_cache.insert(
+                                item.uri.clone(),
+                                (item.name.clone(), item.subtitle.clone()),
+                            );
+                        }
+                    }
+                    app.search.in_flight = false;
+                    app.search.search_results = results;
+                    app.browse.selected = app.first_selectable();
+                    app.status = if app.search.search_results.is_empty() {
+                        "no results".to_string()
+                    } else {
+                        String::new()
+                    };
+                }
+                true
+            }
+            sg = suggestions_rx.recv_async() => {
+                if let Ok(rows) = sg {
+                    // A submit beats a late reply (S29-4): once a real search
+                    // is in flight, suggestion rows must not clobber the
+                    // "searching…" state; once out of input mode, stale rows
+                    // must not resurface (S29-1).
+                    if app.search.input_mode && !app.search.in_flight {
+                        app.search.search_results = rows;
+                        app.browse.selected = app.first_selectable();
+                        app.status = String::new();
+                    }
+                }
+                true
+            }
+            ly = lyrics_rx.recv_async() => {
+                if let Ok((lines, synced)) = ly {
