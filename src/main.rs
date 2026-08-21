@@ -898,3 +898,194 @@ async fn run_ui(
             }
             ly = lyrics_rx.recv_async() => {
                 if let Ok((lines, synced)) = ly {
+                    app.view.lyrics = lines;
+                    app.view.lyrics_synced = synced;
+                }
+                true
+            }
+            d = detail_rx.recv_async() => {
+                if let Ok((context_uri, title, items)) = d {
+                    for item in &items {
+                        if !item.is_header && !item.name.is_empty() {
+                            app.session.meta_cache.insert(
+                                item.uri.clone(),
+                                (item.name.clone(), item.subtitle.clone()),
+                            );
+                        }
+                    }
+                    app.browse.details.push(Detail { context_uri, title, items, parent_selected: app.browse.selected });
+                    app.browse.selected = app.first_selectable();
+                    app.status.clear();
+                }
+                true
+            }
+        };
+        dirty |= touched;
+    }
+    // Hand the publisher back to `main` so the `bye` goes out on the same path
+    // that restores the terminal, rather than relying on where `App` happens
+    // to be dropped.
+    #[cfg(all(feature = "txc", unix))]
+    {
+        Ok(app.txc.take())
+    }
+    #[cfg(not(all(feature = "txc", unix)))]
+    {
+        Ok(())
+    }
+}
+
+/// Push the session's repeat/volume into the engine before fresh playback
+/// starts. Idempotent; the engine keeps its own copy afterwards, so only the
+/// *first* contact after a (re)start matters — which is exactly when these
+/// are dead elsewhere: the `Playing`-handler reapply never fires because every
+/// path that starts playback pre-flips `playback_started`.
+fn push_transport_modes(app: &mut App) {
+    let _ = app.svc.engine.repeat(app.transport.repeat);
+    let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
+}
+
+/// Kick off one radio fetch: resolve the seed on a blocking thread under a
+/// deadline, and land the station (or the timeout error) on `tx`. The
+/// in-flight guard and status text are the caller's job — both the fresh
+/// radio key and the resume path share this exact shape.
+pub(crate) fn spawn_radio(
+    engine: Engine,
+    seed: String,
+    start_position_ms: u32,
+    tx: flume::Sender<Result<Radio, String>>,
+) {
+    tokio::spawn(async move {
+        // F13: per-request cancellation. The 20s timeout cannot cancel the
+        // spawn_blocking closure — without the flag a radio chain would keep
+        // spawning yt-dlp for ~40s after the UI gave up, and a slow-but-alive
+        // chain's late Ok could even fire zombie playback. The flag is
+        type RadioResult = Result<(Vec<String>, Vec<(String, String, String)>), String>;
+        // created HERE, once per request: a shared/stale flag would cancel
+        // unrelated later requests.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let inner_cancel = cancel.clone();
+        let res: RadioResult = match tokio::time::timeout(
+            Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
+            async move {
+                tokio::task::spawn_blocking(move || -> RadioResult {
+                    let rows = engine.radio_entries(&seed, inner_cancel)?;
+                    let (uris, meta_map) =
+                        tuna_tui::engine::expander::station_from_with_meta(&seed, rows)?;
+                    let meta: Vec<(String, String, String)> =
+                        meta_map.into_iter().map(|(u, (t, a))| (u, t, a)).collect();
+                    Ok((uris, meta))
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                // Tell the worker to kill its chain, THEN send the existing
+                // "timed out" error — the drain clears radio_in_flight exactly
+                // as today. Never short-circuit the send: radio_in_flight
+                // would stick true and block every later radio request.
+                cancel.store(true, Ordering::Relaxed);
+                Err("timed out (radio endpoint unresponsive)".to_string())
+            }
+        };
+        let _ = tx.send(res.map(|(uris, meta)| Radio {
+            uris,
+            meta,
+            start_position_ms,
+        }));
+    });
+}
+
+/// Resume the persisted playback source at the last track/position — the
+/// faithful reboot resume (real context ⇒ real queue continuation).
+fn resume_source(app: &mut App, radio_tx: &flume::Sender<Result<Radio, String>>) {
+    push_transport_modes(app);
+    let track = app
+        .playback
+        .now
+        .as_ref()
+        .map(|n| n.uri.clone())
+        .filter(|u| !u.is_empty());
+    let pos = app
+        .playback
+        .now
+        .as_ref()
+        .map(|n| n.position_ms)
+        .unwrap_or(0);
+
+    match app.transport.source.clone() {
+        PlaySource::Context(ctx) => {
+            if let Err(e) = app
+                .svc
+                .engine
+                .play_context_at(ctx, track, pos, app.transport.shuffle)
+            {
+                app.status = format!("couldn't play: {e:#}");
+            }
+        }
+        PlaySource::Radio(seed) => {
+            // Same in-flight guard the Enter path uses: a resumed station must
+            // not race a fresh radio request into the same drain.
+            app.session.radio_in_flight = true;
+            app.status = "resuming radio…".to_string();
+            spawn_radio(app.svc.engine.clone(), seed, pos, radio_tx.clone());
+        }
+        PlaySource::Liked if !app.browse.library.liked.is_empty() => {
+            let uris: Vec<String> = app
+                .browse
+                .library
+                .liked
+                .iter()
+                .map(|i| i.uri.clone())
+                .collect();
+            if let Err(e) = app
+                .svc
+                .engine
+                .play_tracks(uris, track, pos, app.transport.shuffle)
+            {
+                app.status = format!("couldn't play: {e:#}");
+            }
+        }
+        _ => {
+            // No known context — resume the last track followed by the saved
+            // queue so playback actually continues past the first song.
+            if !app.transport.queue_uris.is_empty() {
+                let mut uris = Vec::with_capacity(app.transport.queue_uris.len() + 1);
+                if let Some(u) = &track {
+                    uris.push(u.clone());
+                }
+                uris.extend(app.transport.queue_uris.iter().cloned());
+                if let Err(e) = app
+                    .svc
+                    .engine
+                    .play_tracks(uris, track, pos, app.transport.shuffle)
+                {
+                    app.status = format!("couldn't play: {e:#}");
+                }
+            } else {
+                match track {
+                    Some(uri) => {
+                        if let Err(e) = app.svc.engine.play_track_at(uri, pos) {
+                            app.status = format!("couldn't play: {e:#}");
+                        }
+                    }
+                    None => {
+                        if let Err(e) = app.svc.engine.play() {
+                            app.status = format!("couldn't play: {e:#}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ tests
+
+#[cfg(test)]
+#[path = "main_tests/mod.rs"]
+mod main_tests;
