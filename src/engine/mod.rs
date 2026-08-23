@@ -290,6 +290,17 @@ impl Engine {
         self.inner.expander.radio(seed, cancel)
     }
 
+    /// The radio station as full rows (uri + title + artist + thumbnail),
+    /// seed first. The UI caches the metadata so queue rows render
+    /// "Title — Artist" before each track's own resolve lands.
+    pub fn radio_entries(
+        &self,
+        seed: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<crate::yt::YtVideo>, String> {
+        self.inner.expander.radio_entries(seed, cancel)
+    }
+
     /// The loaded play list, in play order (post-shuffle). Empty when nothing
     /// is loaded. A local mirror for the app's Queue view — the old provider
     /// queue (`/me/player/queue`) died with the Spotify port.
@@ -797,7 +808,6 @@ impl Worker {
             }
         }
     }
-
     /// The natural end of the current track (EOF): advance the queue; if the
     /// process died instead of ending, rebuild the stream.
     ///
@@ -825,11 +835,8 @@ impl Worker {
             .ok()
             .flatten()
             .is_some_and(|s| s.code() != Some(0));
-        let short_track = cur
-            .duration_ms
-            .is_some_and(|d| pos.saturating_add(3_000) >= d);
-        let dropped = !failed && pos < MIN_EOF_POSITION_MS && !short_track;
-        if failed || dropped {
+    let dropped = is_stream_dropped(pos, cur.duration_ms, failed);
+            if dropped {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
             self.drop_streak += 1;
@@ -838,22 +845,23 @@ impl Worker {
                     "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
                 ));
                 self.give_up_on(uri);
-                return;
-            }
-            if dropped {
-                liblog(format!(
-                    "engine: stream dropped for {uri} at {pos}ms (<{MIN_EOF_POSITION_MS}ms); rebuilding"
-                ));
-            } else {
-                liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
-            }
-            self.recover_into(uri, pos);
             return;
         }
+        if failed {
+                liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
+            } else {
+                liblog(format!(
+                "engine: stream dropped for {uri} at {pos}ms (expected {:?}ms); rebuilding",
+                cur.duration_ms
+                ));
+        }
+            self.recover_into(uri, pos);
+                return;
+    }
         self.drop_streak = 0;
         drop(cur);
         self.advance();
-    }
+            }
 
     /// The track is given up on after too many consecutive failures: remove it
     /// from the queue (keeping the queue view mirror in sync) and play its
@@ -1170,6 +1178,16 @@ fn spawn_ffmpeg(url: &str, pos: u32) -> Result<(Child, std::process::ChildStdout
     let bin = crate::config::get().ffmpeg_path.clone();
     let mut cmd = Command::new(&bin);
     cmd.args(["-v", "error", "-hide_banner", "-nostdin"]);
+    if url.starts_with("http://") || url.starts_with("https://") {
+        cmd.args([
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ]);
+    }
     if pos > 0 {
         cmd.arg("-ss").arg(format!("{}", pos / 1000));
     }
@@ -1208,12 +1226,51 @@ fn truncate_seconds(pos: u32) -> u32 {
     pos / 1000 * 1000
 }
 
+/// Pure drop-vs-finish helper: determines whether an EOF signal represents a dropped stream
+/// (network closed mid-track) or a natural end of track.
+pub(crate) fn is_stream_dropped(pos: u32, duration_ms: Option<u32>, failed: bool) -> bool {
+    if failed {
+        return true;
+    }
+    match duration_ms {
+        Some(total_ms) => {
+            // A track with known duration is only finished if the playhead reached within 3s of the end.
+            // Any earlier EOF means the stream disconnected mid-track.
+            pos.saturating_add(3_000) < total_ms
+        }
+        None => {
+            // If duration is unknown, anything under 5s is considered a dropped stream.
+            pos < MIN_EOF_POSITION_MS
+        }
+    }
+}
+
 /// Build in-band metadata for a yt: track, fetching its cover + theme the
 /// same way the api layer did (httpcache-keyed, 24 h TTL).
 fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client) -> EngineMeta {
     let mut image = None;
     let mut theme = None;
-    if let Some(url) = &r.thumbnail {
+    let mut image_url = r.thumbnail.clone();
+
+    // Upgrade to official YouTube Music 1:1 square album art if the thumbnail
+    // is a 16:9 widescreen YouTube video frame or missing.
+    if !image_url.as_ref().is_some_and(|u| u.contains("googleusercontent.com")) {
+        if let Some(id) = crate::util::track_id_from_uri(uri) {
+            let hint = if !r.title.is_empty() {
+                format!("{} {}", r.title, r.artist)
+            } else {
+                String::new()
+            };
+            if let Some(sq) = crate::providers::ytmusic::square_album_art(&id, &hint) {
+                image_url = Some(sq);
+            }
+        }
+    }
+    if let Some(u) = &image_url {
+        image_url = Some(crate::providers::ytmusic::normalize_thumbnail_url(u));
+    }
+
+    if let Some(url) = &image_url {
         if let Some(bytes) = fetch_cover(client, url) {
             if let Ok(img) = image::load_from_memory(&bytes) {
                 theme = Some(crate::reactive::derive_theme(&img, "album ✦"));
@@ -1227,7 +1284,7 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
         artist: r.artist.clone(),
         album: r.album.clone().unwrap_or_default(),
         duration_ms: r.duration_ms.unwrap_or(0),
-        image_url: r.thumbnail.clone(),
+        image_url,
         image,
         theme,
     }

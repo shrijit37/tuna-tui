@@ -269,8 +269,7 @@ mod adversarial {
         // Control: a genuinely short track (duration 3s) that ends at 2.5s is short_track=true, so not dropped
         let short_track = Some(3_000u32);
         let pos = 2_500u32;
-        let dropped_short_track =
-            pos < 5_000 && !short_track.is_some_and(|d| pos.saturating_add(3_000) >= d);
+        let dropped_short_track = crate::engine::is_stream_dropped(pos, short_track, false);
         assert!(
             !dropped_short_track,
             "short track with duration near end must not be dropped"
@@ -278,9 +277,16 @@ mod adversarial {
 
         // Flawed: normal track 200s that ends at 2s is dropped
         let normal_track = Some(200_000u32);
-        let dropped_normal = pos_short < 5_000
-            && !normal_track.is_some_and(|d| pos_short.saturating_add(3_000) >= d);
+        let dropped_normal = crate::engine::is_stream_dropped(pos_short, normal_track, false);
         assert!(dropped_normal, "2s into 200s track must be dropped");
+
+        // Mid-track drop: normal track 200s that ends at 45s (pos_long > 5s) must still be dropped
+        let dropped_mid_track = crate::engine::is_stream_dropped(45_000, normal_track, false);
+        assert!(dropped_mid_track, "45s into 200s track must be treated as dropped stream");
+
+        // Finished track: normal track 200s that ends at 198s is finished, not dropped
+        let finished_normal = crate::engine::is_stream_dropped(198_000, normal_track, false);
+        assert!(!finished_normal, "198s into 200s track must be natural end, not dropped");
     }
 
     /// FLAW: cancelled flag must terminate immediately without draining backlog
