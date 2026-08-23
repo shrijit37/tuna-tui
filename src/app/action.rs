@@ -58,6 +58,7 @@ pub(crate) enum ActionKind {
     CopyLink {
         uri: String,
     },
+    OpenSettings,
 }
 
 pub(crate) struct ActionItem {

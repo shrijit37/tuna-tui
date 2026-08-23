@@ -111,6 +111,8 @@ pub(crate) struct ViewState {
     pub(crate) lyrics_synced: bool,
     // Context actions menu overlay (opened with `a`).
     pub(crate) actions: Option<ActionMenu>,
+    // Settings modal overlay (opened with `S` or Ctrl+, or from menu).
+    pub(crate) settings: Option<SettingsState>,
     // Selected row index in the Queue view.
     pub(crate) queue_selected: usize,
 }
