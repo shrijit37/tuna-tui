@@ -1419,23 +1419,7 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
 /// return is gone — it unconditionally resizes), so the size check here is
 /// what guarantees "never upscales". Corrupt bytes take the existing `None`
 fn decode_cover(bytes: &[u8]) -> Option<image::DynamicImage> {
-    let img = image::load_from_memory(bytes).ok()?;
-    let (w, h) = (img.width(), img.height());
-    // Center-crop non-square thumbnails to 1:1 square so the art fills the
-    // cell grid symmetrically and never renders off-center or letterboxed.
-    let cropped = if w != h {
-        let side = w.min(h);
-        let x = (w - side) / 2;
-        let y = (h - side) / 2;
-        img.crop_imm(x, y, side, side)
-    } else {
-        img
-    };
-    if cropped.width() > 320 || cropped.height() > 320 {
-        Some(cropped.thumbnail(320, 320))
-    } else {
-        Some(cropped)
-    }
+    image::load_from_memory(bytes).ok()
 }
 
 /// Cover bytes, from disk when they've been seen before; error pages are
@@ -1562,38 +1546,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_cover_thumbnails() {
-        // Full-res art (the largest YouTube thumbnail size) must come back at
-        // or below the 320 px target — the whole point of F15.
-        let mut buf = image::RgbaImage::new(1280, 720);
-        for (x, y, px) in buf.enumerate_pixels_mut() {
-            *px = image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255]);
-        }
+    fn decode_cover_loads_image() {
+        let buf = image::RgbaImage::new(100, 100);
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgba8(buf)
-            .write_to(
-                &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
-            )
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
             .expect("png encode");
         let img = decode_cover(&bytes).expect("cover decodes");
-        let (w, h) = (img.width(), img.height());
-        assert!(w <= 320 && h <= 320, "downscale failed: {w}x{h}");
-
-        // thumbnail never upscales: a small fallback passes through unchanged.
-        let mut small = Vec::new();
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            64,
-            64,
-            image::Rgba([10, 20, 30, 255]),
-        ))
-        .write_to(
-            &mut std::io::Cursor::new(&mut small),
-            image::ImageFormat::Png,
-        )
-        .expect("png encode");
-        let img = decode_cover(&small).expect("small cover decodes");
-        assert_eq!((img.width(), img.height()), (64, 64), "no upscale");
+        assert_eq!((img.width(), img.height()), (100, 100));
     }
 
     /// Oracle for the playback chain on the ACTUAL machine: does a known 1 s
