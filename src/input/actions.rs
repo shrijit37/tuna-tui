@@ -115,7 +115,9 @@ pub(crate) fn handle_action_key(app: &mut App, code: KeyCode, chans: &crate::UiC
         }
         ActionKind::OpenSettings => {
             app.view.actions = None;
-            app.view.settings = Some(SettingsState::init_from_config(tuna_tui::config::get()));
+            // Seed from the LIVE runtime config (app.config), not the
+            // boot-time static — otherwise reopened menus show stale values.
+            app.view.settings = Some(SettingsState::init_from_config(&app.config));
             app.status.clear();
         }
         other => {
