@@ -148,11 +148,44 @@ impl App {
     /// A display string for a track uri: the cached "title — artist" once its
     /// metadata has landed, the bare uri before that.
     pub(crate) fn track_label_of(&self, uri: &str) -> String {
-        match self.session.meta_cache.get(uri) {
-            Some((t, a)) if a.is_empty() => t.clone(),
-            Some((t, a)) => format!("{t} — {a}"),
-            None => uri.to_string(),
+        if let Some((t, a)) = self.session.meta_cache.get(uri) {
+            if a.is_empty() {
+                return t.clone();
+            } else {
+                return format!("{t} — {a}");
+            }
         }
+        // Fallback: check store history, liked, and playlists
+        if let Some(h) = self.store.history.iter().find(|h| h.uri == uri) {
+            if !h.title.is_empty() {
+                if h.artist.is_empty() {
+                    return h.title.clone();
+                } else {
+                    return format!("{} — {}", h.title, h.artist);
+                }
+            }
+        }
+        if let Some(l) = self.store.liked.iter().find(|l| l.uri == uri) {
+            if !l.name.is_empty() {
+                if l.subtitle.is_empty() {
+                    return l.name.clone();
+                } else {
+                    return format!("{} — {}", l.name, l.subtitle);
+                }
+            }
+        }
+        for p in &self.store.playlists {
+            if let Some(t) = p.tracks.iter().find(|t| t.uri == uri) {
+                if !t.name.is_empty() {
+                    if t.subtitle.is_empty() {
+                        return t.name.clone();
+                    } else {
+                        return format!("{} — {}", t.name, t.subtitle);
+                    }
+                }
+            }
+        }
+        uri.to_string()
     }
 
     /// Refresh the Queue view's data from the engine's loaded list (the local
@@ -186,14 +219,20 @@ impl App {
                 item.uri.as_str(),
                 "tuna:action:liked-play" | "myx:action:liked-play"
             ) {
-                let uris: Vec<String> = self
+                let tracks: Vec<(String, String, String)> = self
                     .browse
                     .library
                     .liked
                     .iter()
-                    .filter(|i| i.is_track)
-                    .map(|i| i.uri.clone())
+                    .filter(|i| i.is_track && !i.name.is_empty())
+                    .map(|i| (i.uri.clone(), i.name.clone(), i.subtitle.clone()))
                     .collect();
+                for (uri, name, subtitle) in &tracks {
+                    self.session
+                        .meta_cache
+                        .insert(uri.clone(), (name.clone(), subtitle.clone()));
+                }
+                let uris: Vec<String> = tracks.into_iter().map(|(u, _, _)| u).collect();
                 if !uris.is_empty() {
                     self.transport.source = PlaySource::Liked;
                     self.transport.source_name = "Liked Songs".to_string();
@@ -219,6 +258,13 @@ impl App {
                 .unwrap_or_else(|| item.name.clone());
             let shuffle = self.transport.shuffle;
             if let Some(d) = self.browse.details.last() {
+                for item in d.items.iter().filter(|i| i.is_track) {
+                    if !item.name.is_empty() {
+                        self.session
+                            .meta_cache
+                            .insert(item.uri.clone(), (item.name.clone(), item.subtitle.clone()));
+                    }
+                }
                 let uris: Vec<String> = d
                     .items
                     .iter()
@@ -252,6 +298,13 @@ impl App {
                 self.transport.source = PlaySource::Context(ctx);
                 self.transport.source_name = d.title.clone();
                 self.status = format!("starting {}…", item.name);
+                for it in d.items.iter().filter(|i| i.is_track) {
+                    if !it.name.is_empty() {
+                        self.session
+                            .meta_cache
+                            .insert(it.uri.clone(), (it.name.clone(), it.subtitle.clone()));
+                    }
+                }
                 let uris: Vec<String> = d
                     .items
                     .iter()
@@ -271,12 +324,18 @@ impl App {
                 return Activated::None;
             }
             // Section track list.
-            let uris = self
+            let tracks: Vec<(String, String, String)> = self
                 .cur_items()
                 .iter()
-                .filter(|i| i.is_track)
-                .map(|i| i.uri.clone())
+                .filter(|i| i.is_track && !i.name.is_empty())
+                .map(|i| (i.uri.clone(), i.name.clone(), i.subtitle.clone()))
                 .collect();
+            for (uri, name, subtitle) in &tracks {
+                self.session
+                    .meta_cache
+                    .insert(uri.clone(), (name.clone(), subtitle.clone()));
+            }
+            let uris: Vec<String> = tracks.into_iter().map(|(u, _, _)| u).collect();
             self.status = format!("starting {}…", item.name);
             if self.browse.section == Section::Liked {
                 self.transport.source = PlaySource::Liked;
