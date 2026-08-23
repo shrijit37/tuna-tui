@@ -93,11 +93,88 @@ pub fn fetch_lyrics_blocking(
     {
         return hit.clone();
     }
+
+    // Check persistent on-disk cache for instant 0ms reload
+    let disk_key = format!("lyrics:{memo_key}");
+    if let Some(cached_json) = crate::httpcache::get(&disk_key, None) {
+        if let Ok(hit) = serde_json::from_str::<MemoValue>(&cached_json) {
+            MEMO.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(memo_key, hit.clone());
+            return hit;
+        }
+    }
+
     let result = fetch_with_fallback(client, artist, title, album, expected_s);
+    if !result.0.is_empty() {
+        if let Ok(json) = serde_json::to_string(&result) {
+            crate::httpcache::put(&disk_key, &json);
+        }
+    }
     MEMO.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(memo_key, result.clone());
     result
+}
+
+/// Fetch lyrics from YouTube Music InnerTube fallback, with disk caching and Indic transliteration.
+pub fn fetch_ytmusic_lyrics(video_id: &str) -> (Vec<(u32, String)>, bool) {
+    if video_id.is_empty() {
+        return (Vec::new(), false);
+    }
+    let disk_key = format!("lyrics:yt:{video_id}");
+    if let Some(cached_json) = crate::httpcache::get(&disk_key, None) {
+        if let Ok(hit) = serde_json::from_str::<MemoValue>(&cached_json) {
+            return hit;
+        }
+    }
+    if let Some(yt_lyrics) = crate::providers::ytmusic::lyrics(video_id) {
+        let lines: Vec<(u32, String)> = yt_lyrics
+            .lines()
+            .map(|l| {
+                let text = if crate::lyrics::transliterate::contains_indic(l) {
+                    crate::lyrics::transliterate::transliterate_indic(l)
+                } else {
+                    l.to_string()
+                };
+                (0u32, text)
+            })
+            .collect();
+        let res = (lines, false);
+        if !res.0.is_empty() {
+            if let Ok(json) = serde_json::to_string(&res) {
+                crate::httpcache::put(&disk_key, &json);
+            }
+        }
+        res
+    } else {
+        (Vec::new(), false)
+    }
+}
+
+/// Quietly prefetch lyrics in a background thread so they are already cached in memory
+/// and on disk when the next track begins (0ms perceived latency).
+pub fn prefetch_lyrics(
+    artist: String,
+    title: String,
+    album: String,
+    duration_ms: u32,
+    video_id: Option<String>,
+) {
+    if title.is_empty() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("tuna-lyrics-prefetch".into())
+        .spawn(move || {
+            let res = fetch_lyrics_blocking(&artist, &title, &album, duration_ms);
+            if res.0.is_empty() {
+                if let Some(id) = video_id {
+                    let _ = fetch_ytmusic_lyrics(&id);
+                }
+            }
+        })
+        .ok();
 }
 
 /// Build the memo key — spec §35 `lyrics:{sha256}` shaped but in-memory.
