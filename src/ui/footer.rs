@@ -42,6 +42,7 @@ pub(crate) fn render_footer(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
             Span::styled("z", Style::default().fg(on(app.view.zen).into())),
             lbl(" zen   "),
         ),
+        (false, key(","), lbl(" settings   ")),
         (false, key("q"), lbl(" quit")),
     ];
     let line = Line::from(

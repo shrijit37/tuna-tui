@@ -25,12 +25,74 @@ pub(crate) fn handle_key(
         app.status = "press Ctrl-C again to quit".to_string();
         return false;
     }
+    // --- Settings menu captures input while open ---
+    if let Some(mut state) = app.view.settings.take() {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if state.dirty {
+                    if let Some(path) = tuna_tui::config::Config::path() {
+                        let mut cfg = tuna_tui::config::get().clone();
+                        state.apply_to_config(&mut cfg);
+                        let _ = cfg.save_to_file(&path);
+                    }
+                    app.status = "Settings saved".to_string();
+                }
+                app.view.settings = None;
+                app.art_repaint = ArtRepaint::Wipe;
+                return false;
+            }
+            KeyCode::Tab | KeyCode::Char('\t') => {
+                state.next_tab();
+            }
+            KeyCode::BackTab => {
+                state.prev_tab();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.prev_row();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.next_row();
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                let act = state.cycle_value(false);
+                if let Some(SettingsAction::ClearCache) = act {
+                    if let Some(home) = tuna_tui::home_dir() {
+                        let cache_dir = home.join(".cache/tuna-tui");
+                        let _ = std::fs::remove_dir_all(&cache_dir);
+                        state.status_msg = Some("Cache cleared successfully".to_string());
+                    }
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let act = state.cycle_value(true);
+                if let Some(SettingsAction::ClearCache) = act {
+                    if let Some(home) = tuna_tui::home_dir() {
+                        let cache_dir = home.join(".cache/tuna-tui");
+                        let _ = std::fs::remove_dir_all(&cache_dir);
+                        state.status_msg = Some("Cache cleared successfully".to_string());
+                    }
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let act = state.cycle_value(true);
+                if let Some(SettingsAction::ClearCache) = act {
+                    if let Some(home) = tuna_tui::home_dir() {
+                        let cache_dir = home.join(".cache/tuna-tui");
+                        let _ = std::fs::remove_dir_all(&cache_dir);
+                        state.status_msg = Some("Cache cleared successfully".to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        app.view.settings = Some(state);
+        return false;
+    }
 
     if app.view.actions.is_some() {
         handle_action_key(app, code, chans);
         return false;
     }
-
     // --- Playlist creation input mode captures keys ---
     if let Some(input) = &mut app.browse.playlist_input {
         match code {
@@ -217,6 +279,10 @@ pub(crate) fn handle_key(
                     app.view.actions = Some(build_action_menu(&app.store, &item));
                 }
             }
+        }
+        KeyCode::Char(',') => {
+            app.view.settings = Some(SettingsState::init_from_config(tuna_tui::config::get()));
+            app.status.clear();
         }
         // Tab / Shift+Tab (and [ ]) rotate the library sections.
         KeyCode::Tab | KeyCode::Char(']') => {

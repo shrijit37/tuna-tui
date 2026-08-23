@@ -232,3 +232,30 @@ fn a_fade_is_long_enough_to_be_smooth_at_the_animation_rate() {
     let steps = FADE_MS / ANIM_FRAME.as_millis().max(1) as u64;
     assert!(steps >= 30, "only {steps} steps of recolour");
 }
+
+#[test]
+fn settings_menu_state_and_navigation() {
+    let config = tuna_tui::config::Config::default();
+    let mut state = SettingsState::init_from_config(&config);
+    assert_eq!(state.tab, SettingsTab::Display);
+
+    // Navigation between tabs
+    state.next_tab();
+    assert_eq!(state.tab, SettingsTab::Audio);
+    state.next_tab();
+    assert_eq!(state.tab, SettingsTab::Lyrics);
+    state.next_tab();
+    assert_eq!(state.tab, SettingsTab::Search);
+    state.next_tab();
+    assert_eq!(state.tab, SettingsTab::System);
+    state.next_tab();
+    assert_eq!(state.tab, SettingsTab::Display);
+
+    // Navigation between rows
+    let rows = state.current_rows();
+    assert!(!rows.is_empty());
+    state.next_row();
+    assert_eq!(state.selected, 1);
+    state.prev_row();
+    assert_eq!(state.selected, 0);
+}

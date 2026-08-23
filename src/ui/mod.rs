@@ -10,6 +10,7 @@ mod lyrics;
 mod nowplaying;
 mod overlay;
 mod queue;
+mod settings;
 mod visualizer;
 
 pub(crate) use footer::*;
@@ -18,6 +19,7 @@ pub(crate) use lyrics::*;
 pub(crate) use nowplaying::*;
 pub(crate) use overlay::*;
 pub(crate) use queue::*;
+pub(crate) use settings::*;
 pub(crate) use visualizer::*;
 
 use crate::*;
@@ -113,6 +115,9 @@ pub(crate) fn render(f: &mut Frame, app: &App, out: &mut FrameOut, repaint: ArtR
 
     if app.view.actions.is_some() {
         render_actions_overlay(f, app, theme, area);
+    }
+    if app.view.settings.is_some() {
+        render_settings_overlay(f, app, theme, area);
     }
 }
 

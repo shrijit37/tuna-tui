@@ -31,6 +31,10 @@ fn push_context_tail(items: &mut Vec<ActionItem>, uri: &str, name: &str, open_la
         label: "⧉  Copy Link".into(),
         kind: ActionKind::CopyLink { uri: uri.into() },
     });
+    items.push(ActionItem {
+        label: "⚙  Settings".into(),
+        kind: ActionKind::OpenSettings,
+    });
 }
 
 /// Build the context menu for `item`, reading saved/followed state from the
@@ -131,6 +135,10 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
             items.push(ActionItem {
                 label: "⧉  Copy Link".into(),
                 kind: ActionKind::CopyLink { uri },
+            });
+            items.push(ActionItem {
+                label: "⚙  Settings".into(),
+                kind: ActionKind::OpenSettings,
             });
         }
         "channel" | "artist" => {

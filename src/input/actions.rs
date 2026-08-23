@@ -113,6 +113,11 @@ pub(crate) fn handle_action_key(app: &mut App, code: KeyCode, chans: &crate::UiC
             };
             app.view.actions = None;
         }
+        ActionKind::OpenSettings => {
+            app.view.actions = None;
+            app.view.settings = Some(SettingsState::init_from_config(tuna_tui::config::get()));
+            app.status.clear();
+        }
         other => {
             // Every write is local now: mutate the store / transport and
             // report the status line directly.

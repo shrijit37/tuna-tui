@@ -429,6 +429,7 @@ async fn boot(
             lyrics: Vec::new(),
             lyrics_synced: false,
             actions: None,
+            settings: None,
             queue_selected: 0,
         },
         session: SessionState {
@@ -692,7 +693,7 @@ async fn run_ui(
                 // pixels, so the cover has to be sent again once it closes.
                 // Opening one must not wipe: the image would be redrawn a frame
                 // later, back on top of the popup.
-                let overlay = app.view.actions.is_some();
+                let overlay = app.view.actions.is_some() || app.view.settings.is_some();
                 if overlay != overlay_open {
                     overlay_open = overlay;
                     if !overlay {

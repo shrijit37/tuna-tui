@@ -20,6 +20,7 @@ mod frame;
 mod library;
 mod persist;
 mod playback;
+mod settings;
 mod state;
 
 pub(crate) use action::*;
@@ -28,8 +29,8 @@ pub(crate) use frame::*;
 pub(crate) use library::*;
 pub(crate) use persist::*;
 pub(crate) use playback::*;
+pub(crate) use settings::*;
 pub(crate) use state::*;
-
 use crate::*;
 
 pub(crate) struct App {
