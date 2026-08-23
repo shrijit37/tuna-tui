@@ -9,6 +9,7 @@ use crate::yt::YtVideo;
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false";
 const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
+const BROWSE_URL: &str = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false";
 const CLIENT_NAME: &str = "WEB_REMIX";
 const CLIENT_VERSION: &str = "1.20260821.01.00";
 
@@ -523,6 +524,49 @@ pub fn radio(video_id: &str) -> Option<Vec<YtVideo>> {
     }
 }
 
+/// Fetch official lyrics for a video id from YouTube Music InnerTube (`next` -> `browse` endpoint).
+pub fn lyrics(video_id: &str) -> Option<String> {
+    if video_id.trim().is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "context": innertube_context(),
+        "videoId": video_id,
+    });
+    let next_root = post(NEXT_URL, body)?;
+    let tabs = next_root
+        .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")?
+        .as_array()?;
+    let lyrics_tab = tabs.iter().find(|t| {
+        t.pointer("/tabRenderer/title")
+            .and_then(|v| v.as_str())
+            .is_some_and(|title| title.eq_ignore_ascii_case("lyrics"))
+    })?;
+    let browse_id = lyrics_tab
+        .pointer("/tabRenderer/endpoint/browseEndpoint/browseId")?
+        .as_str()?;
+
+    let browse_body = serde_json::json!({
+        "context": innertube_context(),
+        "browseId": browse_id,
+    });
+    let browse_root = post(BROWSE_URL, browse_body)?;
+    let runs = browse_root
+        .pointer("/contents/sectionListRenderer/contents/0/musicDescriptionShelfRenderer/description/runs")?
+        .as_array()?;
+    let mut out = String::new();
+    for r in runs {
+        if let Some(text) = r["text"].as_str() {
+            out.push_str(text);
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Query YouTube Music for the official 1:1 square album art (`544x544`)
 /// for a video ID, falling back to a YouTube Music search by title if needed.
 pub fn square_album_art(video_id: &str, title_hint: &str) -> Option<String> {
@@ -919,5 +963,15 @@ mod tests {
             .expect("live square album art for Rick Astley");
         assert!(art2.contains("googleusercontent.com"));
         assert!(art2.contains("=w544-h544-l90-rj"));
+    }
+
+    /// Live smoke test: YouTube Music regional lyrics (Hindi/Punjabi). Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn live_ytmusic_regional_lyrics() {
+        // Kesariya by Arijit Singh
+        let text = lyrics("NJAv_7lHUIU").expect("live lyrics for Kesariya");
+        assert!(!text.is_empty());
+        assert!(text.contains("केसरिया") || text.contains("रब्बा") || text.contains("मुझको"));
     }
 }

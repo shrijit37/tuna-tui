@@ -152,17 +152,33 @@ pub(crate) fn apply_meta(
 
     // Fetch synced lyrics from lrclib for the new track.
     if !meta.title.is_empty() {
-        let (artist, title, album, dur) = (
+        let (artist, title, album, dur, uri) = (
             meta.artist.clone(),
             meta.title.clone(),
             meta.album.clone(),
             meta.duration_ms,
+            meta.uri.clone(),
         );
         let tx = lyrics_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send(tuna_tui::lyrics::fetch::fetch_lyrics_blocking(
+            let res = tuna_tui::lyrics::fetch::fetch_lyrics_blocking(
                 &artist, &title, &album, dur,
-            ));
+            );
+            if !res.0.is_empty() {
+                let _ = tx.send(res);
+            } else if let Some(id) = tuna_tui::util::track_id_from_uri(&uri) {
+                if let Some(yt_lyrics) = tuna_tui::providers::ytmusic::lyrics(&id) {
+                    let lines: Vec<(u32, String)> = yt_lyrics
+                        .lines()
+                        .map(|l| (0u32, l.to_string()))
+                        .collect();
+                    let _ = tx.send((lines, false));
+                } else {
+                    let _ = tx.send((Vec::new(), false));
+                }
+            } else {
+                let _ = tx.send((Vec::new(), false));
+            }
         });
     }
 
