@@ -107,7 +107,10 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
     for a in &store.artists {
         seen_artists.insert(a.name.to_lowercase());
     }
-    let mut artist_counts: Vec<(String, u32)> = Vec::new();
+    // Aggregate play counts per artist in O(N) with a lowercase-key map;
+    // the value keeps the first-seen casing for display.
+    let mut artist_counts: std::collections::HashMap<String, (String, u32)> =
+        std::collections::HashMap::new();
     for h in &store.history {
         let raw = h.artist.trim();
         if raw.is_empty() {
@@ -121,17 +124,14 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
             {
                 continue;
             }
-            if let Some(pos) = artist_counts
-                .iter()
-                .position(|(a, _)| a.eq_ignore_ascii_case(name))
-            {
-                artist_counts[pos].1 += h.count;
-            } else {
-                artist_counts.push((name.to_string(), h.count));
-            }
+            artist_counts
+                .entry(name.to_lowercase())
+                .and_modify(|(_, c)| *c += h.count)
+                .or_insert((name.to_string(), h.count));
         }
     }
-    artist_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut artist_counts: Vec<(String, u32)> = artist_counts.into_values().collect();
+    artist_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
     for (name, count) in artist_counts {
         if seen_artists.insert(name.to_lowercase()) {
             let uri = format!("yt:artist:{}", name);

@@ -12,30 +12,25 @@ use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-/// Truncate to `max` display columns, replacing the tail with an ellipsis.
+/// Truncate `s` to at most `max` characters, appending `…` when truncated.
 ///
-/// Grapheme-cluster aware: never splits multi-byte characters, combining matras,
-/// or complex Indic/Gurmukhi conjuncts, preserving correct font rendering in terminals.
+/// Counts Unicode scalar values (chars), not bytes. Note the quirks:
+/// - `max == 0` returns `"…"` (length 1), not `""`.
+/// - `max == 1` returns `"…"` with 0 characters of `s`.
+/// - Grapheme clusters (combining marks, ZWJ sequences) may be severed.
 pub fn truncate<'a>(s: &'a str, max: usize) -> Cow<'a, str> {
-    let width = s.width();
-    if width <= max {
+    if s.chars().count() <= max {
         return Cow::Borrowed(s);
     }
-    if max == 0 {
-        return Cow::Borrowed("");
-    }
-    let target = max.saturating_sub(1);
-    let mut cur_w = 0;
-    let mut end_idx = 0;
-    for g in s.graphemes(true) {
-        let gw = g.width();
-        if cur_w + gw > target {
+    let prefix_len = max.saturating_sub(1);
+    let mut byte_idx = 0;
+    for (i, (b, _)) in s.char_indices().enumerate() {
+        if i == prefix_len {
+            byte_idx = b;
             break;
         }
-        cur_w += gw;
-        end_idx += g.len();
     }
-    let prefix = &s[..end_idx];
+    let prefix = &s[..byte_idx];
     Cow::Owned(format!("{prefix}…"))
 }
 

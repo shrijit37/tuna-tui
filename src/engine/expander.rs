@@ -136,6 +136,9 @@ impl Expander for YtExpander {
     }
 }
 
+/// Queue prefill map: uri → (title, artist), one entry per titled radio row.
+pub type RadioMeta = std::collections::HashMap<String, (String, String)>;
+
 /// The seed first, then the mix rows — the seed itself skipped when the mix
 /// echoes it, the whole list capped to `RADIO_LIMIT` + 1. Alongside the uris it
 /// returns a `(title, artist)` prefill map keyed by uri — one entry per queued
@@ -145,7 +148,7 @@ impl Expander for YtExpander {
 pub fn station_from_with_meta(
     seed: &str,
     rows: Vec<yt::YtVideo>,
-) -> Result<(Vec<String>, std::collections::HashMap<String, (String, String)>), String> {
+) -> Result<(Vec<String>, RadioMeta), String> {
     let mut meta = std::collections::HashMap::new();
     let mut uris = vec![seed.to_string()];
     for row in rows.into_iter().take(RADIO_LIMIT) {

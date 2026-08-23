@@ -27,8 +27,11 @@ fn lyrics_client() -> &'static reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_millis(2500))
             .connect_timeout(std::time::Duration::from_millis(1500))
+            // Fail fast: a builder failure here means TLS/runtime breakage;
+            // silently falling back to a default client would drop the tight
+            // 2.5s/1.5s budgets and wedge the lyrics worker on slow networks.
             .build()
-            .unwrap_or_default()
+            .expect("failed to build the lrclib HTTP client")
     })
 }
 

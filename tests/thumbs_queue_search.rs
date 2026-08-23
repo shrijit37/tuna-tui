@@ -356,7 +356,7 @@ fn search_innertube_fixture_parses_daft_punk() {
     let first = &shelf[0];
     assert!(first.get("musicResponsiveListItemRenderer").is_some());
     let thumb_obj = &first["musicResponsiveListItemRenderer"]["thumbnail"]["musicThumbnailRenderer"]["thumbnail"];
-    let picked = ideal_pick_best_thumbnail(&thumb_obj);
+    let picked = ideal_pick_best_thumbnail(thumb_obj);
     assert_eq!(
         picked.as_deref(),
         Some("https://lh3.googleusercontent.com/abc=w544-h544-l90-rj"),
@@ -403,7 +403,7 @@ fn search_duration_parses_m_ss() {
         }
     }
     assert_eq!(parse_duration("3:48"), Some(228_000));
-    assert_eq!(parse_duration("1:02:03"), Some(3723_000));
+    assert_eq!(parse_duration("1:02:03"), Some(3_723_000));
     assert_eq!(parse_duration("invalid"), None);
     assert_eq!(parse_duration(""), None);
 }

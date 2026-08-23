@@ -409,8 +409,8 @@ pub fn pick_thumbnail(v: &serde_json::Value) -> Option<String> {
                 best = Some((w, i));
             }
         }
-        if best.is_some() {
-            return entry_url(arr.unwrap(), best.unwrap().1);
+        if let Some((_, idx)) = best {
+            return entry_url(entries, idx);
         }
         // Tier 1: dimensioned non-squares — largest area wins.
         let mut area_best: Option<(u64, usize)> = None;
@@ -428,8 +428,8 @@ pub fn pick_thumbnail(v: &serde_json::Value) -> Option<String> {
                 area_best = Some((area, i));
             }
         }
-        if area_best.is_some() {
-            return entry_url(entries, area_best.unwrap().1);
+        if let Some((_, idx)) = area_best {
+            return entry_url(entries, idx);
         }
         // Tier 2: legacy width-less rows — last entry with a url wins.
         for t in entries.iter().rev() {
@@ -558,7 +558,7 @@ fn ytv_from_music_row(item: &serde_json::Value) -> Option<YtVideo> {
         .and_then(|f| f.as_array())
         .and_then(|a| a.first())
         .and_then(|c| c.get("musicResponsiveListItemFixedColumnRenderer"))
-        .map(|c| runs_text_of_col(c))
+        .map(runs_text_of_col)
         .and_then(|t| parse_hms_ms(&t));
     let thumbnail = pick_thumbnail(item);
     Some(YtVideo {

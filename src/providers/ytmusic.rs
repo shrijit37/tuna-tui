@@ -690,7 +690,7 @@ mod tests {
     fn duration_parses_common_shapes() {
         assert_eq!(parse_duration_to_ms("3:45"), Some(225_000));
         assert_eq!(parse_duration_to_ms("0:30"), Some(30_000));
-        assert_eq!(parse_duration_to_ms("1:02:03"), Some(3723_000));
+        assert_eq!(parse_duration_to_ms("1:02:03"), Some(3_723_000));
         assert_eq!(parse_duration_to_ms("10:00"), Some(600_000));
         assert_eq!(parse_duration_to_ms(""), None);
         assert_eq!(parse_duration_to_ms("abc"), None);

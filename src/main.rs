@@ -911,14 +911,15 @@ pub(crate) fn spawn_radio(
         // spawn_blocking closure — without the flag a radio chain would keep
         // spawning yt-dlp for ~40s after the UI gave up, and a slow-but-alive
         // chain's late Ok could even fire zombie playback. The flag is
+        type RadioResult = Result<(Vec<String>, Vec<(String, String, String)>), String>;
         // created HERE, once per request: a shared/stale flag would cancel
         // unrelated later requests.
         let cancel = Arc::new(AtomicBool::new(false));
         let inner_cancel = cancel.clone();
-        let res: Result<(Vec<String>, Vec<(String, String, String)>), String> = match tokio::time::timeout(
+        let res: RadioResult = match tokio::time::timeout(
             Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
             async move {
-                tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<(String, String, String)>), String> {
+                tokio::task::spawn_blocking(move || -> RadioResult {
                     let rows = engine.radio_entries(&seed, inner_cancel)?;
                     let (uris, meta_map) =
                         tuna_tui::engine::expander::station_from_with_meta(&seed, rows)?;

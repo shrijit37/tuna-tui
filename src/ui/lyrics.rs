@@ -74,7 +74,9 @@ pub(crate) fn render_lyrics(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
     for (i, (_, text)) in app.view.lyrics.iter().enumerate().skip(start).take(h) {
         let style = if app.view.lyrics_synced {
             if i == cur {
-                Style::default().fg(theme.primary.into())
+                Style::default()
+                    .fg(theme.primary.into())
+                    .add_modifier(Modifier::BOLD)
             } else if i < cur {
                 Style::default().fg(theme.border_subtle.into())
             } else {
