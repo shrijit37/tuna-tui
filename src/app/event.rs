@@ -137,6 +137,9 @@ pub(crate) fn apply_meta(
     // app/event.rs:134–136) — flag it so the 24s save persists the history
     // row even if the playback cadence ever stops covering it.
     app.store_dirty = true;
+    for (section, items) in crate::browse::build_all_sections(&app.store) {
+        app.browse.library.set(section, items);
+    }
 
     let cover = meta
         .image

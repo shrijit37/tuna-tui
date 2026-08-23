@@ -227,50 +227,8 @@ fn apply_toggle(
     app.store_dirty = true;
     let (added, removed) = toggle_msg(kind);
     let is_added = app.store.toggle(kind, name, subtitle, uri);
-    match kind {
-        StoreKind::Liked => {
-            let mut liked: Vec<LibItem> = vec![
-                LibItem::play(
-                    "▶︎  Play Liked Songs".into(),
-                    "tuna:action:liked-play".into(),
-                ),
-                LibItem::header("Songs"),
-            ];
-            liked.extend(
-                app.store
-                    .liked
-                    .iter()
-                    .map(|e| LibItem::track(e.name.clone(), e.subtitle.clone(), e.uri.clone())),
-            );
-            app.browse.library.set(Section::Liked, liked);
-        }
-        StoreKind::Album => {
-            let albums: Vec<LibItem> = app
-                .store
-                .albums
-                .iter()
-                .map(|a| LibItem::ctx(a.name.clone(), a.subtitle.clone(), a.uri.clone()))
-                .collect();
-            app.browse.library.set(Section::Albums, albums);
-        }
-        StoreKind::Artist => {
-            let artists: Vec<LibItem> = app
-                .store
-                .artists
-                .iter()
-                .map(|a| LibItem::ctx(a.name.clone(), String::new(), a.uri.clone()))
-                .collect();
-            app.browse.library.set(Section::Artists, artists);
-        }
-        StoreKind::Playlist => {
-            let playlists: Vec<LibItem> = app
-                .store
-                .playlists
-                .iter()
-                .map(|p| LibItem::ctx(p.name.clone(), p.subtitle.clone(), p.uri.clone()))
-                .collect();
-            app.browse.library.set(Section::Playlists, playlists);
-        }
+    for (section, items) in crate::browse::build_all_sections(&app.store) {
+        app.browse.library.set(section, items);
     }
     if is_added {
         added.into()
@@ -319,13 +277,9 @@ pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
             {
                 Some(msg) => {
                     app.store_dirty = true;
-                    let playlists: Vec<LibItem> = app
-                        .store
-                        .playlists
-                        .iter()
-                        .map(|p| LibItem::ctx(p.name.clone(), p.subtitle.clone(), p.uri.clone()))
-                        .collect();
-                    app.browse.library.set(Section::Playlists, playlists);
+                    for (section, items) in crate::browse::build_all_sections(&app.store) {
+                        app.browse.library.set(section, items);
+                    }
                     msg
                 }
                 None => "playlist gone — press r to reload the library".into(),

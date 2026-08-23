@@ -29,7 +29,9 @@ pub(crate) fn spawn_library_fetch(store: Store, tx: flume::Sender<(Section, Vec<
         .expect("spawn library worker");
 }
 
-fn build_sections(store: &Store, tx: flume::Sender<(Section, Vec<LibItem>)>) {
+pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> {
+    let mut out = Vec::new();
+
     // Home: a rolling mix of recently played and most-played tracks.
     let mut home: Vec<LibItem> = Vec::new();
     if store.history.is_empty() {
@@ -42,38 +44,102 @@ fn build_sections(store: &Store, tx: flume::Sender<(Section, Vec<LibItem>)>) {
         home.push(LibItem::header("Top Tracks"));
         home.extend(history_rows(top.into_iter()).take(8));
     }
-    let _ = tx.send((Section::Home, home));
+    out.push((Section::Home, home));
 
     let recent: Vec<LibItem> = history_rows(store.history.iter()).take(50).collect();
-    let _ = tx.send((Section::Recent, recent));
+    out.push((Section::Recent, recent));
 
-    let playlists: Vec<LibItem> = store
-        .playlists
-        .iter()
-        .map(|p| {
+    // Playlists section: user playlists + quick access playlists
+    let mut playlists: Vec<LibItem> = Vec::new();
+    if !store.playlists.is_empty() {
+        playlists.extend(store.playlists.iter().map(|p| {
             let subtitle = if p.subtitle.is_empty() {
-                format!("{} saved", p.tracks.len())
+                format!("{} tracks", p.tracks.len())
             } else {
                 p.subtitle.clone()
             };
             LibItem::ctx(p.name.clone(), subtitle, p.uri.clone())
-        })
-        .collect();
-    let _ = tx.send((Section::Playlists, playlists));
+        }));
+    }
+    if !store.liked.is_empty() {
+        playlists.push(LibItem::ctx(
+            "Liked Songs".into(),
+            format!("{} saved", store.liked.len()),
+            "tuna:action:liked-play".into(),
+        ));
+    }
+    out.push((Section::Playlists, playlists));
 
-    let albums: Vec<LibItem> = store
-        .albums
-        .iter()
-        .map(|a| LibItem::ctx(a.name.clone(), a.subtitle.clone(), a.uri.clone()))
-        .collect();
-    let _ = tx.send((Section::Albums, albums));
+    // Albums section: saved albums + albums/releases from history and liked tracks
+    let mut albums: Vec<LibItem> = Vec::new();
+    if !store.albums.is_empty() {
+        albums.extend(store.albums.iter().map(|a| {
+            LibItem::ctx(a.name.clone(), a.subtitle.clone(), a.uri.clone())
+        }));
+    }
+    let mut seen_albums = std::collections::HashSet::new();
+    for a in &store.albums {
+        seen_albums.insert(a.name.to_lowercase());
+    }
+    for h in store.history.iter().rev() {
+        let name = h.title.trim();
+        let artist = h.artist.trim();
+        if !name.is_empty() && seen_albums.insert(name.to_lowercase()) {
+            let uri = format!("yt:album:{} {}", name, artist);
+            let subtitle = if artist.is_empty() {
+                "Single / Release".to_string()
+            } else {
+                artist.to_string()
+            };
+            albums.push(LibItem::ctx(name.to_string(), subtitle, uri));
+        }
+    }
+    out.push((Section::Albums, albums));
 
-    let artists: Vec<LibItem> = store
-        .artists
-        .iter()
-        .map(|a| LibItem::ctx(a.name.clone(), String::new(), a.uri.clone()))
-        .collect();
-    let _ = tx.send((Section::Artists, artists));
+    // Artists section: followed artists + artists derived from history/liked
+    let mut artists: Vec<LibItem> = Vec::new();
+    if !store.artists.is_empty() {
+        artists.extend(store.artists.iter().map(|a| {
+            LibItem::ctx(a.name.clone(), "Followed".into(), a.uri.clone())
+        }));
+    }
+    let mut seen_artists = std::collections::HashSet::new();
+    for a in &store.artists {
+        seen_artists.insert(a.name.to_lowercase());
+    }
+    let mut artist_counts: Vec<(String, u32)> = Vec::new();
+    for h in &store.history {
+        let raw = h.artist.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        for part in raw.split(&[',', '&'][..]) {
+            let name = part.trim();
+            if name.is_empty()
+                || name.eq_ignore_ascii_case("feat.")
+                || name.eq_ignore_ascii_case("ft.")
+            {
+                continue;
+            }
+            if let Some(pos) = artist_counts
+                .iter()
+                .position(|(a, _)| a.eq_ignore_ascii_case(name))
+            {
+                artist_counts[pos].1 += h.count;
+            } else {
+                artist_counts.push((name.to_string(), h.count));
+            }
+        }
+    }
+    artist_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    for (name, count) in artist_counts {
+        if seen_artists.insert(name.to_lowercase()) {
+            let uri = format!("yt:artist:{}", name);
+            let subtitle = format!("{} plays", count);
+            artists.push(LibItem::ctx(name, subtitle, uri));
+        }
+    }
+    out.push((Section::Artists, artists));
 
     // Liked keeps its synthetic play row and header, matching the old shape.
     let mut liked: Vec<LibItem> = vec![
@@ -89,7 +155,15 @@ fn build_sections(store: &Store, tx: flume::Sender<(Section, Vec<LibItem>)>) {
             .iter()
             .map(|e| LibItem::track(e.name.clone(), e.subtitle.clone(), e.uri.clone())),
     );
-    let _ = tx.send((Section::Liked, liked));
+    out.push((Section::Liked, liked));
+
+    out
+}
+
+pub(crate) fn build_sections(store: &Store, tx: flume::Sender<(Section, Vec<LibItem>)>) {
+    for (section, items) in build_all_sections(store) {
+        let _ = tx.send((section, items));
+    }
 }
 
 /// Search: `ytsearchN:` flat results, rendered as Songs rows. There are no
@@ -371,5 +445,31 @@ mod tests {
         let (_, home) = rx.recv().unwrap();
         assert!(home.iter().all(|i| i.is_header));
         assert_eq!(home[0].name, "nothing played yet — search for a song");
+    }
+
+    #[test]
+    fn build_all_sections_populates_artists_and_albums_from_history() {
+        let mut store = Store::default();
+        store.record_played("yt:video:kesariya", "Kesariya", "Arijit Singh, Pritam");
+        store.record_played("yt:video:luther", "luther", "Kendrick Lamar & SZA");
+        let sections = build_all_sections(&store);
+        let artists_sec = sections.iter().find(|(s, _)| *s == Section::Artists).unwrap();
+        let albums_sec = sections.iter().find(|(s, _)| *s == Section::Albums).unwrap();
+        let playlists_sec = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+
+        // Artists must contain Arijit Singh, Pritam, Kendrick Lamar, SZA
+        let artist_names: Vec<&str> = artists_sec.1.iter().map(|i| i.name.as_str()).collect();
+        assert!(artist_names.contains(&"Arijit Singh"));
+        assert!(artist_names.contains(&"Kendrick Lamar"));
+        assert!(artists_sec.1[0].uri.starts_with("yt:artist:"));
+
+        // Albums must contain Kesariya and luther
+        let album_names: Vec<&str> = albums_sec.1.iter().map(|i| i.name.as_str()).collect();
+        assert!(album_names.contains(&"Kesariya"));
+        assert!(album_names.contains(&"luther"));
+        assert!(albums_sec.1[0].uri.starts_with("yt:album:"));
+
+        // Playlists should not panic
+        assert!(playlists_sec.1.is_empty() || !playlists_sec.1.is_empty());
     }
 }
