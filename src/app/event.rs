@@ -141,7 +141,7 @@ pub(crate) fn apply_meta(
     for (section, items) in crate::browse::build_all_sections(&app.store) {
         app.browse.library.set(section, items);
     }
-
+    app.refresh_local_queue();
     let cover = meta
         .image
         .image
