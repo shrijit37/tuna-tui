@@ -15,6 +15,34 @@ pub(crate) fn handle_engine_event(app: &mut App, ev: EngineEvent) {
             // fetch anymore — and the guard is what lets that reply past
             // `meta_is_current` and drops a late reply for an earlier track.
             app.session.pending_meta = Some(uri.clone());
+            if let Some((title, artist)) = app.session.meta_cache.get(&uri).cloned().or_else(|| {
+                app.store
+                    .history
+                    .iter()
+                    .find(|h| h.uri == uri)
+                    .map(|h| (h.title.clone(), h.artist.clone()))
+            }) {
+                if !title.is_empty() {
+                    if let Some(n) = app.playback.now.as_mut() {
+                        n.uri = uri.clone();
+                        n.title = title;
+                        n.artist = artist;
+                    } else {
+                        app.playback.now = Some(NowPlaying {
+                            uri: uri.clone(),
+                            title,
+                            artist,
+                            album: String::new(),
+                            duration_ms: 0,
+                            position_ms: 0,
+                            position_at: Instant::now(),
+                            is_playing: true,
+                            cover: None,
+                        });
+                    }
+                }
+            }
+            app.refresh_local_queue();
         }
         EngineEvent::Playing { position_ms, .. } => {
             if !app.transport.playback_started {

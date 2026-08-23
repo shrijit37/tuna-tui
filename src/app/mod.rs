@@ -288,6 +288,12 @@ impl App {
         if item.is_track {
             if self.search.searching {
                 // A search-result song starts that song's radio (seed + similar).
+                if !item.name.is_empty() {
+                    self.session.meta_cache.insert(
+                        item.uri.clone(),
+                        (item.name.clone(), item.subtitle.clone()),
+                    );
+                }
                 self.transport.source = PlaySource::Radio(item.uri.clone());
                 self.transport.source_name = format!("Radio · {}", item.name);
                 return Activated::Radio(item.uri);
