@@ -170,14 +170,16 @@ pub(crate) fn render_progress(
         Some(n) => (app.playback.position_ms(), n.duration_ms.max(1)),
         None => (0, 1),
     };
-    let reserve = left.chars().count() + right.chars().count();
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let reserve = left_len + right_len;
     let bar_w = (area.width as usize).saturating_sub(reserve);
     let filled = ((pos as f32 / dur as f32) * bar_w as f32) as usize;
 
     // Direct cell writes — the bar is a single-char run with one color per
     // cell (plus the two labels), so span/paragraph plumbing is pure overhead.
     let buf = f.buffer_mut();
-    buf.set_stringn(area.x, area.y, &left, left.chars().count(), theme.muted());
+    buf.set_stringn(area.x, area.y, &left, left_len, theme.muted());
     let colors = &mut out.scratch.bar_colors;
     gradient::sample_into(&[theme.primary, theme.accent], bar_w, colors);
     for (i, &color) in colors.iter().enumerate() {
@@ -188,17 +190,17 @@ pub(crate) fn render_progress(
         };
         // In-bounds by construction: bar_w and the labels are derived from
         // `area` itself, which the renderer sizes from the frame.
-        if let Some(cell) = buf.cell_mut((area.x + reserve as u16 + i as u16, area.y)) {
+        if let Some(cell) = buf.cell_mut((area.x + left_len as u16 + i as u16, area.y)) {
             cell.set_symbol("▬");
             cell.set_fg(fg);
         }
     }
-    let right_x = area.x + (reserve + bar_w) as u16;
+    let right_x = area.x + (left_len + bar_w) as u16;
     buf.set_stringn(
         right_x,
         area.y,
         &right,
-        right.chars().count(),
+        right_len,
         theme.muted(),
     );
 }
