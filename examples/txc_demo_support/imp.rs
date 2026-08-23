@@ -498,3 +498,518 @@ fn hsl(hue_deg: f32, s: f32, l: f32) -> Rgb {
 struct Xorshift(u64);
 
 impl Xorshift {
+    fn seeded() -> Xorshift {
+        Xorshift(now_ms() | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// Uniform-ish `f32` in `[0, 1)`.
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+pub fn main() {
+    let mut fake = false;
+    let mut path: Option<PathBuf> = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--fake" => fake = true,
+            "-h" | "--help" => {
+                println!("usage: txc_demo [--fake] [socket_path]");
+                return;
+            }
+            other => path = Some(PathBuf::from(other)),
+        }
+    }
+    let path = path.unwrap_or_else(socket_path);
+
+    if let Err(e) = run(fake, path) {
+        // A clear, single-line diagnosis instead of a panic + backtrace. The
+        // overwhelmingly likely cause is no TTY (piped stdout, CI, `< /dev/null`),
+        // where entering raw mode legitimately fails.
+        eprintln!("txc_demo: {e}");
+        eprintln!("txc_demo: this demo needs an interactive terminal (a TTY) to run.");
+        std::process::exit(1);
+    }
+}
+
+fn run(fake: bool, path: PathBuf) -> io::Result<()> {
+    // Spawn the source *before* touching the terminal: it is detached and
+    // harmless, and doing it first keeps the terminal in raw mode for the
+    // shortest possible window.
+    let (tx, rx) = mpsc::channel::<SourceEvent>();
+    if fake {
+        std::thread::spawn(move || fake_source(tx));
+    } else {
+        std::thread::spawn(move || socket_source(path, tx));
+    }
+
+    let mut terminal = init()?;
+    let result = event_loop(&mut terminal, &rx, fake);
+    restore(terminal)?;
+    result
+}
+
+/// The render loop. Never blocks on the socket — only on `event::poll`, and
+/// only for a bounded timeout.
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    rx: &Receiver<SourceEvent>,
+    fake: bool,
+) -> io::Result<()> {
+    let mut app = App::new(TOKYONIGHT);
+    if fake {
+        app.conn = Conn::Link(Link::Fake);
+    }
+    let started = Instant::now();
+
+    loop {
+        // Drain everything queued this frame. Taking only the last palette
+        // would be defensible, but applying each keeps `seq` and the applied
+        // counter honest, and the source is far slower than the frame rate.
+        loop {
+            match rx.try_recv() {
+                Ok(SourceEvent::Message(msg)) => app.apply(msg),
+                Ok(SourceEvent::Link(link)) => {
+                    // A successful (re)connect clears a lingering `bye`; a
+                    // retry must not, or the reason for the revert vanishes
+                    // from the status line the instant it happens.
+                    if matches!(link, Link::Connected | Link::Fake)
+                        || matches!(app.conn, Conn::Link(_))
+                    {
+                        app.conn = Conn::Link(link);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                // The source thread is gone (it only exits when we do), so
+                // there is nothing left to wait for.
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let animating = app.tick();
+        terminal.draw(|f| render(f, &app, started))?;
+
+        let timeout = if animating { FRAME } else { IDLE };
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// One entry of [`TOKENS`]: the token's wire name and how to read it off a
+/// [`Theme`]. A named alias rather than an inline tuple purely for legibility.
+type TokenRow = (&'static str, fn(&Theme) -> Rgb);
+
+/// The 16 tokens in display order, paired with an accessor. Grouped the way
+/// the spec groups them: roles, status, text, surfaces, borders.
+const TOKENS: &[TokenRow] = &[
+    ("primary", |t| t.primary),
+    ("secondary", |t| t.secondary),
+    ("accent", |t| t.accent),
+    ("error", |t| t.error),
+    ("warning", |t| t.warning),
+    ("success", |t| t.success),
+    ("info", |t| t.info),
+    ("text", |t| t.text),
+    ("text_muted", |t| t.text_muted),
+    ("background", |t| t.background),
+    ("background_panel", |t| t.background_panel),
+    ("background_element", |t| t.background_element),
+    ("border", |t| t.border),
+    ("border_active", |t| t.border_active),
+    ("border_subtle", |t| t.border_subtle),
+    ("border_dimmest", |t| t.border_dimmest),
+];
+
+fn render(f: &mut Frame, app: &App, started: Instant) {
+    let theme = app.displayed;
+    let area = f.area();
+
+    // Paint the whole canvas first: `background` is a token too, and a demo
+    // that left the terminal's own background showing would be cheating.
+    f.render_widget(Block::default().style(theme.base()), area);
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header bar
+        Constraint::Length(1), // status line
+        Constraint::Length(2), // origin
+        Constraint::Min(10),   // swatches | widgets
+        Constraint::Length(4), // contrast strip
+        Constraint::Length(1), // footer
+    ])
+    .split(area.inner(Margin::new(1, 0)));
+
+    render_header(f, app, rows[0]);
+    render_status(f, app, started, rows[1]);
+    render_origin(f, app, rows[2]);
+
+    let body = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .spacing(2)
+        .split(rows[3]);
+    render_swatches(f, app, body[0]);
+    render_widgets(f, app, body[1]);
+
+    render_contrast(f, app, rows[4]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "q / Esc  quit    ·    colors published by tuna-tui over TXC — this process only subscribes",
+            theme.muted(),
+        ))),
+        rows[5],
+    );
+}
+
+/// Header bar: `primary` on `background_panel`, per the brief — and the
+/// simplest possible smoke test that two tokens are being combined correctly.
+fn render_header(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.displayed;
+    let bar = Style::default()
+        .bg(t.background_panel.into())
+        .fg(t.primary.into())
+        .add_modifier(Modifier::BOLD);
+    let right = format!(
+        " seq {}  ·  {}  ·  v{PROTOCOL_VERSION} ",
+        app.seq,
+        if app.is_dark { "dark" } else { "light" }
+    );
+    let pad = usize::from(area.width)
+        .saturating_sub(right.chars().count())
+        .saturating_sub(23);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" TXC · live subscriber", bar),
+            Span::styled(" ".repeat(pad), bar),
+            Span::styled(
+                right,
+                Style::default()
+                    .bg(t.background_panel.into())
+                    .fg(t.text_muted.into()),
+            ),
+        ])),
+        area,
+    );
+}
+
+/// Connection state, in words, plus the fade the publisher asked for.
+fn render_status(f: &mut Frame, app: &App, started: Instant, area: Rect) {
+    let t = app.displayed;
+    let (dot, label, color) = match app.conn {
+        Conn::Link(Link::Connected) => ("●", "connected".to_string(), t.success),
+        Conn::Link(Link::Fake) => ("◈", "fake source (no socket)".to_string(), t.info),
+        Conn::Link(Link::Retrying { attempt, delay }) => (
+            "◌",
+            format!(
+                "reconnecting — attempt {attempt}, backoff {}ms",
+                delay.as_millis()
+            ),
+            t.warning,
+        ),
+        Conn::Bye(reason) => (
+            "◼",
+            format!("publisher said bye ({reason:?}) — reverted to demo default"),
+            t.error,
+        ),
+    };
+    let fade = if app.fade.is_some() {
+        format!("fading {}ms", app.last_fade_ms)
+    } else if app.last_fade_ms == 0 {
+        "snapped (fade_ms 0)".to_string()
+    } else {
+        "idle".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{dot} {label}"),
+                Style::default()
+                    .fg(color.into())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "    {fade}    ·    {} palettes in {}s",
+                    app.applied,
+                    started.elapsed().as_secs()
+                ),
+                t.muted(),
+            ),
+        ])),
+        area,
+    );
+}
+
+/// Provenance: the `origin` block, which is how a consumer decides whether a
+/// palette is even relevant to it (album art vs. a manual theme switch).
+fn render_origin(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.displayed;
+    let (first, second) = match &app.origin {
+        Some(o) => {
+            let kind = match o.kind {
+                OriginKind::AlbumArt => "album_art",
+                OriginKind::Builtin => "builtin",
+                OriginKind::Fallback => "fallback",
+            };
+            let mut meta: Vec<String> = Vec::new();
+            if let Some(x) = &o.track {
+                meta.push(format!("track: {x}"));
+            }
+            if let Some(x) = &o.artist {
+                meta.push(format!("artist: {x}"));
+            }
+            if let Some(x) = &o.album {
+                meta.push(format!("album: {x}"));
+            }
+            (
+                Line::from(vec![
+                    Span::styled(format!("[{kind}] "), Style::default().fg(t.accent.into())),
+                    Span::styled(
+                        o.name.clone(),
+                        Style::default()
+                            .fg(t.text.into())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    if meta.is_empty() {
+                        "no track metadata on this palette".to_string()
+                    } else {
+                        meta.join("   ·   ")
+                    },
+                    t.muted(),
+                )),
+            )
+        }
+        None => (
+            Line::from(Span::styled(
+                "[none] demo default palette",
+                Style::default().fg(t.text_muted.into()),
+            )),
+            Line::from(Span::styled(
+                "waiting for a palette from the publisher…",
+                t.muted(),
+            )),
+        ),
+    };
+    f.render_widget(Paragraph::new(vec![first, second]), area);
+}
+
+/// All 16 tokens, two columns, each row drawn in its own color.
+fn render_swatches(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.displayed;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border.into()))
+        .title(Span::styled(" 16 tokens ", t.heading()))
+        .style(t.panel());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let half = TOKENS.len().div_ceil(2);
+    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner.inner(Margin::new(1, 0)));
+
+    for (ci, chunk) in TOKENS.chunks(half).enumerate() {
+        let lines: Vec<Line> = chunk
+            .iter()
+            .map(|(name, get)| {
+                let c = get(&t);
+                // Both the block and the label ride the token's own color, so
+                // a wrong value is impossible to miss.
+                Line::from(vec![
+                    Span::styled("███ ", Style::default().fg(c.into())),
+                    Span::styled(format!("{name:<19}"), Style::default().fg(c.into())),
+                    Span::styled(
+                        Hex(c).to_string(),
+                        Style::default().fg(c.into()).add_modifier(Modifier::DIM),
+                    ),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines).style(t.panel()), cols[ci]);
+    }
+}
+
+/// A mock consumer UI: this is the "would I actually build my bar out of these
+/// tokens?" test. Border hierarchy, body vs. muted text, and the four status
+/// roles as chips.
+fn render_widgets(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.displayed;
+    let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).split(area);
+
+    // `border_active` on the focused panel, `border` everywhere else — the
+    // exact distinction the four border tokens exist to express.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border_active.into()))
+        .title(Span::styled(" now playing (mock) ", t.heading()))
+        .style(t.panel());
+    let inner = block.inner(rows[0]);
+    f.render_widget(block, rows[0]);
+
+    let bar_w = usize::from(inner.width).saturating_sub(2).min(40);
+    let filled = bar_w * 2 / 5;
+    let lines = vec![
+        Line::from(Span::styled(
+            "Body text uses `text`.",
+            Style::default().fg(t.text.into()),
+        )),
+        Line::from(Span::styled(
+            "Secondary detail uses `text_muted` — dimmer, still legible.",
+            t.muted(),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("▓".repeat(filled), Style::default().fg(t.primary.into())),
+            Span::styled(
+                "░".repeat(bar_w.saturating_sub(filled)),
+                Style::default().fg(t.border_dimmest.into()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("▌", Style::default().fg(t.border_subtle.into())),
+            Span::styled(" inactive row (border_subtle)", t.muted()),
+        ]),
+        Line::from(vec![
+            Span::styled("▌", Style::default().fg(t.border_active.into())),
+            Span::styled(
+                " selected row (border_active)",
+                Style::default()
+                    .bg(t.background_element.into())
+                    .fg(t.text.into()),
+            ),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).style(t.panel()), inner);
+
+    // Status chips: the four semantic roles, filled, with a legible label.
+    let chips = [
+        ("ERROR", t.error),
+        ("WARN", t.warning),
+        ("OK", t.success),
+        ("INFO", t.info),
+    ];
+    let mut spans: Vec<Span> = Vec::new();
+    for (label, bg) in chips {
+        spans.push(Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .bg(bg.into())
+                // `best_on` is the same math the publisher used for the
+                // `on_*` block; reusing it keeps chips readable on any hue.
+                .fg(tuna_tui::txc::contrast::best_on(bg).into())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(t.border_subtle.into()))
+                .style(t.panel()),
+        ),
+        rows[1],
+    );
+}
+
+/// The contrast strip: four filled blocks, each labeled *only* in the
+/// publisher's matching `contrast.on_*` color.
+///
+/// This is the region that would break first if the published WCAG values were
+/// wrong, which is precisely why it is on screen.
+fn render_contrast(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.displayed;
+    let c = app.displayed_contrast;
+    let cells: [(&str, Rgb, Rgb); 4] = [
+        ("on_primary", t.primary, c.on_primary.into()),
+        ("on_secondary", t.secondary, c.on_secondary.into()),
+        ("on_accent", t.accent, c.on_accent.into()),
+        ("on_background", t.background, c.on_background.into()),
+    ];
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "contrast — labels drawn in the published contrast.on_* colors",
+            t.muted(),
+        ))),
+        rows[0],
+    );
+
+    let cols = Layout::horizontal([Constraint::Ratio(1, 4); 4])
+        .spacing(1)
+        .split(rows[1]);
+    for (i, (label, bg, fg)) in cells.iter().enumerate() {
+        let style = Style::default().bg((*bg).into()).fg((*fg).into());
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::from(Span::styled(
+                    format!(" {label}"),
+                    style.add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(format!(" {}", Hex(*fg)), style)),
+            ])
+            .style(style),
+            cols[i],
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// terminal plumbing
+// ---------------------------------------------------------------------------
+
+/// Enter raw mode + the alternate screen, and arm a panic hook that undoes
+/// both.
+///
+/// Without the hook a panic anywhere in the render path leaves the user's
+/// shell in raw mode with no echo — the terminal effectively bricked until
+/// they blind-type `reset`. Same discipline as `theme_demo.rs`, hardened for
+/// the panic path because this demo runs unattended.
+fn init() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        hook(info);
+    }));
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    Terminal::new(CrosstermBackend::new(stdout))
+}
+
+fn restore(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
