@@ -193,8 +193,15 @@ pub(crate) fn render_settings_overlay(f: &mut Frame, app: &App, theme: Theme, ar
                     vec![Span::styled(format!("[ {label} ]"), theme.muted())]
                 }
             }
+            SettingControl::Separator(text) => {
+                vec![Span::styled(
+                    text.to_string(),
+                    Style::default()
+                        .fg(theme.border_active.into())
+                        .add_modifier(Modifier::BOLD),
+                )]
+            }
         };
-
         let mut spans = vec![
             Span::styled(pointer, pointer_style),
             Span::styled(format!("{:<26}", row.label), row_style),

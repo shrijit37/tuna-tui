@@ -240,19 +240,19 @@ fn animation_respects_configured_frame_rate() {
 fn settings_menu_state_and_navigation() {
     let config = tuna_tui::config::Config::default();
     let mut state = SettingsState::init_from_config(&config);
-    assert_eq!(state.tab, SettingsTab::Display);
+    assert_eq!(state.tab, SettingsTab::Visuals);
 
     // Navigation between tabs
     state.next_tab();
-    assert_eq!(state.tab, SettingsTab::Audio);
+    assert_eq!(state.tab, SettingsTab::Playback);
     state.next_tab();
     assert_eq!(state.tab, SettingsTab::Lyrics);
     state.next_tab();
-    assert_eq!(state.tab, SettingsTab::Search);
+    assert_eq!(state.tab, SettingsTab::Interface);
     state.next_tab();
     assert_eq!(state.tab, SettingsTab::System);
     state.next_tab();
-    assert_eq!(state.tab, SettingsTab::Display);
+    assert_eq!(state.tab, SettingsTab::Visuals);
 
     // Navigation between rows
     let rows = state.current_rows();
