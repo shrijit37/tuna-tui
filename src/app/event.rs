@@ -170,7 +170,14 @@ pub(crate) fn apply_meta(
                 if let Some(yt_lyrics) = tuna_tui::providers::ytmusic::lyrics(&id) {
                     let lines: Vec<(u32, String)> = yt_lyrics
                         .lines()
-                        .map(|l| (0u32, l.to_string()))
+                        .map(|l| {
+                            let text = if tuna_tui::lyrics::transliterate::contains_indic(l) {
+                                tuna_tui::lyrics::transliterate::transliterate_indic(l)
+                            } else {
+                                l.to_string()
+                            };
+                            (0u32, text)
+                        })
                         .collect();
                     let _ = tx.send((lines, false));
                 } else {

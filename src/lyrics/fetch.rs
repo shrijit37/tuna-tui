@@ -256,10 +256,28 @@ fn pick_search_match_for_title<'a>(
         .filter(|v| has_lyrics(v))
         .filter_map(|v| v["duration"].as_f64().map(|d| (d, v)))
         .filter(|(d, _)| (d - expected_duration_s).abs() <= tolerance)
-        .min_by(|(a, _), (b, _)| {
-            (a - expected_duration_s)
+        .min_by(|(a_dur, a_val), (b_dur, b_val)| {
+            // Prefer Latin / English script candidates for terminal readability
+            let a_sample = a_val["syncedLyrics"]
+                .as_str()
+                .or_else(|| a_val["plainLyrics"].as_str())
+                .unwrap_or("");
+            let b_sample = b_val["syncedLyrics"]
+                .as_str()
+                .or_else(|| b_val["plainLyrics"].as_str())
+                .unwrap_or("");
+            let a_latin = crate::lyrics::transliterate::is_latin_text(a_sample);
+            let b_latin = crate::lyrics::transliterate::is_latin_text(b_sample);
+            if a_latin != b_latin {
+                return if a_latin {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+            (a_dur - expected_duration_s)
                 .abs()
-                .total_cmp(&(b - expected_duration_s).abs())
+                .total_cmp(&(b_dur - expected_duration_s).abs())
         })
         .map(|(_, v)| v)
 }
@@ -482,10 +500,26 @@ fn fetch_lyrics_url(
 /// Read `syncedLyrics` (preferred) or `plainLyrics` off one lrclib record.
 fn lyrics_from_record(record: &serde_json::Value) -> (Vec<(u32, String)>, bool) {
     if let Some(synced) = record["syncedLyrics"].as_str().filter(|s| !s.is_empty()) {
-        return (crate::lyrics::parse::parse_lrc(synced), true);
+        let mut lines = crate::lyrics::parse::parse_lrc(synced);
+        for (_, text) in lines.iter_mut() {
+            if crate::lyrics::transliterate::contains_indic(text) {
+                *text = crate::lyrics::transliterate::transliterate_indic(text);
+            }
+        }
+        return (lines, true);
     }
     if let Some(plain) = record["plainLyrics"].as_str().filter(|s| !s.is_empty()) {
-        let lines = plain.lines().map(|l| (0u32, l.to_string())).collect();
+        let lines = plain
+            .lines()
+            .map(|l| {
+                let text = if crate::lyrics::transliterate::contains_indic(l) {
+                    crate::lyrics::transliterate::transliterate_indic(l)
+                } else {
+                    l.to_string()
+                };
+                (0u32, text)
+            })
+            .collect();
         return (lines, false);
     }
     (Vec::new(), false)
@@ -692,6 +726,18 @@ mod tests {
     }
 
     #[test]
+    fn search_match_prefers_latin_script_over_indic_script_within_tolerance() {
+        let search = json!([
+            { "trackName": "Kesariya", "duration": 178.0, "syncedLyrics": "[00:01.00]मुझको इतना बताए कोई" },
+            { "trackName": "Kesariya", "duration": 179.0, "syncedLyrics": "[00:01.00]Mujhko itna bataaye koi" },
+        ]);
+        // Even though Devanagari is exact 178.0 and Latin is 179.0, Latin is preferred for terminal compatibility
+        let picked = pick_search_match_for_title(&search, 178.0, PRIMARY_TOLERANCE_S, "Kesariya")
+            .expect("must pick a candidate");
+        assert!(picked["syncedLyrics"].as_str().unwrap().contains("Mujhko"));
+    }
+
+    #[test]
     #[ignore = "requires live internet connection to lrclib.net"]
     fn live_fetch_lyrics_for_luther_returns_correct_lyrics() {
         let (lines, synced) = fetch_lyrics_blocking("Kendrick Lamar & SZA", "luther", "GNX", 178_000);
@@ -705,6 +751,39 @@ mod tests {
         assert!(
             !text.to_lowercase().contains("all the stars are closer"),
             "lyrics must not be for All The Stars"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires live internet connection to lrclib.net"]
+    fn live_fetch_lyrics_for_kesariya_prefers_latin_script() {
+        let (lines, synced) = fetch_lyrics_blocking("Pritam, Arijit Singh", "Kesariya", "Brahmastra", 268_000);
+        assert!(synced, "Kesariya should have synced lyrics");
+        assert!(!lines.is_empty(), "lyrics should not be empty");
+        let text = lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            crate::lyrics::transliterate::is_latin_text(&text),
+            "lyrics must be Latin/Romanized, got:\n{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("mujhko") || text.to_lowercase().contains("kesariya"),
+            "lyrics must contain Kesariya text, got:\n{text}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires live internet connection to lrclib.net"]
+    fn live_fetch_lyrics_for_excuses_prefers_latin_script() {
+        let (lines, _) = fetch_lyrics_blocking("AP Dhillon", "Excuses", "Hidden Gems", 176_000);
+        assert!(!lines.is_empty(), "lyrics should not be empty");
+        let text = lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            crate::lyrics::transliterate::is_latin_text(&text),
+            "lyrics must be Latin/Romanized, got:\n{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("mere dil") || text.to_lowercase().contains("intense"),
+            "lyrics must contain Excuses text, got:\n{text}"
         );
     }
 }
