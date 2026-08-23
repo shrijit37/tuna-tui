@@ -16,7 +16,8 @@ pub(crate) fn render_footer(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
     // nothing must not be advertised.
     let hints = [
         (true, key("⇥"), lbl(" section   ")),
-        (false, key("←→"), lbl(" view   ")),
+        (false, key("←→/hl"), lbl(" view   ")),
+        (false, key("Q"), lbl(" queue   ")),
         (true, key("/"), lbl(" search   ")),
         (
             true,

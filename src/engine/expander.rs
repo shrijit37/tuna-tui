@@ -34,6 +34,7 @@ pub struct ResolvedTrack {
     pub album: Option<String>,
     pub duration_ms: Option<u32>,
     pub thumbnail: Option<String>,
+
 }
 
 /// How many radio tracks (besides the seed) a station expands to. Mixes run
@@ -57,6 +58,14 @@ pub trait Expander: Send + Sync {
     /// deadline fires; the yt-dlp chain stops spawning children instead of
     /// running its full fallback for ~40s after the UI has given up.
     fn radio(&self, seed: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String>;
+
+    /// The radio station as full rows (`YtVideo`s), seed first. The UI uses
+    /// the titles/artists to label queue rows before playback resolves them.
+    fn radio_entries(
+        &self,
+        seed: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<yt::YtVideo>, String>;
 }
 
 /// The pure-YouTube expander — the port's end state, live from phase 1's
@@ -98,6 +107,18 @@ impl Expander for YtExpander {
     }
 
     fn radio(&self, seed: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String> {
+        let Some(_id) = track_id_from_uri(seed) else {
+            return Err(format!("not a track uri: {seed}"));
+        };
+        let rows = self.radio_entries(seed, cancel)?;
+        station_from_with_meta(seed, rows).map(|(uris, _)| uris)
+    }
+
+    fn radio_entries(
+        &self,
+        seed: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<yt::YtVideo>, String> {
         let Some(id) = track_id_from_uri(seed) else {
             return Err(format!("not a track uri: {seed}"));
         };
@@ -108,16 +129,29 @@ impl Expander for YtExpander {
         // (F13) is checked between every chain step and inside yt_stdout's
         // poll loop, so a timed-out request kills its children in-flight.
         let rows = yt::radio_entries(&id, cancel);
-        station_from(seed, rows)
+        if rows.is_empty() {
+            return Err(format!("radio station for {seed} came back empty"));
+        }
+        Ok(rows)
     }
 }
 
 /// The seed first, then the mix rows — the seed itself skipped when the mix
-/// echoes it, the whole list capped to `RADIO_LIMIT` + 1. Pure (no network), so
-/// the station-shape logic is unit-tested offline; only the mix fetch is live.
-fn station_from(seed: &str, rows: Vec<yt::YtVideo>) -> Result<Vec<String>, String> {
+/// echoes it, the whole list capped to `RADIO_LIMIT` + 1. Alongside the uris it
+/// returns a `(title, artist)` prefill map keyed by uri — one entry per queued
+/// row, only for titled rows — so the UI can label the queue before each
+/// track's own resolve lands. Pure (no network), so the station-shape logic is
+/// unit-tested offline; only the mix fetch is live.
+pub fn station_from_with_meta(
+    seed: &str,
+    rows: Vec<yt::YtVideo>,
+) -> Result<(Vec<String>, std::collections::HashMap<String, (String, String)>), String> {
+    let mut meta = std::collections::HashMap::new();
     let mut uris = vec![seed.to_string()];
     for row in rows.into_iter().take(RADIO_LIMIT) {
+        if !row.title.is_empty() {
+            meta.insert(row.uri.clone(), (row.title, row.artist));
+        }
         if row.uri != seed {
             uris.push(row.uri);
         }
@@ -125,7 +159,7 @@ fn station_from(seed: &str, rows: Vec<yt::YtVideo>) -> Result<Vec<String>, Strin
     if uris.len() == 1 {
         return Err(format!("radio station for {seed} came back empty"));
     }
-    Ok(uris)
+    Ok((uris, meta))
 }
 
 impl From<PlaybackInfo> for ResolvedTrack {
@@ -164,7 +198,7 @@ mod tests {
             row("aaaaaaaaaaa"),
             row("bbbbbbbbbbb"),
         ];
-        let uris = station_from(&seed, rows).unwrap();
+        let uris = station_from_with_meta(&seed, rows).unwrap().0;
         assert_eq!(
             uris,
             vec![
@@ -188,20 +222,9 @@ mod tests {
         };
         // 2× RADIO_LIMIT rows in, the slice still stops at RADIO_LIMIT + seed.
         let rows: Vec<yt::YtVideo> = (0..RADIO_LIMIT as u32 * 2).map(row).collect();
-        let uris = station_from(&seed, rows).unwrap();
+        let uris = station_from_with_meta(&seed, rows).unwrap().0;
         assert_eq!(uris.len(), RADIO_LIMIT + 1);
         assert_eq!(uris[0], seed);
-        // Nothing but the seed itself → an empty station is an error, not a
-        // one-track station.
-        let rows = vec![yt::YtVideo {
-            uri: seed.clone(),
-            title: String::new(),
-            artist: String::new(),
-            album: None,
-            duration_ms: None,
-            thumbnail: None,
-        }];
-        assert!(station_from(&seed, rows).is_err());
     }
 
     #[test]

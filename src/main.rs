@@ -417,6 +417,7 @@ async fn boot(
             lyrics: Vec::new(),
             lyrics_synced: false,
             actions: None,
+            queue_selected: 0,
         },
         session: SessionState {
             restore_uri,
@@ -424,7 +425,25 @@ async fn boot(
             last_ctrl_c: None,
             last_click: None,
             radio_in_flight: false,
-            meta_cache: std::collections::HashMap::new(),
+            meta_cache: {
+                let mut cache = std::collections::HashMap::new();
+                if let Some(last) = &saved.last_played {
+                    if !last.title.is_empty() {
+                        cache.insert(last.uri.clone(), (last.title.clone(), last.artist.clone()));
+                    }
+                }
+                for h in &saved.store.history {
+                    if !h.title.is_empty() {
+                        cache.insert(h.uri.clone(), (h.title.clone(), h.artist.clone()));
+                    }
+                }
+                for l in &saved.store.liked {
+                    if !l.name.is_empty() {
+                        cache.insert(l.uri.clone(), (l.name.clone(), l.subtitle.clone()));
+                    }
+                }
+                cache
+            },
         },
         store: saved.store.clone(),
         store_dirty: false,
@@ -438,6 +457,7 @@ async fn boot(
 struct Radio {
     start_position_ms: u32,
     uris: Vec<String>,
+    meta: Vec<(String, String, String)>,
 }
 
 /// Every `Sender` the UI loop hands to input handlers and spawned fetches.
@@ -595,6 +615,9 @@ async fn run_ui(
                     app.session.radio_in_flight = false;
                     match rad {
                         Ok(radio) if !radio.uris.is_empty() => {
+                            for (uri, title, artist) in radio.meta {
+                                app.session.meta_cache.insert(uri, (title, artist));
+                            }
                             if let Err(e) = app.svc.engine.play_tracks(radio.uris, None, radio.start_position_ms, false) {
                                 app.status = format!("couldn't play radio: {e:#}");
                             }
@@ -805,6 +828,14 @@ async fn run_ui(
             }
             s = search_rx.recv_async() => {
                 if let Ok(results) = s {
+                    for item in &results {
+                        if !item.is_header && !item.name.is_empty() {
+                            app.session.meta_cache.insert(
+                                item.uri.clone(),
+                                (item.name.clone(), item.subtitle.clone()),
+                            );
+                        }
+                    }
                     app.search.in_flight = false;
                     app.search.search_results = results;
                     app.browse.selected = app.first_selectable();
@@ -825,6 +856,14 @@ async fn run_ui(
             }
             d = detail_rx.recv_async() => {
                 if let Ok((context_uri, title, items)) = d {
+                    for item in &items {
+                        if !item.is_header && !item.name.is_empty() {
+                            app.session.meta_cache.insert(
+                                item.uri.clone(),
+                                (item.name.clone(), item.subtitle.clone()),
+                            );
+                        }
+                    }
                     app.browse.details.push(Detail { context_uri, title, items, parent_selected: app.browse.selected });
                     app.browse.selected = app.first_selectable();
                     app.status.clear();
@@ -876,17 +915,26 @@ fn spawn_radio(
         // unrelated later requests.
         let cancel = Arc::new(AtomicBool::new(false));
         let inner_cancel = cancel.clone();
-        let res = match tokio::time::timeout(
+        let res: Result<(Vec<String>, Vec<(String, String, String)>), String> = match tokio::time::timeout(
             Duration::from_secs(tuna_tui::yt::RADIO_TIMEOUT_SECS),
             async move {
-                tokio::task::spawn_blocking(move || engine.radio_tracks(&seed, inner_cancel))
-                    .await
-                    .map_err(|e| e.to_string())?
+                tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<(String, String, String)>), String> {
+                    let rows = engine.radio_entries(&seed, inner_cancel)?;
+                    let (uris, meta_map) =
+                        tuna_tui::engine::expander::station_from_with_meta(&seed, rows)?;
+                    let meta: Vec<(String, String, String)> = meta_map
+                        .into_iter()
+                        .map(|(u, (t, a))| (u, t, a))
+                        .collect();
+                    Ok((uris, meta))
+                })
+                .await
+                .map_err(|e| e.to_string())?
             },
         )
         .await
         {
-            Ok(r) => r.map_err(|e| e.to_string()),
+            Ok(r) => r,
             Err(_) => {
                 // Tell the worker to kill its chain, THEN send the existing
                 // "timed out" error — the drain clears radio_in_flight exactly
@@ -896,8 +944,9 @@ fn spawn_radio(
                 Err("timed out (radio endpoint unresponsive)".to_string())
             }
         };
-        let _ = tx.send(res.map(|uris| Radio {
+        let _ = tx.send(res.map(|(uris, meta)| Radio {
             uris,
+            meta,
             start_position_ms,
         }));
     });

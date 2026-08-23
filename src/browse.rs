@@ -99,25 +99,13 @@ pub(crate) fn spawn_search(query: String, tx: flume::Sender<Vec<LibItem>>) {
     std::thread::Builder::new()
         .name("tuna-search".to_string())
         .spawn(move || {
-            // Via the providers seam — yt-dlp adapter today; InnerTube search
-            // (Myx-mh7.1/.2) will produce the same canonical Songs.
-            let songs = tuna_tui::providers::ytdlp::search(&query, config::get().search_limit)
-                .unwrap_or_else(|e| {
-                    tuna_tui::liblog::liblog(format!("browse: search failed: {e}"));
-                    Vec::new()
-                });
+            let vids = yt::ytmusic_search(&query, config::get().search_limit);
             let mut out = Vec::new();
-            if !songs.is_empty() {
+            if !vids.is_empty() {
                 out.push(LibItem::header("Songs"));
             }
-            out.extend(songs.into_iter().map(|s| {
-                let artist = s
-                    .artists
-                    .first()
-                    .map(|a| a.name.clone())
-                    .unwrap_or_default();
-                let uri = format!("yt:video:{}", s.id);
-                LibItem::track(s.title, artist, uri)
+            out.extend(vids.into_iter().map(|v| {
+                LibItem::track(v.title, v.artist, v.uri)
             }));
             let _ = tx.send(out);
         })

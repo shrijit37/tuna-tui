@@ -109,6 +109,8 @@ pub(crate) struct ViewState {
     pub(crate) lyrics_synced: bool,
     // Context actions menu overlay (opened with `a`).
     pub(crate) actions: Option<ActionMenu>,
+    // Selected row index in the Queue view.
+    pub(crate) queue_selected: usize,
 }
 
 /// Cross-cutting session bookkeeping: which metadata fetch is still in flight

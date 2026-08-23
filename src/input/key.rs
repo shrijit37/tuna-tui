@@ -181,39 +181,82 @@ pub(crate) fn handle_key(
         KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => {
             app.playback.seek_step(-SEEK_STEP_MS)
         }
-        KeyCode::Right => {
+        KeyCode::Right | KeyCode::Char('l') => {
             app.view.mode = app.view.mode.shift(1);
             if app.view.mode == RightView::Queue && app.transport.playback_started {
                 app.refresh_local_queue();
             }
         }
-        KeyCode::Left => {
+        KeyCode::Left | KeyCode::Char('h') => {
             app.view.mode = app.view.mode.shift(-1);
             if app.view.mode == RightView::Queue && app.transport.playback_started {
                 app.refresh_local_queue();
             }
         }
+        KeyCode::Char('Q') => {
+            if app.view.mode == RightView::Queue {
+                app.view.mode = RightView::NowPlaying;
+            } else {
+                app.view.mode = RightView::Queue;
+                if app.transport.playback_started {
+                    app.refresh_local_queue();
+                }
+            }
+        }
         // The frame loop notices the layout change and wipes the art box.
         KeyCode::Char('z') => app.view.zen = !app.view.zen,
-        KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
-        KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.view.mode == RightView::Queue && !app.transport.queue.is_empty() {
+                app.view.queue_selected =
+                    (app.view.queue_selected + 1).min(app.transport.queue.len().saturating_sub(1));
+            } else {
+                app.move_sel(1);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.view.mode == RightView::Queue && !app.transport.queue.is_empty() {
+                app.view.queue_selected = app.view.queue_selected.saturating_sub(1);
+            } else {
+                app.move_sel(-1);
+            }
+        }
         // Needs a terminal that reports modified Enter (kitty, WezTerm, foot).
         KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => play_selected_context(app, false),
-        KeyCode::Enter => match app.activate() {
-            Activated::Open(uri, name) => {
-                spawn_detail_fetch(app.store.clone(), uri, name, chans.detail.clone());
-            }
-            Activated::Radio(uri) => {
-                if app.session.radio_in_flight {
-                    app.status = "radio already starting…".to_string();
-                    return false;
+        KeyCode::Enter => {
+            if app.view.mode == RightView::Queue && !app.transport.queue_uris.is_empty() {
+                let sel = app
+                    .view
+                    .queue_selected
+                    .min(app.transport.queue_uris.len().saturating_sub(1));
+                let target_uri = app.transport.queue_uris[sel].clone();
+                let remaining = app.transport.queue_uris[sel..].to_vec();
+                if let Err(e) = app.svc.engine.play_tracks(
+                    remaining,
+                    Some(target_uri),
+                    0,
+                    app.transport.shuffle,
+                ) {
+                    app.status = format!("couldn't play: {e:#}");
                 }
-                app.session.radio_in_flight = true;
-                app.status = "starting radio…".to_string();
-                crate::spawn_radio(app.svc.engine.clone(), uri, 0, chans.radio.clone());
+                app.refresh_local_queue();
+            } else {
+                match app.activate() {
+                    Activated::Open(uri, name) => {
+                        spawn_detail_fetch(app.store.clone(), uri, name, chans.detail.clone());
+                    }
+                    Activated::Radio(uri) => {
+                        if app.session.radio_in_flight {
+                            app.status = "radio already starting…".to_string();
+                            return false;
+                        }
+                        app.session.radio_in_flight = true;
+                        app.status = "starting radio…".to_string();
+                        crate::spawn_radio(app.svc.engine.clone(), uri, 0, chans.radio.clone());
+                    }
+                    Activated::None => {}
+                }
             }
-            Activated::None => {}
-        },
+        }
         _ => {}
     }
     false
