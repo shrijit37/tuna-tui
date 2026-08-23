@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# bd enforcement (Myx-enforce): staged additions must reference beads for debt markers
+# and unchecked list items. Skip with: git commit --no-verify
+exec scripts/check-bead-enforcement.sh --staged
