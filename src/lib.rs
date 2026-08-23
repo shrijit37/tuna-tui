@@ -36,6 +36,8 @@ pub mod term;
 pub mod yt;
 
 #[cfg(feature = "streaming")]
+pub mod itunes;
+#[cfg(feature = "streaming")]
 pub mod providers;
 
 /// Cross-platform home directory. Uses `HOME` on Unix, `USERPROFILE` on Windows.
