@@ -12,7 +12,8 @@ pub fn is_latin_text(s: &str) -> bool {
         let code = c as u32;
         if c.is_ascii_alphabetic() {
             latin += 1;
-        } else if matches!(code, 0x0900..=0x0D7F | 0x0400..=0x04FF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0x3040..=0x30FF) {
+        } else if matches!(code, 0x0900..=0x0D7F | 0x0400..=0x04FF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0x3040..=0x30FF)
+        {
             non_latin += 1;
         }
     }
@@ -77,7 +78,10 @@ pub fn transliterate_indic(s: &str) -> String {
                 }
                 // Inherent 'a' if not followed by punctuation or whitespace or word end
                 if let Some(n) = next {
-                    if !n.is_whitespace() && !n.is_ascii_punctuation() && !matches!(n, '।' | '॥' | ',' | '.' | '?' | '!') {
+                    if !n.is_whitespace()
+                        && !n.is_ascii_punctuation()
+                        && !matches!(n, '।' | '॥' | ',' | '.' | '?' | '!')
+                    {
                         out.push('a');
                     }
                 }
@@ -117,7 +121,10 @@ pub fn transliterate_indic(s: &str) -> String {
                     }
                 }
                 if let Some(n) = next {
-                    if !n.is_whitespace() && !n.is_ascii_punctuation() && !matches!(n, '।' | '॥' | ',' | '.' | '?' | '!') {
+                    if !n.is_whitespace()
+                        && !n.is_ascii_punctuation()
+                        && !matches!(n, '।' | '॥' | ',' | '.' | '?' | '!')
+                    {
                         out.push('a');
                     }
                 }

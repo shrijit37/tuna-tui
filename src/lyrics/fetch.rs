@@ -149,12 +149,29 @@ fn normalize_query(s: &str) -> String {
             break;
         }
     }
-    out = out.replace(['-', '_', '.', ',', ';', ':', '!', '?', '/', '\\', '&', '|'], " ");
+    out = out.replace(
+        ['-', '_', '.', ',', ';', ':', '!', '?', '/', '\\', '&', '|'],
+        " ",
+    );
     // Strip feat variants as whole tokens — substring replace would mangle
     // "daft" → "da" via "ft". Filter after splitting.
     let filtered: Vec<&str> = out
         .split_whitespace()
-        .filter(|w| !matches!(*w, "feat" | "feat." | "ft" | "ft." | "featuring" | "official" | "audio" | "video" | "lyrics" | "with"))
+        .filter(|w| {
+            !matches!(
+                *w,
+                "feat"
+                    | "feat."
+                    | "ft"
+                    | "ft."
+                    | "featuring"
+                    | "official"
+                    | "audio"
+                    | "video"
+                    | "lyrics"
+                    | "with"
+            )
+        })
         .collect();
     filtered.join(" ")
 }
@@ -181,7 +198,16 @@ fn title_matches(candidate_title: &str, target_title: &str) -> bool {
 
 /// Extract primary artist name before collaboration separators (&, feat, etc.)
 fn primary_artist(artist: &str) -> &str {
-    let seps = [" & ", " feat. ", " feat ", " ft. ", " ft ", " featuring ", ", ", " / "];
+    let seps = [
+        " & ",
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " ft ",
+        " featuring ",
+        ", ",
+        " / ",
+    ];
     for sep in seps {
         if let Some((first, _)) = artist.split_once(sep) {
             return first.trim();
@@ -325,8 +351,13 @@ fn fetch_with_fallback(
     // 2. Filtered search artist/track/album with primary tolerance
     let filtered_search = search_url(artist, title, album);
     {
-        let (lines, synced) =
-            fetch_search_url_for_title(client, &filtered_search, expected_s, PRIMARY_TOLERANCE_S, title);
+        let (lines, synced) = fetch_search_url_for_title(
+            client,
+            &filtered_search,
+            expected_s,
+            PRIMARY_TOLERANCE_S,
+            title,
+        );
         if !lines.is_empty() {
             return (lines, synced);
         }
@@ -397,18 +428,20 @@ fn fetch_search_url_for_title(
     let Ok(v) = resp.json::<serde_json::Value>() else {
         return (Vec::new(), false);
     };
-    let Some(record) = pick_search_match_for_title(&v, expected_s, tolerance, target_title).or_else(|| {
-        if v.is_array() {
-            None
-        } else {
-            // Single-record fallback (tests + /api/get shape)
-            if has_lyrics(&v) {
-                Some(&v)
-            } else {
+    let Some(record) = pick_search_match_for_title(&v, expected_s, tolerance, target_title)
+        .or_else(|| {
+            if v.is_array() {
                 None
+            } else {
+                // Single-record fallback (tests + /api/get shape)
+                if has_lyrics(&v) {
+                    Some(&v)
+                } else {
+                    None
+                }
             }
-        }
-    }) else {
+        })
+    else {
         return (Vec::new(), false);
     };
     lyrics_from_record(record)
@@ -725,7 +758,10 @@ mod tests {
             { "trackName": "HUMBLE.", "duration": 177.0, "syncedLyrics": "[00:01.00]humble" },
         ]);
         let picked = pick_search_match_for_title(&search, 178.0, PRIMARY_TOLERANCE_S, "luther");
-        assert!(picked.is_none(), "must not pick All The Stars or HUMBLE for luther");
+        assert!(
+            picked.is_none(),
+            "must not pick All The Stars or HUMBLE for luther"
+        );
     }
 
     #[test]
@@ -743,12 +779,18 @@ mod tests {
     #[test]
     #[ignore = "requires live internet connection to lrclib.net"]
     fn live_fetch_lyrics_for_luther_returns_correct_lyrics() {
-        let (lines, synced) = fetch_lyrics_blocking("Kendrick Lamar & SZA", "luther", "GNX", 178_000);
+        let (lines, synced) =
+            fetch_lyrics_blocking("Kendrick Lamar & SZA", "luther", "GNX", 178_000);
         assert!(synced, "luther should have synced lyrics");
         assert!(!lines.is_empty(), "lyrics should not be empty");
-        let text = lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let text = lines
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            text.to_lowercase().contains("world were mine") || text.to_lowercase().contains("roman numeral seven"),
+            text.to_lowercase().contains("world were mine")
+                || text.to_lowercase().contains("roman numeral seven"),
             "lyrics must be for luther, got: {text}"
         );
         assert!(
@@ -760,10 +802,15 @@ mod tests {
     #[test]
     #[ignore = "requires live internet connection to lrclib.net"]
     fn live_fetch_lyrics_for_kesariya_prefers_latin_script() {
-        let (lines, synced) = fetch_lyrics_blocking("Pritam, Arijit Singh", "Kesariya", "Brahmastra", 268_000);
+        let (lines, synced) =
+            fetch_lyrics_blocking("Pritam, Arijit Singh", "Kesariya", "Brahmastra", 268_000);
         assert!(synced, "Kesariya should have synced lyrics");
         assert!(!lines.is_empty(), "lyrics should not be empty");
-        let text = lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let text = lines
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             crate::lyrics::transliterate::is_latin_text(&text),
             "lyrics must be Latin/Romanized, got:\n{text}"
@@ -779,7 +826,11 @@ mod tests {
     fn live_fetch_lyrics_for_excuses_prefers_latin_script() {
         let (lines, _) = fetch_lyrics_blocking("AP Dhillon", "Excuses", "Hidden Gems", 176_000);
         assert!(!lines.is_empty(), "lyrics should not be empty");
-        let text = lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let text = lines
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             crate::lyrics::transliterate::is_latin_text(&text),
             "lyrics must be Latin/Romanized, got:\n{text}"

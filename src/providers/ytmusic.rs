@@ -56,7 +56,11 @@ fn parse_duration_to_ms(s: &str) -> Option<u32> {
         return None;
     }
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.is_empty() || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()))
+    {
         return None;
     }
     let mut ms: u64 = 0;
@@ -104,7 +108,10 @@ fn thumbnail_from_value(v: &serde_json::Value) -> Option<String> {
                 .rev()
                 .filter_map(|e| e.get("url").and_then(|u| u.as_str()))
                 .find(|u| u.contains("googleusercontent.com"))
-                .or_else(|| arr.last().and_then(|e| e.get("url").and_then(|u| u.as_str())))
+                .or_else(|| {
+                    arr.last()
+                        .and_then(|e| e.get("url").and_then(|u| u.as_str()))
+                })
             {
                 return Some(normalize_thumbnail_url(url));
             }
@@ -118,7 +125,11 @@ fn deep_thumbnail(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::Object(map) => {
             if let Some(arr) = map.get("thumbnails").and_then(|a| a.as_array()) {
-                if let Some(last) = arr.last().and_then(|e| e.get("url")).and_then(|u| u.as_str()) {
+                if let Some(last) = arr
+                    .last()
+                    .and_then(|e| e.get("url"))
+                    .and_then(|u| u.as_str())
+                {
                     return Some(last.to_string());
                 }
             }
@@ -244,7 +255,11 @@ fn parse_subtitle(item: &serde_json::Value) -> (Vec<String>, Option<String>, Opt
     let Some(col) = flex[1].get("musicResponsiveListItemFlexColumnRenderer") else {
         return (Vec::new(), None, None);
     };
-    let Some(runs) = col.get("text").and_then(|t| t.get("runs")).and_then(|r| r.as_array()) else {
+    let Some(runs) = col
+        .get("text")
+        .and_then(|t| t.get("runs"))
+        .and_then(|r| r.as_array())
+    else {
         return (Vec::new(), None, None);
     };
     // split runs by " • "
@@ -368,15 +383,12 @@ fn song_from_mrlir(item: &serde_json::Value) -> Option<Song> {
 }
 
 fn ytv_from_radio(item: &serde_json::Value) -> Option<YtVideo> {
-    let video_id = item
-        .get("videoId")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            item.get("navigationEndpoint")
-                .and_then(|n| n.get("watchEndpoint"))
-                .and_then(|w| w.get("videoId"))
-                .and_then(|v| v.as_str())
-        })?;
+    let video_id = item.get("videoId").and_then(|v| v.as_str()).or_else(|| {
+        item.get("navigationEndpoint")
+            .and_then(|n| n.get("watchEndpoint"))
+            .and_then(|w| w.get("videoId"))
+            .and_then(|v| v.as_str())
+    })?;
     if video_id.is_empty() {
         return None;
     }
@@ -481,7 +493,9 @@ pub fn track_meta(video_id: &str) -> Option<(String, String, Option<String>, Opt
     parse_player_value(&root)
 }
 
-fn parse_player_value(root: &serde_json::Value) -> Option<(String, String, Option<String>, Option<String>)> {
+fn parse_player_value(
+    root: &serde_json::Value,
+) -> Option<(String, String, Option<String>, Option<String>)> {
     let details = root.get("videoDetails")?;
     let title = details.get("title").and_then(|v| v.as_str())?.to_string();
     if title.is_empty() {
@@ -854,10 +868,16 @@ mod tests {
         assert_eq!(songs[0].id, "fJ9rUzIMcZQ");
         assert_eq!(songs[0].title, "Bohemian Rhapsody");
         assert_eq!(songs[0].artists[0].name, "Queen");
-        assert_eq!(songs[0].album.as_ref().unwrap().name, "A Night at the Opera");
+        assert_eq!(
+            songs[0].album.as_ref().unwrap().name,
+            "A Night at the Opera"
+        );
         assert_eq!(songs[0].duration_ms, Some(355_000));
         // last thumbnail normalized to 544
-        assert_eq!(songs[0].thumbnails[0].url, "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj");
+        assert_eq!(
+            songs[0].thumbnails[0].url,
+            "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj"
+        );
         assert_eq!(songs[1].id, "QkF3oxziUI4");
         assert_eq!(songs[1].artists[0].name, "Led Zeppelin");
         assert_eq!(songs[1].duration_ms, Some(482_000));
@@ -888,7 +908,10 @@ mod tests {
         assert_eq!(title, "Rick Astley - Never Gonna Give You Up");
         assert_eq!(author, "Rick Astley");
         // last thumb is the 120 one normalized to 544
-        assert_eq!(thumb.as_deref(), Some("https://lh3.googleusercontent.com/xyz=w544-h544-l90-rj"));
+        assert_eq!(
+            thumb.as_deref(),
+            Some("https://lh3.googleusercontent.com/xyz=w544-h544-l90-rj")
+        );
     }
 
     #[test]
@@ -903,11 +926,17 @@ mod tests {
         assert_eq!(vids[0].title, "Bohemian Rhapsody");
         assert_eq!(vids[0].artist, "Queen");
         assert_eq!(vids[0].duration_ms, Some(355_000));
-        assert_eq!(vids[0].thumbnail.as_deref(), Some("https://lh3.googleusercontent.com/q1=w544-h544-l90-rj"));
+        assert_eq!(
+            vids[0].thumbnail.as_deref(),
+            Some("https://lh3.googleusercontent.com/q1=w544-h544-l90-rj")
+        );
         assert_eq!(vids[1].uri, "yt:video:QkF3oxziUI4");
         assert_eq!(vids[1].duration_ms, Some(482_000));
         // i.ytimg.com passes through untouched
-        assert_eq!(vids[1].thumbnail.as_deref(), Some("https://i.ytimg.com/vi/QkF3oxziUI4/hqdefault.jpg"));
+        assert_eq!(
+            vids[1].thumbnail.as_deref(),
+            Some("https://i.ytimg.com/vi/QkF3oxziUI4/hqdefault.jpg")
+        );
     }
 
     #[test]
@@ -915,11 +944,17 @@ mod tests {
         let v1 = serde_json::json!({
             "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/a=w60-h60-l90-rj"}]}}}
         });
-        assert_eq!(thumbnail_from_value(&v1).as_deref(), Some("https://lh3.googleusercontent.com/a=w544-h544-l90-rj"));
+        assert_eq!(
+            thumbnail_from_value(&v1).as_deref(),
+            Some("https://lh3.googleusercontent.com/a=w544-h544-l90-rj")
+        );
         let v2 = serde_json::json!({
             "thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/b=s100"}]}
         });
-        assert_eq!(thumbnail_from_value(&v2).as_deref(), Some("https://lh3.googleusercontent.com/b=w544-h544-l90-rj"));
+        assert_eq!(
+            thumbnail_from_value(&v2).as_deref(),
+            Some("https://lh3.googleusercontent.com/b=w544-h544-l90-rj")
+        );
     }
 
     /// Live smoke test: YouTube Music search. Run with `--ignored`.
@@ -952,7 +987,11 @@ mod tests {
     #[ignore]
     fn live_ytmusic_radio() {
         let vids = radio("fJ9rUzIMcZQ").expect("live next radio response");
-        assert!(vids.len() >= 5, "expected multiple radio tracks, got {}", vids.len());
+        assert!(
+            vids.len() >= 5,
+            "expected multiple radio tracks, got {}",
+            vids.len()
+        );
         assert!(vids[0].uri.starts_with("yt:video:"));
         assert!(!vids[0].title.is_empty());
     }

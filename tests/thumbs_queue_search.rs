@@ -31,7 +31,9 @@ fn ideal_pick_best_thumbnail(value: &serde_json::Value) -> Option<String> {
         return None;
     }
     // If any candidate has width/height, score squares first
-    let has_dims = candidates.iter().any(|(_, w, h)| w.is_some() && h.is_some());
+    let has_dims = candidates
+        .iter()
+        .any(|(_, w, h)| w.is_some() && h.is_some());
     if has_dims {
         // Prefer square (w==h) largest area, else largest area
         let mut squares: Vec<_> = candidates
@@ -137,10 +139,7 @@ fn thumb_legacy_flat_rows_no_dims_falls_back_to_last() {
         ideal_pick_best_thumbnail(&v).as_deref(),
         Some("https://i.ytimg.com/vi/abc/hq720.jpg")
     );
-    assert_eq!(
-        ideal_pick_best_thumbnail(&v),
-        legacy_largest_thumbnail(&v)
-    );
+    assert_eq!(ideal_pick_best_thumbnail(&v), legacy_largest_thumbnail(&v));
 }
 
 #[test]
@@ -178,7 +177,10 @@ fn thumb_mixed_some_with_dims_some_without_prefers_square_with_dims() {
 // §4.3 Queue raw-id fix: prefill meta_cache so track_label_of never shows raw uri
 // ---------------------------------------------------------------------------
 
-fn ideal_track_label(uri: &str, cache: &std::collections::HashMap<String, (String, String)>) -> String {
+fn ideal_track_label(
+    uri: &str,
+    cache: &std::collections::HashMap<String, (String, String)>,
+) -> String {
     cache
         .get(uri)
         .map(|(t, a)| format!("{t} — {a}"))
@@ -217,7 +219,10 @@ fn queue_title_artist_split_covers_browse_kind_rows() {
     }
     assert_eq!(
         title_artist_split("Daft Punk - Get Lucky (Official Video)"),
-        ("Get Lucky (Official Video)".to_string(), "Daft Punk".to_string())
+        (
+            "Get Lucky (Official Video)".to_string(),
+            "Daft Punk".to_string()
+        )
     );
     assert_eq!(
         title_artist_split("Queen – Bohemian Rhapsody"),
@@ -244,14 +249,23 @@ fn queue_prefill_from_search_row() {
         .into_iter()
         .map(|u| ideal_track_label(&u, &cache))
         .collect();
-    assert!(!labels[0].starts_with("yt:video:"), "queue must not show raw id");
+    assert!(
+        !labels[0].starts_with("yt:video:"),
+        "queue must not show raw id"
+    );
     assert!(labels[0].contains("Daft Punk"));
 }
 
 #[test]
 fn queue_radio_seed_not_raw() {
     // Radio station_from seed + rows: rows may have empty artist — still cache title
-    fn station_from_seed(seed: &str, rows: Vec<(&str, &str, &str)>) -> (Vec<String>, std::collections::HashMap<String, (String, String)>) {
+    fn station_from_seed(
+        seed: &str,
+        rows: Vec<(&str, &str, &str)>,
+    ) -> (
+        Vec<String>,
+        std::collections::HashMap<String, (String, String)>,
+    ) {
         let mut uris = vec![seed.to_string()];
         let mut map = std::collections::HashMap::new();
         // seed itself assumed known elsewhere; rows:
@@ -351,11 +365,13 @@ fn search_innertube_fixture_parses_daft_punk() {
         }
     });
     // Extract via ideal helper (mirrors real parser's path)
-    let shelf = &fixture["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]["musicShelfRenderer"]["contents"];
+    let shelf = &fixture["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]
+        ["content"]["sectionListRenderer"]["contents"][0]["musicShelfRenderer"]["contents"];
     assert!(shelf.is_array());
     let first = &shelf[0];
     assert!(first.get("musicResponsiveListItemRenderer").is_some());
-    let thumb_obj = &first["musicResponsiveListItemRenderer"]["thumbnail"]["musicThumbnailRenderer"]["thumbnail"];
+    let thumb_obj = &first["musicResponsiveListItemRenderer"]["thumbnail"]
+        ["musicThumbnailRenderer"]["thumbnail"];
     let picked = ideal_pick_best_thumbnail(thumb_obj);
     assert_eq!(
         picked.as_deref(),
@@ -384,7 +400,7 @@ fn search_empty_query_returns_empty() {
 
 #[test]
 fn search_duration_parses_m_ss() {
-    fn parse_duration(s: & str) -> Option<u32> {
+    fn parse_duration(s: &str) -> Option<u32> {
         // mirrors parsers/helpers parseDuration
         let parts: Vec<&str> = s.split(':').collect();
         match parts.as_slice() {

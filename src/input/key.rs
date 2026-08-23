@@ -37,7 +37,7 @@ pub(crate) fn handle_key(
             KeyCode::Esc => {
                 app.search.input_mode = false;
                 app.search.search_results.clear(); // S29-1: Esc drops stale rows
-            },
+            }
             KeyCode::Enter => {
                 app.search.input_mode = false;
                 let q = app.search.query().trim().to_string();

@@ -33,11 +33,8 @@ fn live_album_drill_in_roundtrip() {
 #[ignore = "hits YouTube / InnerTube"]
 fn live_artist_drill_in_roundtrip() {
     let store = crate::Store::default();
-    let (_, items) = crate::browse::fetch_detail_blocking(
-        &store,
-        "yt:artist:Arijit Singh",
-        "Arijit Singh",
-    );
+    let (_, items) =
+        crate::browse::fetch_detail_blocking(&store, "yt:artist:Arijit Singh", "Arijit Singh");
     assert!(items.len() > 1, "play row + artist songs");
     assert!(items[0].is_play);
     assert!(items[1].is_track);

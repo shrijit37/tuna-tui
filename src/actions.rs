@@ -320,13 +320,20 @@ mod tests {
     #[test]
     fn action_menu_for_video_contains_all_actions() {
         let store = Store::default();
-        let track = LibItem::track("Kesariya".into(), "Arijit Singh".into(), "yt:video:NJAv_7lHUIU".into());
+        let track = LibItem::track(
+            "Kesariya".into(),
+            "Arijit Singh".into(),
+            "yt:video:NJAv_7lHUIU".into(),
+        );
         let menu = build_action_menu(&store, &track);
         assert_eq!(menu.title, "Kesariya");
         assert!(menu.items.iter().any(|i| i.label.contains("Liked")));
         assert!(menu.items.iter().any(|i| i.label.contains("Start Radio")));
         assert!(menu.items.iter().any(|i| i.label.contains("Add to Queue")));
-        assert!(menu.items.iter().any(|i| i.label.contains("Add to Playlist")));
+        assert!(menu
+            .items
+            .iter()
+            .any(|i| i.label.contains("Add to Playlist")));
         assert!(menu.items.iter().any(|i| i.label.contains("Go to Artist")));
         assert!(menu.items.iter().any(|i| i.label.contains("Go to Album")));
         assert!(menu.items.iter().any(|i| i.label.contains("Copy Link")));
@@ -335,7 +342,11 @@ mod tests {
     #[test]
     fn action_menu_for_artist_contains_open_and_follow() {
         let store = Store::default();
-        let artist = LibItem::ctx("Arijit Singh".into(), "".into(), "yt:artist:Arijit Singh".into());
+        let artist = LibItem::ctx(
+            "Arijit Singh".into(),
+            "".into(),
+            "yt:artist:Arijit Singh".into(),
+        );
         let menu = build_action_menu(&store, &artist);
         assert!(menu.items.iter().any(|i| i.label.contains("Follow")));
         assert!(menu.items.iter().any(|i| i.label.contains("Play")));
@@ -345,7 +356,11 @@ mod tests {
     #[test]
     fn action_menu_for_album_contains_open_and_save() {
         let store = Store::default();
-        let album = LibItem::ctx("Brahmastra".into(), "Pritam".into(), "yt:album:Brahmastra".into());
+        let album = LibItem::ctx(
+            "Brahmastra".into(),
+            "Pritam".into(),
+            "yt:album:Brahmastra".into(),
+        );
         let menu = build_action_menu(&store, &album);
         assert!(menu.items.iter().any(|i| i.label.contains("Save Album")));
         assert!(menu.items.iter().any(|i| i.label.contains("Play")));

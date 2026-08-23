@@ -483,7 +483,9 @@ pub fn pick_thumbnail(v: &serde_json::Value) -> Option<String> {
     let mut best: Option<(u64, usize)> = None;
     if let Some(entries) = arr {
         for (i, t) in entries.iter().enumerate() {
-            let Some(_url) = t["url"].as_str() else { continue };
+            let Some(_url) = t["url"].as_str() else {
+                continue;
+            };
             let w = t["width"].as_u64().unwrap_or(0);
             let h = t["height"].as_u64().unwrap_or(0);
             if w > 0 && w == h && (best.is_none_or(|(a, _)| w >= a)) {
@@ -496,7 +498,9 @@ pub fn pick_thumbnail(v: &serde_json::Value) -> Option<String> {
         // Tier 1: dimensioned non-squares — largest area wins.
         let mut area_best: Option<(u64, usize)> = None;
         for (i, t) in entries.iter().enumerate() {
-            let Some(_url) = t["url"].as_str() else { continue };
+            let Some(_url) = t["url"].as_str() else {
+                continue;
+            };
             let w = t["width"].as_u64().unwrap_or(0);
             let h = t["height"].as_u64().unwrap_or(0);
             if w == 0 || h == 0 {
@@ -559,7 +563,11 @@ pub fn parse_ytmusic_search(root: &serde_json::Value) -> Vec<YtVideo> {
                 }
             }
             // Songs shelf rows.
-            if let Some(shelf) = section.get("musicShelfRenderer").and_then(|s| s.get("contents")).and_then(|c| c.as_array()) {
+            if let Some(shelf) = section
+                .get("musicShelfRenderer")
+                .and_then(|s| s.get("contents"))
+                .and_then(|c| c.as_array())
+            {
                 for row in shelf {
                     if let Some(item) = row.get("musicResponsiveListItemRenderer") {
                         if let Some(v) = ytv_from_music_row(item) {
@@ -630,7 +638,10 @@ fn ytv_from_music_row(item: &serde_json::Value) -> Option<YtVideo> {
         .map(runs_text_of_col)
         .unwrap_or_default();
     let (artist, album) = match meta.split_once(" • ") {
-        Some((a, al)) => (a.trim().to_string(), Some(al.trim()).filter(|s| !s.is_empty()).map(String::from)),
+        Some((a, al)) => (
+            a.trim().to_string(),
+            Some(al.trim()).filter(|s| !s.is_empty()).map(String::from),
+        ),
         None => (meta.trim().to_string(), None),
     };
     // Fixed column carries the duration ("5:20", "—" when unknown).
@@ -654,9 +665,7 @@ fn ytv_from_music_row(item: &serde_json::Value) -> Option<YtVideo> {
 
 /// The joined text of a flex/fixed column renderer's `text.runs`.
 fn runs_text_of_col(col: &serde_json::Value) -> String {
-    col.get("text")
-        .map(runs_text)
-        .unwrap_or_default()
+    col.get("text").map(runs_text).unwrap_or_default()
 }
 
 /// Joined `runs[].text`, empty when absent.
@@ -700,7 +709,11 @@ pub fn ytmusic_search(query: &str, limit: usize) -> Vec<YtVideo> {
             .map(|s| YtVideo {
                 uri: format!("yt:video:{}", s.id),
                 title: s.title,
-                artist: s.artists.first().map(|a| a.name.clone()).unwrap_or_default(),
+                artist: s
+                    .artists
+                    .first()
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default(),
                 album: s.album.map(|a| a.name),
                 duration_ms: s.duration_ms,
                 thumbnail: s.thumbnails.first().map(|t| t.url.clone()),
@@ -1338,7 +1351,7 @@ mod adversarial {
     /// ISOLATION: only thumbnails array varies; same id/title/artist
     /// FALSE_POSITIVE_PREVENTION: control single thumbnail, control bare string fallback, control last-wins
     #[test]
-   fn test_yt_thumbnail_picks_largest_last_not_first_isolated() {
+    fn test_yt_thumbnail_picks_largest_last_not_first_isolated() {
         let single = json!({"id":"x","title":"t","thumbnails":[{"url":"https://a/small.jpg"}]});
         assert_eq!(
             pick_thumbnail(&single).as_deref(),
@@ -1347,17 +1360,11 @@ mod adversarial {
 
         // Control: bare thumbnail string fallback when no array
         let bare = json!({"id":"x","title":"t","thumbnail":"https://b/bare.jpg"});
-        assert_eq!(
-            pick_thumbnail(&bare).as_deref(),
-            Some("https://b/bare.jpg")
-        );
+        assert_eq!(pick_thumbnail(&bare).as_deref(), Some("https://b/bare.jpg"));
 
         // Flawed: array with 2 entries, last is larger -> must pick last
         let two = json!({"id":"x","title":"t","thumbnails":[{"url":"https://a/small.jpg"},{"url":"https://a/large.jpg"}]});
-        assert_eq!(
-            pick_thumbnail(&two).as_deref(),
-            Some("https://a/large.jpg")
-        );
+        assert_eq!(pick_thumbnail(&two).as_deref(), Some("https://a/large.jpg"));
 
         // Control: empty array + bare fallback -> bare
         let empty_array =
@@ -1369,7 +1376,7 @@ mod adversarial {
 
         // Control: both missing -> None
         let none = json!({"id":"x","title":"t"});
-       assert_eq!(pick_thumbnail(&none), None);
+        assert_eq!(pick_thumbnail(&none), None);
     }
 
     /// FLAW: pick_url must skip storyboard (vcodec=="none" && acodec=="none") even if it is last

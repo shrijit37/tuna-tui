@@ -95,10 +95,7 @@ pub(crate) fn render_queue_view(f: &mut Frame, app: &App, theme: Theme, area: Re
                         theme.muted()
                     },
                 ),
-                Span::styled(
-                    truncate(q, max.saturating_sub(6)),
-                    style,
-                ),
+                Span::styled(truncate(q, max.saturating_sub(6)), style),
             ]));
         }
     }

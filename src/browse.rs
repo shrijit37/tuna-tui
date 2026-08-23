@@ -73,9 +73,12 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
     // Albums section: saved albums + albums/releases from history and liked tracks
     let mut albums: Vec<LibItem> = Vec::new();
     if !store.albums.is_empty() {
-        albums.extend(store.albums.iter().map(|a| {
-            LibItem::ctx(a.name.clone(), a.subtitle.clone(), a.uri.clone())
-        }));
+        albums.extend(
+            store
+                .albums
+                .iter()
+                .map(|a| LibItem::ctx(a.name.clone(), a.subtitle.clone(), a.uri.clone())),
+        );
     }
     let mut seen_albums = std::collections::HashSet::new();
     for a in &store.albums {
@@ -99,9 +102,12 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
     // Artists section: followed artists + artists derived from history/liked
     let mut artists: Vec<LibItem> = Vec::new();
     if !store.artists.is_empty() {
-        artists.extend(store.artists.iter().map(|a| {
-            LibItem::ctx(a.name.clone(), "Followed".into(), a.uri.clone())
-        }));
+        artists.extend(
+            store
+                .artists
+                .iter()
+                .map(|a| LibItem::ctx(a.name.clone(), "Followed".into(), a.uri.clone())),
+        );
     }
     let mut seen_artists = std::collections::HashSet::new();
     for a in &store.artists {
@@ -178,9 +184,10 @@ pub(crate) fn spawn_search(query: String, tx: flume::Sender<Vec<LibItem>>) {
             if !vids.is_empty() {
                 out.push(LibItem::header("Songs"));
             }
-            out.extend(vids.into_iter().map(|v| {
-                LibItem::track(v.title, v.artist, v.uri)
-            }));
+            out.extend(
+                vids.into_iter()
+                    .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+            );
             let _ = tx.send(out);
         })
         .expect("spawn search worker");
@@ -355,7 +362,10 @@ pub(crate) fn fetch_detail_blocking(
                 vids
             };
             if !vids.is_empty() {
-                items.extend(vids.into_iter().map(|v| LibItem::track(v.title, v.artist, v.uri)));
+                items.extend(
+                    vids.into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                );
             } else {
                 append_or_hint(
                     &mut items,
@@ -374,7 +384,10 @@ pub(crate) fn fetch_detail_blocking(
                 vids
             };
             if !vids.is_empty() {
-                items.extend(vids.into_iter().map(|v| LibItem::track(v.title, v.artist, v.uri)));
+                items.extend(
+                    vids.into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                );
             } else {
                 append_or_hint(
                     &mut items,
@@ -545,9 +558,18 @@ mod tests {
         store.record_played("yt:video:kesariya", "Kesariya", "Arijit Singh, Pritam");
         store.record_played("yt:video:luther", "luther", "Kendrick Lamar & SZA");
         let sections = build_all_sections(&store);
-        let artists_sec = sections.iter().find(|(s, _)| *s == Section::Artists).unwrap();
-        let albums_sec = sections.iter().find(|(s, _)| *s == Section::Albums).unwrap();
-        let playlists_sec = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        let artists_sec = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Artists)
+            .unwrap();
+        let albums_sec = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Albums)
+            .unwrap();
+        let playlists_sec = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Playlists)
+            .unwrap();
 
         // Artists must contain Arijit Singh, Pritam, Kendrick Lamar, SZA
         let artist_names: Vec<&str> = artists_sec.1.iter().map(|i| i.name.as_str()).collect();

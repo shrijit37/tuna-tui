@@ -34,7 +34,6 @@ pub struct ResolvedTrack {
     pub album: Option<String>,
     pub duration_ms: Option<u32>,
     pub thumbnail: Option<String>,
-
 }
 
 /// How many radio tracks (besides the seed) a station expands to. Mixes run
@@ -300,13 +299,17 @@ mod tests {
 
     #[test]
     fn video_uris_expand_to_themselves() {
-        let uris = YtExpander::default().expand("yt:video:dQw4w9WgXcQ").unwrap();
+        let uris = YtExpander::default()
+            .expand("yt:video:dQw4w9WgXcQ")
+            .unwrap();
         assert_eq!(uris, vec!["yt:video:dQw4w9WgXcQ".to_string()]);
     }
 
     #[test]
     fn unknown_schemes_are_rejected_with_a_reason() {
-        assert!(YtExpander::default().expand("spotify:playlist:xyz").is_err());
+        assert!(YtExpander::default()
+            .expand("spotify:playlist:xyz")
+            .is_err());
         assert!(YtExpander::default().expand("yt:video").is_err());
         assert!(YtExpander::default().expand("yt:podcast:x").is_err());
     }

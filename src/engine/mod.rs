@@ -327,7 +327,6 @@ impl Engine {
         self.inner.expander.record_song_hints(songs);
     }
 
-
     /// The loaded play list, in play order (post-shuffle). Empty when nothing
     /// is loaded. A local mirror for the app's Queue view — the old provider
     /// queue (`/me/player/queue`) died with the Spotify port.
@@ -949,8 +948,8 @@ impl Worker {
             .ok()
             .flatten()
             .is_some_and(|s| s.code() != Some(0));
-    let dropped = is_stream_dropped(pos, cur.duration_ms, failed);
-            if dropped {
+        let dropped = is_stream_dropped(pos, cur.duration_ms, failed);
+        if dropped {
             let _ = cur.child.kill();
             let _ = cur.child.wait();
             self.drop_streak += 1;
@@ -959,23 +958,23 @@ impl Worker {
                     "engine: giving up on {uri} after {RECOVERY_ATTEMPTS} consecutive failed EOFs"
                 ));
                 self.give_up_on(uri);
-            return;
-        }
-        if failed {
+                return;
+            }
+            if failed {
                 liblog(format!("engine: decoder died for {uri}; rebuilding stream"));
             } else {
                 liblog(format!(
-                "engine: stream dropped for {uri} at {pos}ms (expected {:?}ms); rebuilding",
-                cur.duration_ms
+                    "engine: stream dropped for {uri} at {pos}ms (expected {:?}ms); rebuilding",
+                    cur.duration_ms
                 ));
-        }
+            }
             self.recover_into(uri, pos);
-                return;
-    }
+            return;
+        }
         self.drop_streak = 0;
         drop(cur);
         self.advance();
-            }
+    }
 
     /// The track is given up on after too many consecutive failures: remove it
     /// from the queue (keeping the queue view mirror in sync) and play its
@@ -1372,7 +1371,10 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
 
     // Upgrade to official YouTube Music 1:1 square album art if the thumbnail
     // is a 16:9 widescreen YouTube video frame or missing.
-    if !image_url.as_ref().is_some_and(|u| u.contains("googleusercontent.com")) {
+    if !image_url
+        .as_ref()
+        .is_some_and(|u| u.contains("googleusercontent.com"))
+    {
         if let Some(id) = crate::util::track_id_from_uri(uri) {
             let hint = if !r.title.is_empty() {
                 format!("{} {}", r.title, r.artist)
@@ -1452,7 +1454,6 @@ fn shuffle_pick(cursor: usize, n: usize, rng: &mut impl rand::Rng) -> usize {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

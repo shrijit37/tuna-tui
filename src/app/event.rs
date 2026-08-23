@@ -165,9 +165,7 @@ pub(crate) fn apply_meta(
         );
         let tx = lyrics_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let res = tuna_tui::lyrics::fetch::fetch_lyrics_blocking(
-                &artist, &title, &album, dur,
-            );
+            let res = tuna_tui::lyrics::fetch::fetch_lyrics_blocking(&artist, &title, &album, dur);
             if !res.0.is_empty() {
                 let _ = tx.send(res);
             } else if let Some(id) = tuna_tui::util::track_id_from_uri(&uri) {

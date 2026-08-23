@@ -282,11 +282,17 @@ mod adversarial {
 
         // Mid-track drop: normal track 200s that ends at 45s (pos_long > 5s) must still be dropped
         let dropped_mid_track = crate::engine::is_stream_dropped(45_000, normal_track, false);
-        assert!(dropped_mid_track, "45s into 200s track must be treated as dropped stream");
+        assert!(
+            dropped_mid_track,
+            "45s into 200s track must be treated as dropped stream"
+        );
 
         // Finished track: normal track 200s that ends at 198s is finished, not dropped
         let finished_normal = crate::engine::is_stream_dropped(198_000, normal_track, false);
-        assert!(!finished_normal, "198s into 200s track must be natural end, not dropped");
+        assert!(
+            !finished_normal,
+            "198s into 200s track must be natural end, not dropped"
+        );
     }
 
     /// FLAW: cancelled flag must terminate immediately without draining backlog

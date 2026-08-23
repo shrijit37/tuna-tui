@@ -9,11 +9,7 @@ use crate::browse;
 use tuna_tui::util::uri_to_url;
 
 /// Handle input while the actions menu is open.
-pub(crate) fn handle_action_key(
-    app: &mut App,
-    code: KeyCode,
-    chans: &crate::UiChannels,
-) {
+pub(crate) fn handle_action_key(app: &mut App, code: KeyCode, chans: &crate::UiChannels) {
     match code {
         KeyCode::Esc | KeyCode::Char('a') => {
             app.view.actions = None;
