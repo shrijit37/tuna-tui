@@ -111,7 +111,7 @@ pub(crate) fn render_library(
         app.browse.selected,
         cap,
         total_items,
-        tuna_tui::config::get().scrolloff,
+        app.config.scrolloff,
     );
     out.hits.lib = Some(Rect {
         x: inner.x,

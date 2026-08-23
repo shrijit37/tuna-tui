@@ -78,8 +78,6 @@ impl ArtRepaint {
 
 /// Ceiling on the redraw rate: 120fps input response (8ms).
 pub(crate) const MIN_FRAME: Duration = Duration::from_millis(8);
-/// Redraw rate while the visualizer, synced lyrics, or theme fade is running (120fps / 8ms motion).
-pub(crate) const ANIM_FRAME: Duration = Duration::from_millis(8);
 /// Redraw rate when nothing changed / base rate (30fps / 33ms).
 pub(crate) const IDLE_REDRAW: Duration = Duration::from_millis(33);
 /// How often the live queue is re-fetched and the session persisted.
@@ -87,15 +85,19 @@ pub(crate) const SYNC_EVERY: Duration = Duration::from_secs(24);
 
 /// Whether this frame is worth drawing.
 ///
-/// Input beats animation beats the idle clock. Smoothness of the recolour comes
-/// from its duration, not from the frame rate: every present makes the terminal
-/// recompose the viewport, and the inline cover shimmers if that happens 60
-/// times a second.
-pub(crate) fn should_draw(dirty: bool, animating: bool, since_last: Duration) -> bool {
+/// Input beats animation beats the idle clock. `anim_frame` comes from the
+/// live config (`animation_fps`) so the settings menu changes pacing without
+/// a restart.
+pub(crate) fn should_draw(
+    dirty: bool,
+    animating: bool,
+    since_last: Duration,
+    anim_frame: Duration,
+) -> bool {
     if dirty {
-        since_last >= MIN_FRAME
+        since_last >= MIN_FRAME.min(anim_frame)
     } else if animating {
-        since_last >= ANIM_FRAME
+        since_last >= anim_frame
     } else {
         since_last >= IDLE_REDRAW
     }

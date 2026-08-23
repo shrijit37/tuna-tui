@@ -425,13 +425,14 @@ async fn boot(
         },
         view: ViewState {
             mode: RightView::NowPlaying,
-            zen: false,
+            zen: tuna_tui::config::get().zen_default,
             lyrics: Vec::new(),
             lyrics_synced: false,
             actions: None,
             settings: None,
             queue_selected: 0,
         },
+        config: tuna_tui::config::get().clone(),
         session: SessionState {
             restore_uri,
             pending_meta: None,
@@ -701,7 +702,10 @@ async fn run_ui(
                     }
                     dirty = true;
                 }
-                if should_draw(dirty, animating, last_draw.elapsed()) {
+                let anim_frame = Duration::from_millis(
+                    (1000 / app.config.animation_fps.max(1)).max(1) as u64,
+                );
+                if should_draw(dirty, animating, last_draw.elapsed(), anim_frame) {
                     app.theme.advance();
                     // Present the frame atomically. Without this the terminal
                     // renders whatever has arrived so far, and a recolour that

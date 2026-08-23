@@ -207,5 +207,59 @@ pub const GRUVBOX: Theme = Theme {
     border_dimmest: c(0x50, 0x49, 0x45),
 };
 
+pub const NORD: Theme = Theme {
+    name: "nord",
+    primary: c(0x88, 0xc0, 0xd0),
+    secondary: c(0x81, 0xa1, 0xc1),
+    accent: c(0x8f, 0xbc, 0xbb),
+    error: c(0xbf, 0x61, 0x6a),
+    warning: c(0xeb, 0xcb, 0x8b),
+    success: c(0xa3, 0xbe, 0x8c),
+    info: c(0x5e, 0x81, 0xac),
+    text: c(0xe5, 0xe9, 0xf0),
+    text_muted: c(0x4c, 0x56, 0x6a),
+    background: c(0x2e, 0x34, 0x40),
+    background_panel: c(0x3b, 0x42, 0x52),
+    background_element: c(0x43, 0x4c, 0x5e),
+    border: c(0x4c, 0x56, 0x6a),
+    border_active: c(0x88, 0xc0, 0xd0),
+    border_subtle: c(0x3b, 0x42, 0x52),
+    border_dimmest: c(0x38, 0x3f, 0x4e),
+};
+
+pub const DRACULA: Theme = Theme {
+    name: "dracula",
+    primary: c(0xbd, 0x93, 0xf9),
+    secondary: c(0xff, 0x79, 0xc6),
+    accent: c(0x8b, 0xe9, 0xfd),
+    error: c(0xff, 0x55, 0x55),
+    warning: c(0xff, 0xb8, 0x6c),
+    success: c(0x50, 0xfa, 0x7b),
+    info: c(0x8b, 0xe9, 0xfd),
+    text: c(0xf8, 0xf8, 0xf2),
+    text_muted: c(0x62, 0x72, 0xa4),
+    background: c(0x28, 0x2a, 0x36),
+    background_panel: c(0x34, 0x37, 0x46),
+    background_element: c(0x44, 0x47, 0x5a),
+    border: c(0x62, 0x72, 0xa4),
+    border_active: c(0xbd, 0x93, 0xf9),
+    border_subtle: c(0x34, 0x37, 0x46),
+    border_dimmest: c(0x34, 0x37, 0x46),
+};
+
 /// All built-in themes, in picker order.
-pub const THEMES: &[Theme] = &[TOKYONIGHT, CATPPUCCIN, ROSEPINE, GRUVBOX];
+pub const THEMES: &[Theme] = &[TOKYONIGHT, CATPPUCCIN, ROSEPINE, GRUVBOX, NORD, DRACULA];
+
+impl Theme {
+    pub fn from_name(name: &str) -> Option<Theme> {
+        match name.trim().to_lowercase().as_str() {
+            "tokyonight" | "tokyo night" => Some(TOKYONIGHT),
+            "catppuccin" | "catppuccin mocha" => Some(CATPPUCCIN),
+            "rosepine" | "rosé pine" | "rose pine" => Some(ROSEPINE),
+            "gruvbox" | "gruvbox dark" => Some(GRUVBOX),
+            "nord" => Some(NORD),
+            "dracula" => Some(DRACULA),
+            _ => None,
+        }
+    }
+}
