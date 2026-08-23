@@ -1,0 +1,40 @@
+name: Jules PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: jules-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+      checks: write
+    steps:
+      # Pinned to the v1.6.0 release (SHA reviewed 2026-08-18).
+      # Bump deliberately: read the diff between tags first, then update this SHA.
+      - uses: thalesraymond/jules-pr-reviewer@c033a37855c3b85caa89bd4ee944b2b6af1bc104
+        with:
+          jules_api_key: ${{ secrets.JULES_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          fail_on: blocking
+          # Real reviews on non-trivial PRs take 15-25 min; the 30 min default allows
+          # only 2 attempts before the check run fails.
+          timeout_minutes: 45
+          # The action reviews its own introduction when an up-to-date master-merge pulls
+          # this file into a PR diff (it does not know it is itself). Ignore it: master
+          # infrastructure, user-directed and SHA-pinned, never authored PR content.
+          ignored_paths: '["\.github/workflows/jules-review\.yml"]'
+
+# --- Known limitation (accepted 2026-08-18, decision: document + accept) ---
+# The action skips fork PRs by default (skip_forks: true, anti prompt-injection) and creates
+# no check run for them. With branch protection requiring jules/review on master, fork PRs can
+# never merge (no jules/review check ever appears on their head commit). Accepted for this solo repo.
+# Escape hatch if a fork PR ever needs merging: temporarily drop the required check via
+#   gh api -X DELETE repos/shrijit37/tuna-tui/branches/master/protection/required_status_checks
+# merge after a human review, then re-add it (PUT .../protection with the same body).

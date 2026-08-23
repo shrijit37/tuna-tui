@@ -1,0 +1,28 @@
+name: bead-enforcement
+# bd (beads) is the issue tracker: work markers added to the tree must
+# reference a bead id so no work item lives outside the board. Runs the
+# same script `hooks/pre-commit` uses locally, but format-only (no bd CLI
+# in the container). CI is the server gate — this suite only checks the
+# PR's added lines.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check added markers carry bead ids
+        run: |
+          chmod +x scripts/check-bead-enforcement.sh
+          base="${{ github.event.pull_request.base.sha }}"
+          # For PRs, compare to base sha; for pushes, compare to parent or before commit
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="HEAD~1"
+          fi
+          git diff "$base"...HEAD | BD_ENFORCEMENT_FORMAT_ONLY=1 bash scripts/check-bead-enforcement.sh --diff
