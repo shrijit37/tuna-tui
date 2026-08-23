@@ -115,9 +115,10 @@ impl Expander for YtExpander {
         };
         let uris = match kind {
             "video" => vec![uri.to_string()],
-            // Playlists / channels / albums all resolve through the one
-            // kind table in yt; YouTube has no first-class albums — a
-            // search-backed expansion is the honest approximation.
+            "artist" | "album" => yt::resolve_kind(kind, id, 25)
+                .into_iter()
+                .map(|v| v.uri)
+                .collect(),
             kind => yt::resolve_kind(kind, id, config::get().search_limit)
                 .into_iter()
                 .map(|v| v.uri)
