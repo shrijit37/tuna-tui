@@ -30,16 +30,16 @@ pub(crate) fn handle_key(
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 if state.dirty {
+                    // Build the new config from the LIVE runtime copy so
+                    // nothing saved at boot is silently reverted.
+                    let mut cfg = app.config.clone();
+                    state.apply_to_config(&mut cfg);
                     if let Some(path) = tuna_tui::config::Config::path() {
-                        let mut cfg = tuna_tui::config::get().clone();
-                        state.apply_to_config(&mut cfg);
                         let _ = cfg.save_to_file(&path);
                     }
                     // Live-apply: the runtime config the render/input paths
                     // read must reflect the saved settings without a restart.
-                    let mut cfg = tuna_tui::config::get().clone();
-                    state.apply_to_config(&mut cfg);
-                    app.config = cfg.clone();
+                    app.config = cfg;
                     if app.config.theme_name != "Adaptive" {
                         if let Some(t) = tuna_tui::theme::Theme::from_name(&app.config.theme_name)
                         {
@@ -294,7 +294,9 @@ pub(crate) fn handle_key(
             }
         }
         KeyCode::Char(',') => {
-            app.view.settings = Some(SettingsState::init_from_config(tuna_tui::config::get()));
+            // Seed from the LIVE runtime config (app.config), not the
+            // boot-time static — otherwise reopened menus show stale values.
+            app.view.settings = Some(SettingsState::init_from_config(&app.config));
             app.status.clear();
         }
         // Tab / Shift+Tab (and [ ]) rotate the library sections.
