@@ -564,7 +564,7 @@ async fn run_ui(
     // `sleep()` every loop starves forever when player events are continuously
     // ready: the future gets cancelled/reset before its deadline. That was the
     // frozen-UI bug.
-    let mut frame = tokio::time::interval(Duration::from_millis(1));
+    let mut frame = tokio::time::interval(Duration::from_millis(8));
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_draw = Instant::now() - IDLE_REDRAW;
     let mut last_sync = Instant::now();

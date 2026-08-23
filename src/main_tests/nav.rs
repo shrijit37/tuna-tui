@@ -211,7 +211,7 @@ fn input_redraws_at_the_next_terminal_refresh() {
     assert!(!should_draw(
         true,
         false,
-        Duration::from_micros(500)
+        MIN_FRAME - Duration::from_millis(1)
     ));
 }
 
@@ -224,7 +224,7 @@ fn an_untouched_screen_redraws_rarely() {
 #[test]
 fn animation_redraws_at_animation_frame_rate() {
     assert!(should_draw(false, true, ANIM_FRAME));
-    assert!(!should_draw(false, true, Duration::from_micros(500)));
+    assert!(!should_draw(false, true, Duration::from_millis(4)));
 }
 
 #[test]
