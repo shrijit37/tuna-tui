@@ -31,6 +31,47 @@ pub(crate) fn handle_key(
         return false;
     }
 
+    // --- Playlist creation input mode captures keys ---
+    if let Some(input) = &mut app.browse.playlist_input {
+        match code {
+            KeyCode::Esc => {
+                app.browse.playlist_input = None;
+                app.status.clear();
+            }
+            KeyCode::Enter => {
+                if let Some(inp) = app.browse.playlist_input.take() {
+                    let name = inp
+                        .lines()
+                        .first()
+                        .map(|s| s.trim())
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        let uri = format!("tuna:playlist:{now}");
+                        app.store
+                            .toggle(StoreKind::Playlist, name.clone(), "0 tracks".to_string(), uri);
+                        app.store_dirty = true;
+                        for (section, items) in crate::browse::build_all_sections(&app.store) {
+                            app.browse.library.set(section, items);
+                        }
+                        app.status = format!("Created playlist \"{name}\"");
+                        app.browse.selected = 1;
+                    } else {
+                        app.status.clear();
+                    }
+                }
+            }
+            _ => {
+                input.input(crossterm::event::KeyEvent::new(code, mods));
+            }
+        }
+        return false;
+    }
+
     // --- Search input mode captures everything ---
     if app.search.input_mode {
         match code {

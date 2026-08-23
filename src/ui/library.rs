@@ -149,7 +149,6 @@ pub(crate) fn render_library(
             );
             continue;
         }
-
         let selected = idx == app.browse.selected;
         let bg = if selected {
             theme.background_element.into()
@@ -157,6 +156,43 @@ pub(crate) fn render_library(
             theme.background_panel.into()
         };
         let block = left_bar_block(&theme, selected, bg);
+
+        if item.uri == "tuna:action:new-playlist" {
+            let label_spans = if let Some(input) = &app.browse.playlist_input {
+                let text = input.lines().first().map(|s| s.as_str()).unwrap_or("");
+                let cursor_col = input.cursor().1;
+                let (before, after) = split_at_cursor(text, cursor_col);
+                vec![
+                    Span::styled(
+                        "＋  ",
+                        Style::default()
+                            .fg(theme.primary.into())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{before}▏{after}"),
+                        Style::default()
+                            .fg(theme.text.into())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]
+            } else {
+                vec![Span::styled(
+                    "＋  New Playlist",
+                    if selected {
+                        Style::default()
+                            .fg(theme.primary.into())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(theme.accent.into())
+                            .add_modifier(Modifier::BOLD)
+                    },
+                )]
+            };
+            f.render_widget(Paragraph::new(Line::from(label_spans)).block(block), rect);
+            continue;
+        }
         let style = if selected {
             Style::default()
                 .fg(theme.text.into())

@@ -400,6 +400,7 @@ async fn boot(
             selected: 0,
             sort: SortMode::Added,
             details: Vec::new(),
+            playlist_input: None,
         },
         transport: Transport {
             shuffle: saved.shuffle,
