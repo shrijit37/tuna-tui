@@ -1418,13 +1418,23 @@ fn engine_meta(uri: &str, r: &ResolvedTrack, client: &reqwest::blocking::Client)
 /// `thumbnail` has NO no-upscale guard (the 0.24 `nwidth >= width` early
 /// return is gone — it unconditionally resizes), so the size check here is
 /// what guarantees "never upscales". Corrupt bytes take the existing `None`
-/// path.
 fn decode_cover(bytes: &[u8]) -> Option<image::DynamicImage> {
     let img = image::load_from_memory(bytes).ok()?;
-    if img.width() > 320 || img.height() > 320 {
-        Some(img.thumbnail(320, 320))
+    let (w, h) = (img.width(), img.height());
+    // Center-crop non-square thumbnails to 1:1 square so the art fills the
+    // cell grid symmetrically and never renders off-center or letterboxed.
+    let cropped = if w != h {
+        let side = w.min(h);
+        let x = (w - side) / 2;
+        let y = (h - side) / 2;
+        img.crop_imm(x, y, side, side)
     } else {
-        Some(img)
+        img
+    };
+    if cropped.width() > 320 || cropped.height() > 320 {
+        Some(cropped.thumbnail(320, 320))
+    } else {
+        Some(cropped)
     }
 }
 
