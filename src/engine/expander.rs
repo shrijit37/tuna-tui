@@ -66,12 +66,48 @@ pub trait Expander: Send + Sync {
         seed: &str,
         cancel: Arc<AtomicBool>,
     ) -> Result<Vec<yt::YtVideo>, String>;
+    /// Title/artist hints recorded while expanding, drained as
+    /// `(uri, title, artist)` triples for UI queue pre-population.
+    fn take_meta_hints(&self) -> Vec<(String, String, String)> {
+        Vec::new()
+    }
+
+    /// A square album-art URL previously hinted for `uri`, if one was seen.
+    fn square_thumb_of(&self, _uri: &str) -> Option<String> {
+        None
+    }
+
+    /// Hints from YT Music search rows for label caching + square art.
+    fn record_song_hints(&self, _songs: &[crate::providers::contracts::Song]) {}
 }
 
 /// The pure-YouTube expander — the port's end state, live from phase 1's
 /// `yt/` module.
 #[derive(Default)]
-pub struct YtExpander;
+pub struct YtExpander {
+    hints: std::sync::Mutex<HintMap>,
+}
+
+#[derive(Default)]
+struct HintMap {
+    labels: std::collections::HashMap<String, (String, String)>,
+    thumbs: std::collections::HashMap<String, String>,
+}
+
+impl YtExpander {
+    /// Only googleusercontent-hosted art qualifies — YT Music's square crops
+    /// live there; i.ytimg.com entries (16:9 video frames from yt-dlp rows)
+    /// must never override a resolve's own metadata.
+    fn square_thumb_of(&self, uri: &str) -> Option<String> {
+        self.hints
+            .lock()
+            .ok()?
+            .thumbs
+            .get(uri)
+            .filter(|u| u.contains("googleusercontent"))
+            .cloned()
+    }
+}
 
 impl Expander for YtExpander {
     fn expand(&self, uri: &str) -> Result<Vec<String>, String> {
@@ -101,9 +137,13 @@ impl Expander for YtExpander {
         // Via the providers seam — yt-dlp adapter today; when the InnerTube
         // client lands (Myx-mh7.1/.2) it produces the same PlaybackInfo shape
         // and this call upgrades without touching the engine.
-        providers::ytdlp::resolve_stream(&id)
+        let mut r = providers::ytdlp::resolve_stream(&id)
             .map(ResolvedTrack::from)
-            .map_err(|e| format!("couldn't resolve {uri}: {e}"))
+            .map_err(|e| format!("couldn't resolve {uri}: {e}"))?;
+        if let Some(square) = self.square_thumb_of(uri) {
+            r.thumbnail = Some(square);
+        }
+        Ok(r)
     }
 
     fn radio(&self, seed: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String> {
@@ -133,6 +173,34 @@ impl Expander for YtExpander {
             return Err(format!("radio station for {seed} came back empty"));
         }
         Ok(rows)
+    }
+    fn take_meta_hints(&self) -> Vec<(String, String, String)> {
+        let Ok(mut map) = self.hints.lock() else {
+            return Vec::new();
+        };
+        map.labels.drain().map(|(u, (t, a))| (u, t, a)).collect()
+    }
+
+    fn square_thumb_of(&self, uri: &str) -> Option<String> {
+        YtExpander::square_thumb_of(self, uri)
+    }
+
+    fn record_song_hints(&self, songs: &[crate::providers::contracts::Song]) {
+        let Ok(mut map) = self.hints.lock() else {
+            return;
+        };
+        for s in songs {
+            let uri = format!("yt:video:{}", s.id);
+            let artist = s
+                .artists
+                .first()
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            map.labels.insert(uri.clone(), (s.title.clone(), artist));
+            if let Some(t) = s.thumbnails.first() {
+                map.thumbs.insert(uri, t.url.clone());
+            }
+        }
     }
 }
 
@@ -232,21 +300,21 @@ mod tests {
 
     #[test]
     fn video_uris_expand_to_themselves() {
-        let uris = YtExpander.expand("yt:video:dQw4w9WgXcQ").unwrap();
+        let uris = YtExpander::default().expand("yt:video:dQw4w9WgXcQ").unwrap();
         assert_eq!(uris, vec!["yt:video:dQw4w9WgXcQ".to_string()]);
     }
 
     #[test]
     fn unknown_schemes_are_rejected_with_a_reason() {
-        assert!(YtExpander.expand("spotify:playlist:xyz").is_err());
-        assert!(YtExpander.expand("yt:video").is_err());
-        assert!(YtExpander.expand("yt:podcast:x").is_err());
+        assert!(YtExpander::default().expand("spotify:playlist:xyz").is_err());
+        assert!(YtExpander::default().expand("yt:video").is_err());
+        assert!(YtExpander::default().expand("yt:podcast:x").is_err());
     }
 
     #[test]
     fn resolve_rejects_non_track_uris() {
-        assert!(YtExpander.resolve("yt:playlist:PLabc").is_err());
-        assert!(YtExpander.resolve("").is_err());
+        assert!(YtExpander::default().resolve("yt:playlist:PLabc").is_err());
+        assert!(YtExpander::default().resolve("").is_err());
     }
 
     /// Live smoke test: needs yt-dlp + network. Run with `--ignored`.
@@ -254,7 +322,7 @@ mod tests {
     #[ignore]
     fn live_radio_roundtrip() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let uris = YtExpander
+        let uris = YtExpander::default()
             .radio("yt:video:dQw4w9WgXcQ", cancel)
             .expect("radio station");
         assert!(uris.len() >= 2, "seed + at least one similar track");
@@ -271,7 +339,7 @@ mod tests {
     #[ignore]
     fn live_radio_falls_back_to_a_search_station() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let uris = YtExpander
+        let uris = YtExpander::default()
             .radio("yt:video:P8qNOneERe0", cancel)
             .expect("radio station");
         assert_eq!(uris[0], "yt:video:P8qNOneERe0");

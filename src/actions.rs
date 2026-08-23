@@ -91,7 +91,11 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
             });
             items.push(ActionItem {
                 label: "＋  Add to Queue".into(),
-                kind: ActionKind::Queue { uri: uri.clone() },
+                kind: ActionKind::Queue {
+                    uri: uri.clone(),
+                    name: item.name.clone(),
+                    subtitle: item.subtitle.clone(),
+                },
             });
             items.push(ActionItem {
                 label: "≡  Add to Playlist…".into(),
@@ -246,7 +250,14 @@ pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
             name,
             subtitle,
         } => apply_toggle(app, StoreKind::Liked, uri, name, subtitle),
-        ActionKind::Queue { uri } => {
+        ActionKind::Queue {
+            uri,
+            name,
+            subtitle,
+        } => {
+            if !name.is_empty() {
+                app.session.meta_cache.insert(uri.clone(), (name, subtitle));
+            }
             // The local queue: the engine's list is the authority, and the
             // transport mirrors it for the view. Dedupe so repeat presses
             // don't stack rows; enqueuing while nothing is loaded is a no-op

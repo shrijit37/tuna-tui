@@ -298,7 +298,7 @@ async fn boot(
 
     // The pure-YouTube expander: every uri the app produces is `yt:` now, so
     // there is nothing for a hybrid bridge to do.
-    let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(tuna_tui::engine::YtExpander);
+    let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(tuna_tui::engine::YtExpander::default());
 
     let (ev_tx, ev_rx) = flume::unbounded::<EngineEvent>();
     let engine = engine::run(ev_tx, engine_meta_tx, init_vol, expander).context("start engine")?;
@@ -626,6 +626,7 @@ async fn run_ui(
                             push_transport_modes(&mut app);
                             app.transport.playback_started = true;
                             app.status = "radio started".to_string();
+                            app.absorb_meta_hints();
                             app.refresh_local_queue();
                         }
                         Ok(_) => {

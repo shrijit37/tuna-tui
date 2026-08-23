@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
     println!("tuna-tui-probe: opening audio device…");
     let (tx, rx) = flume::unbounded::<EngineEvent>();
     let (meta_tx, _meta_rx) = flume::unbounded::<engine::EngineMeta>();
-    let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(engine::YtExpander);
+    let expander: Arc<dyn tuna_tui::engine::Expander> = Arc::new(engine::YtExpander::default());
     let engine = engine::run(tx, meta_tx, 50, expander)?;
     println!("tuna-tui-probe: engine live; yt-dlp + ffmpeg pipelines ready.");
 

@@ -138,14 +138,21 @@ impl App {
         self.refresh_local_queue();
     }
 
+    /// Absorb title/artist hints drained from the engine into the session meta cache.
+    pub(crate) fn absorb_meta_hints(&mut self) {
+        for (uri, title, artist) in self.svc.engine.take_meta_hints() {
+            self.session.meta_cache.insert(uri, (title, artist));
+        }
+    }
+
     /// A display string for a track uri: the cached "title — artist" once its
     /// metadata has landed, the bare uri before that.
     pub(crate) fn track_label_of(&self, uri: &str) -> String {
-        self.session
-            .meta_cache
-            .get(uri)
-            .map(|(t, a)| format!("{t} — {a}"))
-            .unwrap_or_else(|| uri.to_string())
+        match self.session.meta_cache.get(uri) {
+            Some((t, a)) if a.is_empty() => t.clone(),
+            Some((t, a)) => format!("{t} — {a}"),
+            None => uri.to_string(),
+        }
     }
 
     /// Refresh the Queue view's data from the engine's loaded list (the local

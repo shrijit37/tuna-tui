@@ -300,6 +300,16 @@ impl Engine {
     ) -> Result<Vec<crate::yt::YtVideo>, String> {
         self.inner.expander.radio_entries(seed, cancel)
     }
+    /// Drain title/artist hints recorded during expansion/radio.
+    pub fn take_meta_hints(&self) -> Vec<(String, String, String)> {
+        self.inner.expander.take_meta_hints()
+    }
+
+    /// Feed YT Music search rows into the hint store.
+    pub fn record_song_hints(&self, songs: &[crate::providers::contracts::Song]) {
+        self.inner.expander.record_song_hints(songs);
+    }
+
 
     /// The loaded play list, in play order (post-shuffle). Empty when nothing
     /// is loaded. A local mirror for the app's Queue view — the old provider
@@ -773,9 +783,7 @@ impl Worker {
             return None;
         }
         if self.state.shuffle && n > 1 {
-            use rand::Rng as _;
-            let other: Vec<usize> = (0..n).filter(|&i| i != self.state.cursor).collect();
-            let pick = other[rand::rng().random_range(0..other.len())];
+            let pick = shuffle_pick(self.state.cursor, n, &mut rand::rng());
             self.state.history.push(self.state.cursor);
             self.state.cursor = pick;
             return Some(pick);
@@ -1306,10 +1314,21 @@ fn fetch_cover(client: &reqwest::blocking::Client, url: &str) -> Option<Vec<u8>>
     Some(bytes)
 }
 
+/// Rejection loop for shuffle picking — eliminates the per-skip `Vec`
+/// allocation while guaranteeing `pick != cursor`.
+fn shuffle_pick(cursor: usize, n: usize, rng: &mut impl rand::Rng) -> usize {
+    loop {
+        let i = rng.random_range(0..n);
+        if i != cursor {
+            break i;
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn a_failing_recovery_backs_off_up_to_the_cap() {
         assert!(next_backoff(RETRY_MIN) > RETRY_MIN);
@@ -1623,5 +1642,22 @@ mod tests {
             peak2 > 0.0,
             "bands fell to zero during audible playback: {peak2}"
         );
+    }
+    #[test]
+    fn shuffle_pick_never_returns_the_cursor() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x53EED);
+        for n in 2..=10usize {
+            for cursor in 0..=n {
+                for _ in 0..500 {
+                    let pick = shuffle_pick(cursor, n, &mut rng);
+                    assert!(
+                        pick < n,
+                        "pick {pick} out of range for n={n}, cursor={cursor}"
+                    );
+                    assert_ne!(pick, cursor, "pick == cursor {cursor} for n={n}");
+                }
+            }
+        }
     }
 }

@@ -66,7 +66,7 @@ fn live_radio_roundtrip() {
     use tuna_tui::engine::Expander as _;
     // Never-set flag: a live smoke test must not cancel itself.
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let uris = tuna_tui::engine::YtExpander
+    let uris = tuna_tui::engine::YtExpander::default()
         .radio("yt:video:dQw4w9WgXcQ", cancel)
         .expect("radio station");
     assert!(uris.len() >= 2, "seed + at least one similar track");

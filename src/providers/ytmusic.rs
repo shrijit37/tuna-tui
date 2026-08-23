@@ -98,10 +98,15 @@ fn thumbnail_from_value(v: &serde_json::Value) -> Option<String> {
     ];
     for cand in candidates.into_iter().flatten() {
         if let Some(arr) = cand.as_array() {
-            if let Some(last) = arr.last() {
-                if let Some(url) = last.get("url").and_then(|u| u.as_str()) {
-                    return Some(normalize_thumbnail_url(url));
-                }
+            // Prefer googleusercontent URLs (square YTM art) over generic ones
+            if let Some(url) = arr
+                .iter()
+                .rev()
+                .filter_map(|e| e.get("url").and_then(|u| u.as_str()))
+                .find(|u| u.contains("googleusercontent.com"))
+                .or_else(|| arr.last().and_then(|e| e.get("url").and_then(|u| u.as_str())))
+            {
+                return Some(normalize_thumbnail_url(url));
             }
         }
     }
