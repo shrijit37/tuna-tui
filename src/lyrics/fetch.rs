@@ -356,17 +356,6 @@ fn fetch_exact_url(client: &reqwest::blocking::Client, url: &str) -> (Vec<(u32, 
     lyrics_from_record(&v)
 }
 
-/// Search endpoint with tolerance picking. Handles both array and single-record
-/// (old /api/get shape) defensively for offline tests.
-fn fetch_search_url(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    expected_s: f64,
-    tolerance: f64,
-) -> (Vec<(u32, String)>, bool) {
-    fetch_search_url_for_title(client, url, expected_s, tolerance, "")
-}
-
 fn fetch_search_url_for_title(
     client: &reqwest::blocking::Client,
     url: &str,

@@ -635,10 +635,12 @@ fn deep_googleusercontent_thumb(v: &serde_json::Value) -> Option<String> {
 // offline-tested parsers (exposed for unit tests)
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn parse_search_json_for_test(root: &serde_json::Value, limit: usize) -> Vec<Song> {
     parse_search_value(root, limit)
 }
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn parse_player_json_for_test(
     root: &serde_json::Value,
 ) -> Option<(String, String, Option<String>, Option<String>)> {
