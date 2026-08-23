@@ -129,14 +129,52 @@ fn normalize_query(s: &str) -> String {
             break;
         }
     }
-    out = out.replace(['-', '_'], " ");
+    while let Some(start) = out.find('[') {
+        if let Some(end) = out[start..].find(']') {
+            out.replace_range(start..start + end + 1, " ");
+        } else {
+            break;
+        }
+    }
+    out = out.replace(['-', '_', '.', ',', ';', ':', '!', '?', '/', '\\', '&', '|'], " ");
     // Strip feat variants as whole tokens — substring replace would mangle
     // "daft" → "da" via "ft". Filter after splitting.
     let filtered: Vec<&str> = out
         .split_whitespace()
-        .filter(|w| !matches!(*w, "feat" | "feat." | "ft" | "ft." | "featuring"))
+        .filter(|w| !matches!(*w, "feat" | "feat." | "ft" | "ft." | "featuring" | "official" | "audio" | "video" | "lyrics" | "with"))
         .collect();
     filtered.join(" ")
+}
+
+/// Check if candidate track title matches the requested title by normalized token or substring.
+fn title_matches(candidate_title: &str, target_title: &str) -> bool {
+    if target_title.is_empty() || candidate_title.is_empty() {
+        return true;
+    }
+    let n_cand = normalize_query(candidate_title);
+    let n_target = normalize_query(target_title);
+    if n_cand.is_empty() || n_target.is_empty() {
+        return true;
+    }
+    if n_cand.contains(&n_target) || n_target.contains(&n_cand) {
+        return true;
+    }
+    let cand_tokens: Vec<&str> = n_cand.split_whitespace().collect();
+    let target_tokens: Vec<&str> = n_target.split_whitespace().collect();
+    target_tokens
+        .iter()
+        .any(|t| t.len() >= 2 && cand_tokens.contains(t))
+}
+
+/// Extract primary artist name before collaboration separators (&, feat, etc.)
+fn primary_artist(artist: &str) -> &str {
+    let seps = [" & ", " feat. ", " feat ", " ft. ", " ft ", " featuring ", ", ", " / "];
+    for sep in seps {
+        if let Some((first, _)) = artist.split_once(sep) {
+            return first.trim();
+        }
+    }
+    artist.trim()
 }
 
 /// Check if a candidate record actually carries lyrics (F3 / Myx-ms2).
@@ -169,8 +207,42 @@ fn pick_search_match(
     expected_duration_s: f64,
     tolerance: f64,
 ) -> Option<&serde_json::Value> {
+    pick_search_match_for_title(search, expected_duration_s, tolerance, "")
+}
+
+/// Pick the record nearest in duration while ensuring the candidate trackName
+/// actually matches the target title (prevents picking unrelated songs by the same artist).
+fn pick_search_match_for_title<'a>(
+    search: &'a serde_json::Value,
+    expected_duration_s: f64,
+    tolerance: f64,
+    target_title: &str,
+) -> Option<&'a serde_json::Value> {
     let arr = search.as_array()?;
-    arr.iter()
+    let matched_by_title: Vec<&serde_json::Value> = arr
+        .iter()
+        .filter(|v| has_lyrics(v))
+        .filter(|v| {
+            if target_title.is_empty() {
+                true
+            } else {
+                let track_name = v["trackName"]
+                    .as_str()
+                    .or_else(|| v["name"].as_str())
+                    .unwrap_or("");
+                title_matches(track_name, target_title)
+            }
+        })
+        .collect();
+
+    let candidates = if matched_by_title.is_empty() && target_title.is_empty() {
+        arr.iter().filter(|v| has_lyrics(v)).collect::<Vec<_>>()
+    } else {
+        matched_by_title
+    };
+
+    candidates
+        .into_iter()
         .filter(|v| has_lyrics(v))
         .filter_map(|v| v["duration"].as_f64().map(|d| (d, v)))
         .filter(|(d, _)| (d - expected_duration_s).abs() <= tolerance)
@@ -203,11 +275,37 @@ fn fetch_with_fallback(
         return (lines, synced);
     }
 
+    // 1b. Exact /api/get with primary artist (e.g. "Kendrick Lamar" from "Kendrick Lamar & SZA")
+    let p_artist = primary_artist(artist);
+    if p_artist != artist.trim() && !p_artist.is_empty() {
+        let p_exact_url = format!(
+            "https://lrclib.net/api/get?artist_name={}&track_name={}&album_name={}&duration={}",
+            urlencode(p_artist),
+            urlencode(title),
+            urlencode(album),
+            expected_s as u32
+        );
+        let (lines, synced) = fetch_exact_url(client, &p_exact_url);
+        if !lines.is_empty() {
+            return (lines, synced);
+        }
+    }
+
     // 2. Filtered search artist/track/album with primary tolerance
     let filtered_search = search_url(artist, title, album);
     {
         let (lines, synced) =
-            fetch_search_url(client, &filtered_search, expected_s, PRIMARY_TOLERANCE_S);
+            fetch_search_url_for_title(client, &filtered_search, expected_s, PRIMARY_TOLERANCE_S, title);
+        if !lines.is_empty() {
+            return (lines, synced);
+        }
+    }
+
+    // 2b. Filtered search with primary artist
+    if p_artist != artist.trim() && !p_artist.is_empty() {
+        let p_filtered_search = search_url(p_artist, title, album);
+        let (lines, synced) =
+            fetch_search_url_for_title(client, &p_filtered_search, expected_s, PRIMARY_TOLERANCE_S, title);
         if !lines.is_empty() {
             return (lines, synced);
         }
@@ -219,7 +317,8 @@ fn fetch_with_fallback(
         urlencode(&format!("{} {}", artist, title))
     );
     {
-        let (lines, synced) = fetch_search_url(client, &q_url, expected_s, PRIMARY_TOLERANCE_S);
+        let (lines, synced) =
+            fetch_search_url_for_title(client, &q_url, expected_s, PRIMARY_TOLERANCE_S, title);
         if !lines.is_empty() {
             return (lines, synced);
         }
@@ -235,25 +334,27 @@ fn fetch_with_fallback(
             urlencode(&format!("{} {}", n_artist, n_title))
         );
         {
-            let (lines, synced) = fetch_search_url(client, &n_q, expected_s, FALLBACK_TOLERANCE_S);
+            let (lines, synced) =
+                fetch_search_url_for_title(client, &n_q, expected_s, FALLBACK_TOLERANCE_S, title);
             if !lines.is_empty() {
                 return (lines, synced);
             }
         }
         // Also fallback with wide tolerance on the filtered search if normalized q missed
         let (lines, synced) =
-            fetch_search_url(client, &filtered_search, expected_s, FALLBACK_TOLERANCE_S);
+            fetch_search_url_for_title(client, &filtered_search, expected_s, FALLBACK_TOLERANCE_S, title);
         if !lines.is_empty() {
             return (lines, synced);
         }
     } else {
         // No normalization change — just widen tolerance on filtered search
         let (lines, synced) =
-            fetch_search_url(client, &filtered_search, expected_s, FALLBACK_TOLERANCE_S);
+            fetch_search_url_for_title(client, &filtered_search, expected_s, FALLBACK_TOLERANCE_S, title);
         if !lines.is_empty() {
             return (lines, synced);
         }
-        let (lines, synced) = fetch_search_url(client, &q_url, expected_s, FALLBACK_TOLERANCE_S);
+        let (lines, synced) =
+            fetch_search_url_for_title(client, &q_url, expected_s, FALLBACK_TOLERANCE_S, title);
         if !lines.is_empty() {
             return (lines, synced);
         }
@@ -297,6 +398,16 @@ fn fetch_search_url(
     expected_s: f64,
     tolerance: f64,
 ) -> (Vec<(u32, String)>, bool) {
+    fetch_search_url_for_title(client, url, expected_s, tolerance, "")
+}
+
+fn fetch_search_url_for_title(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    expected_s: f64,
+    tolerance: f64,
+    target_title: &str,
+) -> (Vec<(u32, String)>, bool) {
     let Ok(resp) = client
         .get(url)
         .header("User-Agent", "tuna-tui (terminal music player)")
@@ -310,7 +421,7 @@ fn fetch_search_url(
     let Ok(v) = resp.json::<serde_json::Value>() else {
         return (Vec::new(), false);
     };
-    let Some(record) = pick_search_match(&v, expected_s, tolerance).or_else(|| {
+    let Some(record) = pick_search_match_for_title(&v, expected_s, tolerance, target_title).or_else(|| {
         if v.is_array() {
             None
         } else {
@@ -600,6 +711,46 @@ mod tests {
         assert_eq!(normalize_query("Hello (feat. World) - Test"), "hello test");
         assert_eq!(normalize_query("Song feat. Artist"), "song artist");
         assert_eq!(normalize_query("  Multiple   Spaces  "), "multiple spaces");
+    }
+
+    #[test]
+    fn search_match_for_title_rejects_unrelated_song_with_matching_duration() {
+        let search = json!([
+            { "trackName": "All The Stars", "duration": 178.0, "syncedLyrics": "[00:01.00]stars" },
+            { "trackName": "Kendrick Lamar & SZA - luther", "duration": 180.0, "syncedLyrics": "[00:01.00]luther" },
+        ]);
+        // Even though "All The Stars" has duration 178.0 (exact match for 178.0),
+        // searching for "luther" must pick "luther" (180.0, within 3s tolerance).
+        let picked = pick_search_match_for_title(&search, 178.0, PRIMARY_TOLERANCE_S, "luther")
+            .expect("must find luther");
+        assert_eq!(picked["trackName"], "Kendrick Lamar & SZA - luther");
+    }
+
+    #[test]
+    fn search_match_for_title_returns_none_if_only_unrelated_songs_in_tolerance() {
+        let search = json!([
+            { "trackName": "All The Stars", "duration": 178.0, "syncedLyrics": "[00:01.00]stars" },
+            { "trackName": "HUMBLE.", "duration": 177.0, "syncedLyrics": "[00:01.00]humble" },
+        ]);
+        let picked = pick_search_match_for_title(&search, 178.0, PRIMARY_TOLERANCE_S, "luther");
+        assert!(picked.is_none(), "must not pick All The Stars or HUMBLE for luther");
+    }
+
+    #[test]
+    #[ignore = "requires live internet connection to lrclib.net"]
+    fn live_fetch_lyrics_for_luther_returns_correct_lyrics() {
+        let (lines, synced) = fetch_lyrics_blocking("Kendrick Lamar & SZA", "luther", "GNX", 178_000);
+        assert!(synced, "luther should have synced lyrics");
+        assert!(!lines.is_empty(), "lyrics should not be empty");
+        let text = lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.to_lowercase().contains("world were mine") || text.to_lowercase().contains("roman numeral seven"),
+            "lyrics must be for luther, got: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("all the stars are closer"),
+            "lyrics must not be for All The Stars"
+        );
     }
 }
 
