@@ -4302,6 +4302,8 @@ dependencies = [
  "tokio",
  "toml",
  "tui-textarea-2",
+ "unicode-segmentation",
+ "unicode-width",
  "windows-win",
  "winit",
 ]

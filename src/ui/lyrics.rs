@@ -72,17 +72,19 @@ pub(crate) fn render_lyrics(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
 
     let mut lines: Vec<Line> = Vec::with_capacity(h);
     for (i, (_, text)) in app.view.lyrics.iter().enumerate().skip(start).take(h) {
-        let style = if app.view.lyrics_synced && i == cur {
-            Style::default()
-                .fg(theme.primary.into())
-                .add_modifier(Modifier::BOLD)
-        } else if app.view.lyrics_synced && i < cur {
-            Style::default().fg(theme.border_subtle.into())
+        let style = if app.view.lyrics_synced {
+            if i == cur {
+                Style::default().fg(theme.primary.into())
+            } else if i < cur {
+                Style::default().fg(theme.border_subtle.into())
+            } else {
+                theme.muted()
+            }
         } else {
-            theme.muted()
+            Style::default().fg(theme.text.into())
         };
         let txt: std::borrow::Cow<'_, str> = if text.is_empty() {
-            "♪︎".into()
+            "♪".into()
         } else {
             truncate(text, max)
         };

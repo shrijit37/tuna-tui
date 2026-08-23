@@ -9,17 +9,34 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
-/// Truncate to `max` characters, replacing the tail with an ellipsis.
+/// Truncate to `max` display columns, replacing the tail with an ellipsis.
 ///
-/// Borrows the input when it already fits (the common render-row case — no
-/// allocation); only the cut path builds a string.
+/// Grapheme-cluster aware: never splits multi-byte characters, combining matras,
+/// or complex Indic/Gurmukhi conjuncts, preserving correct font rendering in terminals.
 pub fn truncate<'a>(s: &'a str, max: usize) -> Cow<'a, str> {
-    if s.chars().count() <= max {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.chars().take(max.saturating_sub(1)).collect::<String>() + "…")
+    let width = s.width();
+    if width <= max {
+        return Cow::Borrowed(s);
     }
+    if max == 0 {
+        return Cow::Borrowed("");
+    }
+    let target = max.saturating_sub(1);
+    let mut cur_w = 0;
+    let mut end_idx = 0;
+    for g in s.graphemes(true) {
+        let gw = g.width();
+        if cur_w + gw > target {
+            break;
+        }
+        cur_w += gw;
+        end_idx += g.len();
+    }
+    let prefix = &s[..end_idx];
+    Cow::Owned(format!("{prefix}…"))
 }
 
 /// Format milliseconds as `m:ss`.
@@ -366,6 +383,14 @@ mod adversarial {
         // Control: never splits multibyte char
         let t3 = truncate("a\u{65e5}b", 2); // a + CJK
         assert_eq!(t3.chars().count(), 2);
+
+        // Indic / Devanagari test: "केसरिया" (7 chars: क + े + स + र + ि + य + ा)
+        // Must never split combining vowel signs (matras) off base consonants.
+        let hindi = "केसरिया";
+        let th = truncate(hindi, 4);
+        assert!(th.ends_with('…'));
+        // Must be valid UTF-8 and not contain isolated combining marks
+        assert!(th.starts_with("के"));
     }
 
     /// FLAW: backoff_step must double until cap, not exceed cap nor reset
