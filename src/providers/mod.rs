@@ -7,5 +7,6 @@
 
 pub mod contracts;
 pub mod ytdlp;
+pub mod ytmusic;
 
 pub use contracts::{AlbumRef, ArtistRef, AudioStream, PlaybackInfo, Song, Thumbnail};

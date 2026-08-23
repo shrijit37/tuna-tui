@@ -164,6 +164,14 @@ fn radio_candidates(id: &str) -> Vec<String> {
 /// failure. The pseudo-radio resolves the seed for its title, searches that
 /// flat, and drops the seed itself from the results.
 pub fn radio_entries(id: &str, cancel: Arc<AtomicBool>) -> Vec<YtVideo> {
+    if cancel.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    if let Some(tracks) = crate::providers::ytmusic::radio(id) {
+        if !tracks.is_empty() {
+            return tracks;
+        }
+    }
     let limit = RADIO_FETCH_LIMIT.to_string();
     for url in radio_candidates(id) {
         // F13: check between chain steps — a cancelled request must not start
@@ -338,7 +346,7 @@ fn video_from(v: &serde_json::Value) -> Option<YtVideo> {
         // (u64::MAX × 1000 overflows before the u32 try_from can guard it).
         .and_then(|s| s.checked_mul(1000))
         .and_then(|ms| u32::try_from(ms).ok());
-    let thumbnail = largest_thumbnail(v);
+    let thumbnail = pick_thumbnail(v);
     let uri = format!("yt:video:{id}");
     Some(YtVideo {
         uri,
@@ -350,15 +358,255 @@ fn video_from(v: &serde_json::Value) -> Option<YtVideo> {
     })
 }
 
-/// The last thumbnail in the array — yt-dlp orders `thumbnails` small→large, so
-/// the last is the biggest actual frame. Falls back to the bare `thumbnail`.
-fn largest_thumbnail(v: &serde_json::Value) -> Option<String> {
-    v["thumbnails"]
-        .as_array()
-        .and_then(|a| a.last())
-        .and_then(|t| t["url"].as_str())
-        .or_else(|| v["thumbnail"].as_str())
-        .map(String::from)
+/// Square-first thumbnail picker. YouTube Music album art (`w544-h544`,
+/// `width == height`) beats bigger 16:9 video frames regardless of array
+/// position; among equal-tier candidates the largest area wins and ties go to
+/// the later entry. Width-less legacy rows keep the old last-entry behavior,
+/// and a bare top-level `thumbnail` string is the final fallback.
+pub fn pick_thumbnail(v: &serde_json::Value) -> Option<String> {
+    let arr = v["thumbnails"].as_array();
+    // Tier 0: true squares (width == height > 0) with a url.
+    let mut best: Option<(u64, usize)> = None;
+    if let Some(entries) = arr {
+        for (i, t) in entries.iter().enumerate() {
+            let Some(_url) = t["url"].as_str() else { continue };
+            let w = t["width"].as_u64().unwrap_or(0);
+            let h = t["height"].as_u64().unwrap_or(0);
+            if w > 0 && w == h && (best.is_none_or(|(a, _)| w >= a)) {
+                best = Some((w, i));
+            }
+        }
+        if best.is_some() {
+            return entry_url(arr.unwrap(), best.unwrap().1);
+        }
+        // Tier 1: dimensioned non-squares — largest area wins.
+        let mut area_best: Option<(u64, usize)> = None;
+        for (i, t) in entries.iter().enumerate() {
+            let Some(_url) = t["url"].as_str() else { continue };
+            let w = t["width"].as_u64().unwrap_or(0);
+            let h = t["height"].as_u64().unwrap_or(0);
+            if w == 0 || h == 0 {
+                continue;
+            }
+            // saturating: a hostile u64::MAX dimension degrades to "huge",
+            // it never aborts the pick.
+            let area = w.saturating_mul(h);
+            if area_best.is_none_or(|(a, _)| area >= a) {
+                area_best = Some((area, i));
+            }
+        }
+        if area_best.is_some() {
+            return entry_url(entries, area_best.unwrap().1);
+        }
+        // Tier 2: legacy width-less rows — last entry with a url wins.
+        for t in entries.iter().rev() {
+            if let Some(url) = t["url"].as_str() {
+                return Some(url.to_string());
+            }
+        }
+    }
+    v["thumbnail"].as_str().map(String::from)
+}
+
+/// The url of `entries[i]`, re-borrowed so the borrow checker sees one lookup.
+fn entry_url(entries: &[serde_json::Value], i: usize) -> Option<String> {
+    entries[i]["url"].as_str().map(String::from)
+}
+
+/// Parse an InnerTube YouTube Music search payload into flat `YtVideo` rows.
+/// Only music shelves are read (`musicCardShelfRenderer` top result +
+/// `musicShelfRenderer` song rows); unknown or non-music renderers are
+/// ignored, and malformed shapes degrade to fewer/empty rows — never a panic.
+pub fn parse_ytmusic_search(root: &serde_json::Value) -> Vec<YtVideo> {
+    let Some(contents) = root
+        .get("contents")
+        .and_then(|c| c.get("tabbedSearchResultsRenderer"))
+        .and_then(|t| t.get("tabs"))
+        .and_then(|t| t.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tab in contents {
+        let Some(sections) = tab
+            .get("tabRenderer")
+            .and_then(|t| t.get("content"))
+            .and_then(|c| c.get("sectionListRenderer"))
+            .and_then(|s| s.get("contents"))
+            .and_then(|s| s.as_array())
+        else {
+            continue;
+        };
+        for section in sections {
+            // Top result card.
+            if let Some(card) = section.get("musicCardShelfRenderer") {
+                if let Some(v) = ytv_from_card(card) {
+                    out.push(v);
+                }
+            }
+            // Songs shelf rows.
+            if let Some(shelf) = section.get("musicShelfRenderer").and_then(|s| s.get("contents")).and_then(|c| c.as_array()) {
+                for row in shelf {
+                    if let Some(item) = row.get("musicResponsiveListItemRenderer") {
+                        if let Some(v) = ytv_from_music_row(item) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `musicCardShelfRenderer` → the top-result `YtVideo`.
+fn ytv_from_card(card: &serde_json::Value) -> Option<YtVideo> {
+    let id = card
+        .get("playlistItemData")
+        .and_then(|p| p.get("videoId"))
+        .and_then(|v| v.as_str())?;
+    let title = runs_text(&card["title"]);
+    if title.is_empty() {
+        return None;
+    }
+    // Subtitle runs look like ["Video", " · ", "Daft Punk"] — drop the type
+    // token and separators; whatever remains is the artist line.
+    let artist = card
+        .get("subtitle")
+        .and_then(|s| s.get("runs"))
+        .and_then(|r| r.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !matches!(*t, "Video" | "Song" | " · " | " • "))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    let thumbnail = pick_thumbnail(card);
+    Some(YtVideo {
+        uri: format!("yt:video:{id}"),
+        title,
+        artist,
+        album: None,
+        duration_ms: None,
+        thumbnail,
+    })
+}
+
+/// A `musicResponsiveListItemRenderer` shelf row → `YtVideo`.
+fn ytv_from_music_row(item: &serde_json::Value) -> Option<YtVideo> {
+    let id = item
+        .get("playlistItemData")
+        .and_then(|p| p.get("videoId"))
+        .and_then(|v| v.as_str())?;
+    let flex = item.get("flexColumns")?.as_array()?;
+    let title = flex
+        .first()
+        .and_then(|c| c.get("musicResponsiveListItemFlexColumnRenderer"))
+        .map(runs_text_of_col)
+        .unwrap_or_default();
+    if title.is_empty() {
+        return None;
+    }
+    // Second column: "Artist • Album".
+    let meta = flex
+        .get(1)
+        .and_then(|c| c.get("musicResponsiveListItemFlexColumnRenderer"))
+        .map(runs_text_of_col)
+        .unwrap_or_default();
+    let (artist, album) = match meta.split_once(" • ") {
+        Some((a, al)) => (a.trim().to_string(), Some(al.trim()).filter(|s| !s.is_empty()).map(String::from)),
+        None => (meta.trim().to_string(), None),
+    };
+    // Fixed column carries the duration ("5:20", "—" when unknown).
+    let duration_ms = item
+        .get("fixedColumns")
+        .and_then(|f| f.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("musicResponsiveListItemFixedColumnRenderer"))
+        .map(|c| runs_text_of_col(c))
+        .and_then(|t| parse_hms_ms(&t));
+    let thumbnail = pick_thumbnail(item);
+    Some(YtVideo {
+        uri: format!("yt:video:{id}"),
+        title,
+        artist,
+        album,
+        duration_ms,
+        thumbnail,
+    })
+}
+
+/// The joined text of a flex/fixed column renderer's `text.runs`.
+fn runs_text_of_col(col: &serde_json::Value) -> String {
+    col.get("text")
+        .map(runs_text)
+        .unwrap_or_default()
+}
+
+/// Joined `runs[].text`, empty when absent.
+fn runs_text(v: &serde_json::Value) -> String {
+    v.get("runs")
+        .and_then(|r| r.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// `m:ss` / `h:mm:ss` → milliseconds. Anything unparsable → `None`.
+fn parse_hms_ms(s: &str) -> Option<u32> {
+    let mut ms: u64 = 0;
+    let mut mul: u64 = 1;
+    for part in s.trim().split(':').rev() {
+        let n: u64 = part.parse().ok()?;
+        ms += n.checked_mul(mul)?;
+        mul *= 60;
+    }
+    u32::try_from(ms.saturating_mul(1000)).ok()
+}
+
+/// YT Music search: the live InnerTube songs endpoint first (music-filtered,
+/// ~1 request); offline or empty, fall back to the flat `ytsearchN:` dump,
+/// parsing its InnerTube envelope when present. An empty query never spawns
+/// a child process.
+pub fn ytmusic_search(query: &str, limit: usize) -> Vec<YtVideo> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let limit = limit.max(1);
+    if let Some(songs) = crate::providers::ytmusic::search_songs(query, limit) {
+        let rows: Vec<YtVideo> = songs
+            .into_iter()
+            .take(limit)
+            .map(|s| YtVideo {
+                uri: format!("yt:video:{}", s.id),
+                title: s.title,
+                artist: s.artists.first().map(|a| a.name.clone()).unwrap_or_default(),
+                album: s.album.map(|a| a.name),
+                duration_ms: s.duration_ms,
+                thumbnail: s.thumbnails.first().map(|t| t.url.clone()),
+            })
+            .collect();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    if let Some(root) = yt_json(
+        &["--flat-playlist", &format!("ytsearch{limit}:{query}")],
+        None,
+    ) {
+        let rows = parse_ytmusic_search(&root);
+        if !rows.is_empty() {
+            return rows.into_iter().take(limit).collect();
+        }
+        return entries(&root).into_iter().take(limit).collect();
+    }
+    Vec::new()
 }
 
 /// Wait up to `deadline` for one of `p`'s permits, polling every 50ms.
@@ -976,25 +1224,24 @@ mod adversarial {
     /// ISOLATION: only thumbnails array varies; same id/title/artist
     /// FALSE_POSITIVE_PREVENTION: control single thumbnail, control bare string fallback, control last-wins
     #[test]
-    fn test_yt_thumbnail_picks_largest_last_not_first_isolated() {
-        // Control: single thumbnail array -> that url
+   fn test_yt_thumbnail_picks_largest_last_not_first_isolated() {
         let single = json!({"id":"x","title":"t","thumbnails":[{"url":"https://a/small.jpg"}]});
         assert_eq!(
-            largest_thumbnail(&single).as_deref(),
+            pick_thumbnail(&single).as_deref(),
             Some("https://a/small.jpg")
         );
 
         // Control: bare thumbnail string fallback when no array
         let bare = json!({"id":"x","title":"t","thumbnail":"https://b/bare.jpg"});
         assert_eq!(
-            largest_thumbnail(&bare).as_deref(),
+            pick_thumbnail(&bare).as_deref(),
             Some("https://b/bare.jpg")
         );
 
         // Flawed: array with 2 entries, last is larger -> must pick last
         let two = json!({"id":"x","title":"t","thumbnails":[{"url":"https://a/small.jpg"},{"url":"https://a/large.jpg"}]});
         assert_eq!(
-            largest_thumbnail(&two).as_deref(),
+            pick_thumbnail(&two).as_deref(),
             Some("https://a/large.jpg")
         );
 
@@ -1002,13 +1249,13 @@ mod adversarial {
         let empty_array =
             json!({"id":"x","title":"t","thumbnails":[],"thumbnail":"https://b/bare.jpg"});
         assert_eq!(
-            largest_thumbnail(&empty_array).as_deref(),
+            pick_thumbnail(&empty_array).as_deref(),
             Some("https://b/bare.jpg")
         );
 
         // Control: both missing -> None
         let none = json!({"id":"x","title":"t"});
-        assert_eq!(largest_thumbnail(&none), None);
+       assert_eq!(pick_thumbnail(&none), None);
     }
 
     /// FLAW: pick_url must skip storyboard (vcodec=="none" && acodec=="none") even if it is last
