@@ -22,6 +22,16 @@ type MemoValue = (Vec<(u32, String)>, bool);
 /// shared instance is sound across the worker threads.
 static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 
+fn lyrics_client() -> &'static reqwest::blocking::Client {
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(2500))
+            .connect_timeout(std::time::Duration::from_millis(1500))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 /// Session-scoped memo of lrclib results, keyed on normalized
 /// `artist|title|album|duration_s` (F1 fix). Repeated tracks — the same song
 /// again, radio loops — used to re-fetch identical content on every track
@@ -63,7 +73,7 @@ pub fn fetch_lyrics_blocking(
     album: &str,
     duration_ms: u32,
 ) -> (Vec<(u32, String)>, bool) {
-    let client = CLIENT.get_or_init(|| crate::httpcache::blocking_client().clone());
+    let client = lyrics_client();
     let expected_s = duration_ms as f64 / 1000.0;
 
     // F2 guard: 0-duration is not a real length — don't memoize, just try once
@@ -301,58 +311,14 @@ fn fetch_with_fallback(
         }
     }
 
-    // 2b. Filtered search with primary artist
-    if p_artist != artist.trim() && !p_artist.is_empty() {
-        let p_filtered_search = search_url(p_artist, title, album);
-        let (lines, synced) =
-            fetch_search_url_for_title(client, &p_filtered_search, expected_s, PRIMARY_TOLERANCE_S, title);
-        if !lines.is_empty() {
-            return (lines, synced);
-        }
-    }
-
-    // 3. Generic q search with primary tolerance
+    // 3. Clean generic query search
+    let clean_artist = normalize_query(artist);
+    let clean_title = normalize_query(title);
     let q_url = format!(
         "https://lrclib.net/api/search?q={}",
-        urlencode(&format!("{} {}", artist, title))
+        urlencode(&format!("{} {}", clean_artist, clean_title))
     );
     {
-        let (lines, synced) =
-            fetch_search_url_for_title(client, &q_url, expected_s, PRIMARY_TOLERANCE_S, title);
-        if !lines.is_empty() {
-            return (lines, synced);
-        }
-    }
-
-    // 4. Normalized fallback with wider tolerance
-    let n_artist = normalize_query(artist);
-    let n_title = normalize_query(title);
-    // Only do normalized if it actually changes the query
-    if n_artist != artist.to_lowercase() || n_title != title.to_lowercase() {
-        let n_q = format!(
-            "https://lrclib.net/api/search?q={}",
-            urlencode(&format!("{} {}", n_artist, n_title))
-        );
-        {
-            let (lines, synced) =
-                fetch_search_url_for_title(client, &n_q, expected_s, FALLBACK_TOLERANCE_S, title);
-            if !lines.is_empty() {
-                return (lines, synced);
-            }
-        }
-        // Also fallback with wide tolerance on the filtered search if normalized q missed
-        let (lines, synced) =
-            fetch_search_url_for_title(client, &filtered_search, expected_s, FALLBACK_TOLERANCE_S, title);
-        if !lines.is_empty() {
-            return (lines, synced);
-        }
-    } else {
-        // No normalization change — just widen tolerance on filtered search
-        let (lines, synced) =
-            fetch_search_url_for_title(client, &filtered_search, expected_s, FALLBACK_TOLERANCE_S, title);
-        if !lines.is_empty() {
-            return (lines, synced);
-        }
         let (lines, synced) =
             fetch_search_url_for_title(client, &q_url, expected_s, FALLBACK_TOLERANCE_S, title);
         if !lines.is_empty() {
