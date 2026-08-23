@@ -11,6 +11,210 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisualizerStyle {
+    #[default]
+    Block,
+    Braille,
+    Line,
+    Solid,
+}
+
+impl VisualizerStyle {
+    pub const ALL: [VisualizerStyle; 4] = [
+        VisualizerStyle::Block,
+        VisualizerStyle::Braille,
+        VisualizerStyle::Line,
+        VisualizerStyle::Solid,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Block => "Block ( ▂▃▄▅▆▇█)",
+            Self::Braille => "Braille (⠁⠃⠇⡇⣇⣧⣷⣿)",
+            Self::Line => "Line (─)",
+            Self::Solid => "Solid (█)",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Braille => "braille",
+            Self::Line => "line",
+            Self::Solid => "solid",
+        }
+    }
+
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "block" => Some(Self::Block),
+            "braille" => Some(Self::Braille),
+            "line" => Some(Self::Line),
+            "solid" => Some(Self::Solid),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for VisualizerStyle {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(s).ok_or(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisualizerSmoothing {
+    Snappy,
+    #[default]
+    Balanced,
+    Liquid,
+}
+
+impl VisualizerSmoothing {
+    pub const ALL: [VisualizerSmoothing; 3] = [
+        VisualizerSmoothing::Snappy,
+        VisualizerSmoothing::Balanced,
+        VisualizerSmoothing::Liquid,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Snappy => "Snappy",
+            Self::Balanced => "Balanced",
+            Self::Liquid => "Liquid",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snappy => "snappy",
+            Self::Balanced => "balanced",
+            Self::Liquid => "liquid",
+        }
+    }
+
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "snappy" => Some(Self::Snappy),
+            "balanced" => Some(Self::Balanced),
+            "liquid" => Some(Self::Liquid),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for VisualizerSmoothing {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(s).ok_or(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioQuality {
+    #[default]
+    Best,
+    High,
+    DataSaver,
+}
+
+impl AudioQuality {
+    pub const ALL: [AudioQuality; 3] = [
+        AudioQuality::Best,
+        AudioQuality::High,
+        AudioQuality::DataSaver,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Best => "Best Available",
+            Self::High => "High (Opus 160k)",
+            Self::DataSaver => "Data Saver (64k)",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Best => "best",
+            Self::High => "high",
+            Self::DataSaver => "data_saver",
+        }
+    }
+
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "best" => Some(Self::Best),
+            "high" => Some(Self::High),
+            "data_saver" | "datasaver" | "low" => Some(Self::DataSaver),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for AudioQuality {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(s).ok_or(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LyricsAlignment {
+    #[default]
+    Center,
+    Left,
+    Right,
+}
+
+impl LyricsAlignment {
+    pub const ALL: [LyricsAlignment; 3] = [
+        LyricsAlignment::Center,
+        LyricsAlignment::Left,
+        LyricsAlignment::Right,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Center => "Center",
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "center" => Some(Self::Center),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for LyricsAlignment {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(s).ok_or(())
+    }
+}
+
+/// Stereo f32 samples for `secs` of 44.1 kHz audio — what the engine's
+/// prebuffer gate counts.
+pub fn prebuffer_samples(secs: u8) -> usize {
+    secs as usize * 44_100 * 2
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Rows kept visible above and below the list cursor, like vim's `scrolloff`.
     pub scrolloff: usize,
@@ -36,13 +240,30 @@ pub struct Config {
     /// buffer smooths stutter on high-latency or fluctuating connections at
     /// the cost of a silent pre-roll on every stream start.
     pub buffer_duration_secs: u8,
-}
 
-/// Stereo f32 samples for `secs` of 44.1 kHz audio — what the engine's
-/// prebuffer gate counts. The engine and the tests share this conversion so
-/// the knob and the gate can never disagree.
-pub fn prebuffer_samples(secs: u8) -> usize {
-    secs as usize * 44_100 * 2
+    // --- Extended Settings ---
+    /// Animation / Visualizer target FPS (e.g. 30, 60, 120, 240).
+    pub animation_fps: u16,
+    /// Character rendering style for the spectrum visualizer.
+    pub visualizer_style: VisualizerStyle,
+    /// Smoothing filter applied to visualizer frequency bands.
+    pub visualizer_smoothing: VisualizerSmoothing,
+    /// Audio stream quality preference.
+    pub audio_quality: AudioQuality,
+    /// Volume increment/decrement step percentage (1..=20).
+    pub volume_step: u8,
+    /// Text alignment in the lyrics view.
+    pub lyrics_alignment: LyricsAlignment,
+    /// Whether to auto-transliterate non-Latin (Indic/CJK) lyrics and metadata.
+    pub lyrics_transliterate: bool,
+    /// Resolve next track stream URL in advance.
+    pub next_track_prefetch: bool,
+    /// Enable MPRIS / system media control integration.
+    pub mpris_enabled: bool,
+    /// Active theme name ("Adaptive", "Tokyo Night", "Catppuccin", etc.).
+    pub theme_name: String,
+    /// Default to Zen mode (fullscreen Now Playing without left sidebar).
+    pub zen_default: bool,
 }
 
 impl Default for Config {
@@ -57,6 +278,18 @@ impl Default for Config {
             search_limit: 6,
             cookies_file: None,
             buffer_duration_secs: 2,
+
+            animation_fps: 120,
+            visualizer_style: VisualizerStyle::Block,
+            visualizer_smoothing: VisualizerSmoothing::Balanced,
+            audio_quality: AudioQuality::Best,
+            volume_step: 5,
+            lyrics_alignment: LyricsAlignment::Center,
+            lyrics_transliterate: true,
+            next_track_prefetch: true,
+            mpris_enabled: true,
+            theme_name: "Adaptive".to_string(),
+            zen_default: false,
         }
     }
 }
@@ -209,10 +442,20 @@ impl Config {
     /// candidates.
     fn from_table(table: &toml::Table) -> Self {
         let d = Self::default();
-        let int = |k: &str| table.get(k).and_then(toml::Value::as_integer);
+        let get_val = |k: &str| -> Option<&toml::Value> {
+            table.get(k).or_else(|| {
+                for section in ["display", "audio", "lyrics", "search", "system"] {
+                    if let Some(v) = table.get(section).and_then(|t| t.as_table()).and_then(|t| t.get(k)) {
+                        return Some(v);
+                    }
+                }
+                None
+            })
+        };
+        let int = |k: &str| get_val(k).and_then(toml::Value::as_integer);
+        let boolean = |k: &str| get_val(k).and_then(toml::Value::as_bool);
         let text = |k: &str| {
-            table
-                .get(k)
+            get_val(k)
                 .and_then(toml::Value::as_str)
                 .map(str::to_owned)
         };
@@ -220,10 +463,7 @@ impl Config {
             scrolloff: int("scrolloff")
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(d.scrolloff),
-            restore_on_startup: table
-                .get("restore_on_startup")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(d.restore_on_startup),
+            restore_on_startup: boolean("restore_on_startup").unwrap_or(d.restore_on_startup),
             protocol: text("protocol").or(d.protocol),
             ytdlp_path: text("ytdlp_path").unwrap_or(d.ytdlp_path),
             ffmpeg_path: text("ffmpeg_path").unwrap_or(d.ffmpeg_path),
@@ -232,15 +472,87 @@ impl Config {
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(d.search_limit),
             cookies_file: text("cookies_file").or(d.cookies_file),
-            // Documented contract is 1..=30 (the template's own comment): 0
-            // would silently switch the prebuffer off and 31..=255 are
-            // typos — out-of-range falls back to the default, same as any
-            // other wrong value.
             buffer_duration_secs: int("buffer_duration_secs")
                 .and_then(|v| u8::try_from(v).ok())
                 .filter(|v| (1..=30).contains(v))
                 .unwrap_or(d.buffer_duration_secs),
+
+            animation_fps: int("animation_fps")
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v >= 1 && *v <= 1000)
+                .unwrap_or(d.animation_fps),
+            visualizer_style: text("visualizer_style")
+                .and_then(|s| VisualizerStyle::parse_str(&s))
+                .unwrap_or(d.visualizer_style),
+            visualizer_smoothing: text("visualizer_smoothing")
+                .and_then(|s| VisualizerSmoothing::parse_str(&s))
+                .unwrap_or(d.visualizer_smoothing),
+            audio_quality: text("audio_quality")
+                .and_then(|s| AudioQuality::parse_str(&s))
+                .unwrap_or(d.audio_quality),
+            volume_step: int("volume_step")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (1..=50).contains(v))
+                .unwrap_or(d.volume_step),
+            lyrics_alignment: text("lyrics_alignment")
+                .and_then(|s| LyricsAlignment::parse_str(&s))
+                .unwrap_or(d.lyrics_alignment),
+            lyrics_transliterate: boolean("lyrics_transliterate").unwrap_or(d.lyrics_transliterate),
+            next_track_prefetch: boolean("next_track_prefetch").unwrap_or(d.next_track_prefetch),
+            mpris_enabled: boolean("mpris_enabled").unwrap_or(d.mpris_enabled),
+            theme_name: text("theme_name").unwrap_or(d.theme_name),
+            zen_default: boolean("zen_default").unwrap_or(d.zen_default),
         }
+    }
+
+    /// Serialize current configuration into clean, human-readable TOML.
+    pub fn serialize_toml(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# tuna-tui configuration\n\n");
+
+        out.push_str("[display]\n");
+        out.push_str(&format!("animation_fps = {}\n", self.animation_fps));
+        out.push_str(&format!("visualizer_style = \"{}\"\n", self.visualizer_style.as_str()));
+        out.push_str(&format!("visualizer_smoothing = \"{}\"\n", self.visualizer_smoothing.as_str()));
+        if let Some(proto) = &self.protocol {
+            out.push_str(&format!("protocol = \"{}\"\n", proto));
+        }
+        out.push_str(&format!("zen_default = {}\n", self.zen_default));
+        out.push_str(&format!("theme_name = \"{}\"\n\n", self.theme_name));
+
+        out.push_str("[audio]\n");
+        out.push_str(&format!("audio_quality = \"{}\"\n", self.audio_quality.as_str()));
+        out.push_str(&format!("buffer_duration_secs = {}\n", self.buffer_duration_secs));
+        out.push_str(&format!("volume_step = {}\n", self.volume_step));
+        out.push_str(&format!("restore_on_startup = {}\n", self.restore_on_startup));
+        out.push_str(&format!("next_track_prefetch = {}\n\n", self.next_track_prefetch));
+
+        out.push_str("[lyrics]\n");
+        out.push_str(&format!("lyrics_alignment = \"{}\"\n", self.lyrics_alignment.as_str()));
+        out.push_str(&format!("lyrics_transliterate = {}\n\n", self.lyrics_transliterate));
+
+        out.push_str("[search]\n");
+        out.push_str(&format!("search_limit = {}\n", self.search_limit));
+        out.push_str(&format!("scrolloff = {}\n\n", self.scrolloff));
+
+        out.push_str("[system]\n");
+        out.push_str(&format!("mpris_enabled = {}\n", self.mpris_enabled));
+        out.push_str(&format!("ytdlp_path = \"{}\"\n", self.ytdlp_path));
+        out.push_str(&format!("ffmpeg_path = \"{}\"\n", self.ffmpeg_path));
+        out.push_str(&format!("audio_format = \"{}\"\n", self.audio_format));
+        if let Some(cookies) = &self.cookies_file {
+            out.push_str(&format!("cookies_file = \"{}\"\n", cookies));
+        }
+
+        out
+    }
+
+    /// Save configuration to file path.
+    pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, self.serialize_toml())
     }
 }
 
@@ -291,6 +603,38 @@ mod tests {
         assert_eq!(c.ffmpeg_path, "/opt/ffmpeg");
         assert_eq!(c.audio_format, "bestaudio");
         assert_eq!(c.search_limit, 9);
+    }
+    #[test]
+    fn extended_settings_parse_and_serialize() {
+        let toml = r#"
+animation_fps = 60
+visualizer_style = "braille"
+visualizer_smoothing = "liquid"
+audio_quality = "high"
+volume_step = 10
+lyrics_alignment = "left"
+lyrics_transliterate = false
+next_track_prefetch = true
+mpris_enabled = false
+theme_name = "Nord"
+zen_default = true
+"#;
+        let c = Config::parse(toml).expect("valid extended toml");
+        assert_eq!(c.animation_fps, 60);
+        assert_eq!(c.visualizer_style, VisualizerStyle::Braille);
+        assert_eq!(c.visualizer_smoothing, VisualizerSmoothing::Liquid);
+        assert_eq!(c.audio_quality, AudioQuality::High);
+        assert_eq!(c.volume_step, 10);
+        assert_eq!(c.lyrics_alignment, LyricsAlignment::Left);
+        assert!(!c.lyrics_transliterate);
+        assert!(c.next_track_prefetch);
+        assert!(!c.mpris_enabled);
+        assert_eq!(c.theme_name, "Nord");
+        assert!(c.zen_default);
+
+        let serialized = c.serialize_toml();
+        let parsed_again = Config::parse(&serialized).expect("serialized toml parses");
+        assert_eq!(c, parsed_again);
     }
 
     #[test]
