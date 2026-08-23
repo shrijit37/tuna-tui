@@ -120,13 +120,14 @@ pub(crate) fn handle_mouse(
         m.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
     ) {
+        let step = app.config.volume_step.max(1);
         match m.kind {
             MouseEventKind::ScrollUp => {
-                app.transport.volume = (app.transport.volume + 5).min(100);
+                app.transport.volume = (app.transport.volume + step).min(100);
                 let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
             }
             MouseEventKind::ScrollDown => {
-                app.transport.volume = app.transport.volume.saturating_sub(5);
+                app.transport.volume = app.transport.volume.saturating_sub(step);
                 let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
             }
             _ => {}

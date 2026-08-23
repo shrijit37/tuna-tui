@@ -35,6 +35,17 @@ pub(crate) fn handle_key(
                         state.apply_to_config(&mut cfg);
                         let _ = cfg.save_to_file(&path);
                     }
+                    // Live-apply: the runtime config the render/input paths
+                    // read must reflect the saved settings without a restart.
+                    let mut cfg = tuna_tui::config::get().clone();
+                    state.apply_to_config(&mut cfg);
+                    app.config = cfg.clone();
+                    if app.config.theme_name != "Adaptive" {
+                        if let Some(t) = tuna_tui::theme::Theme::from_name(&app.config.theme_name)
+                        {
+                            app.theme.start_fade(t);
+                        }
+                    }
                     app.status = "Settings saved".to_string();
                 }
                 app.view.settings = None;
@@ -220,11 +231,13 @@ pub(crate) fn handle_key(
             let _ = app.svc.engine.prev();
         }
         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Media(MediaKeyCode::RaiseVolume) => {
-            app.transport.volume = (app.transport.volume + 5).min(100);
+            let step = app.config.volume_step.max(1);
+            app.transport.volume = (app.transport.volume + step).min(100);
             let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
         }
         KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Media(MediaKeyCode::LowerVolume) => {
-            app.transport.volume = app.transport.volume.saturating_sub(5);
+            let step = app.config.volume_step.max(1);
+            app.transport.volume = app.transport.volume.saturating_sub(step);
             let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
         }
         KeyCode::Char('s') => {

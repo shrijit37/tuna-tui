@@ -65,6 +65,8 @@ pub(crate) struct App {
     pub(crate) queue_dirty: bool,
     // What the album art box owes the next frame. See ArtRepaint.
     pub(crate) art_repaint: ArtRepaint,
+    // Active runtime configuration (mirrors config.toml with live mutations).
+    pub(crate) config: tuna_tui::config::Config,
 }
 
 impl App {

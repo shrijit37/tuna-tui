@@ -52,10 +52,14 @@ pub(crate) fn render_visualizer(
         *c = (v / peak).sqrt().clamp(0.0, 1.0);
     }
 
-    // 2. Spatial smoothing — a couple of weighted passes so the envelope flows
-    //    instead of spiking. This is what kills the "chopped" look.
+    // 2. Spatial smoothing based on user setting:
+    let passes = match app.config.visualizer_smoothing {
+        tuna_tui::config::VisualizerSmoothing::Snappy => 0,
+        tuna_tui::config::VisualizerSmoothing::Balanced => 2,
+        tuna_tui::config::VisualizerSmoothing::Liquid => 4,
+    };
     let src = &mut out.scratch.src;
-    for _ in 0..2 {
+    for _ in 0..passes {
         src.clear();
         src.extend_from_slice(cols);
         for x in 0..w {
@@ -65,10 +69,13 @@ pub(crate) fn render_visualizer(
         }
     }
 
-    // 3. Paint cells directly: each column is one char at a row color, so a
-    //    Span/Line/Paragraph pile is pure overhead. The grid is single-char so
-    //    buffer writes render identically to the widget.
-    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    // 3. Paint cells directly using selected visualizer style glyphs:
+    let (solid_glyph, levels): (&str, &[&str; 8]) = match app.config.visualizer_style {
+        tuna_tui::config::VisualizerStyle::Block => ("█", &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]),
+        tuna_tui::config::VisualizerStyle::Braille => ("⣿", &["⠁", "⠃", "⠇", "⡇", "⣇", "⣧", "⣷", "⣿"]),
+        tuna_tui::config::VisualizerStyle::Line => ("─", &["─", "─", "─", "─", "─", "─", "─", "─"]),
+        tuna_tui::config::VisualizerStyle::Solid => ("█", &["█", "█", "█", "█", "█", "█", "█", "█"]),
+    };
     let stops = [theme.info, theme.primary, theme.accent];
     let buf = f.buffer_mut();
     for row in 0..h {
@@ -82,11 +89,11 @@ pub(crate) fn render_visualizer(
         for (x, &v) in cols.iter().enumerate() {
             let filled = v * h as f32 - from_bottom;
             let ch: &str = if filled >= 1.0 {
-                "█"
+                solid_glyph
             } else if filled <= 0.0 {
                 " "
             } else {
-                LEVELS[((filled * 8.0) as usize).clamp(1, 8) - 1]
+                levels[((filled * 8.0) as usize).clamp(1, 8) - 1]
             };
             // In-bounds by construction: vrect is clamped to `area`, which the
             // renderer sizes from the frame.
