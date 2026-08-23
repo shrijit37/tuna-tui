@@ -226,12 +226,11 @@ fn an_untouched_screen_redraws_rarely() {
 #[test]
 fn animation_redraws_at_animation_frame_rate() {
     assert!(should_draw(false, true, ANIM_FRAME));
-    assert!(!should_draw(false, true, Duration::from_millis(8)));
+    assert!(!should_draw(false, true, Duration::from_millis(2)));
 }
+
 #[test]
 fn a_fade_is_long_enough_to_be_smooth_at_the_animation_rate() {
-    // Smoothness has to come from duration, not frame rate: every present
-    // recomposes the viewport and the inline cover shimmers at 60fps.
     let steps = FADE_MS / ANIM_FRAME.as_millis() as u64;
     assert!(steps >= 30, "only {steps} steps of recolour");
 }
