@@ -218,6 +218,24 @@ impl App {
                 .map(|d| d.title.clone())
                 .unwrap_or_else(|| item.name.clone());
             let shuffle = self.transport.shuffle;
+            if let Some(d) = self.browse.details.last() {
+                let uris: Vec<String> = d
+                    .items
+                    .iter()
+                    .filter(|i| i.is_track)
+                    .map(|i| i.uri.clone())
+                    .collect();
+                if !uris.is_empty() {
+                    self.transport.source = PlaySource::Context(d.context_uri.clone());
+                    self.transport.source_name = name.clone();
+                    self.status = format!("starting {name}…");
+                    if let Err(e) = self.svc.engine.play_tracks(uris, None, 0, shuffle) {
+                        self.status = format!("couldn't play: {e:#}");
+                    }
+                    self.refresh_local_queue();
+                    return Activated::None;
+                }
+            }
             self.play_context_row(item.uri, name, shuffle);
             return Activated::None;
         }
@@ -231,16 +249,24 @@ impl App {
             // Inside a drill-in → play its context at this track (real queue).
             if let Some(d) = self.browse.details.last() {
                 let ctx = d.context_uri.clone();
-                self.transport.source = PlaySource::Context(ctx.clone());
+                self.transport.source = PlaySource::Context(ctx);
                 self.transport.source_name = d.title.clone();
                 self.status = format!("starting {}…", item.name);
-                if let Err(e) = self.svc.engine.play_context_at(
-                    ctx,
-                    Some(item.uri.clone()),
-                    0,
-                    self.transport.shuffle,
-                ) {
-                    self.status = format!("couldn't play: {e:#}");
+                let uris: Vec<String> = d
+                    .items
+                    .iter()
+                    .filter(|i| i.is_track)
+                    .map(|i| i.uri.clone())
+                    .collect();
+                if !uris.is_empty() {
+                    if let Err(e) = self.svc.engine.play_tracks(
+                        uris,
+                        Some(item.uri.clone()),
+                        0,
+                        self.transport.shuffle,
+                    ) {
+                        self.status = format!("couldn't play: {e:#}");
+                    }
                 }
                 return Activated::None;
             }
