@@ -76,11 +76,11 @@ impl ArtRepaint {
     }
 }
 
-/// Ceiling on the redraw rate: unthrottled input response (~200Hz).
-pub(crate) const MIN_FRAME: Duration = Duration::from_millis(5);
-/// Redraw rate while the visualizer, synced lyrics, or theme fade is running (180-200fps motion).
-pub(crate) const ANIM_FRAME: Duration = Duration::from_millis(5);
-/// Redraw rate when nothing changed / base rate (30fps).
+/// Ceiling on the redraw rate: unthrottled 1ms input response.
+pub(crate) const MIN_FRAME: Duration = Duration::from_millis(1);
+/// Redraw rate while the visualizer, synced lyrics, or theme fade is running (1ms ultra-motion).
+pub(crate) const ANIM_FRAME: Duration = Duration::from_millis(1);
+/// Redraw rate when nothing changed / base rate (30fps / 33ms).
 pub(crate) const IDLE_REDRAW: Duration = Duration::from_millis(33);
 /// How often the live queue is re-fetched and the session persisted.
 pub(crate) const SYNC_EVERY: Duration = Duration::from_secs(24);
