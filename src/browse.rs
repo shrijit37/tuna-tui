@@ -57,8 +57,13 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
     ));
     if !store.playlists.is_empty() {
         playlists.extend(store.playlists.iter().map(|p| {
-            let subtitle = if p.subtitle.is_empty() {
-                format!("{} tracks", p.tracks.len())
+            let count = p.tracks.len();
+            let subtitle = if count > 0 || p.subtitle.is_empty() || p.subtitle.ends_with("tracks") || p.subtitle.ends_with("track") {
+                if count == 1 {
+                    "1 track".to_string()
+                } else {
+                    format!("{count} tracks")
+                }
             } else {
                 p.subtitle.clone()
             };
@@ -590,4 +595,44 @@ mod tests {
         // Playlists always starts with "New Playlist" action
         assert_eq!(playlists_sec.1[0].uri, "tuna:action:new-playlist");
     }
+    #[test]
+    fn build_all_sections_updates_playlist_track_count() {
+        let mut store = Store::default();
+        store.toggle(
+            StoreKind::Playlist,
+            "My Favorites".to_string(),
+            String::new(),
+            "tuna:playlist:123".to_string(),
+        );
+        let sections = build_all_sections(&store);
+        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        assert_eq!(playlists.1[1].subtitle, "0 tracks");
+
+        store.add_to_playlist(
+            "tuna:playlist:123",
+            "My Favorites".to_string(),
+            crate::app::LibEntry {
+                name: "Track 1".into(),
+                subtitle: "Artist 1".into(),
+                uri: "yt:video:1".into(),
+            },
+        );
+        let sections = build_all_sections(&store);
+        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        assert_eq!(playlists.1[1].subtitle, "1 track");
+
+        store.add_to_playlist(
+            "tuna:playlist:123",
+            "My Favorites".to_string(),
+            crate::app::LibEntry {
+                name: "Track 2".into(),
+                subtitle: "Artist 2".into(),
+                uri: "yt:video:2".into(),
+            },
+        );
+        let sections = build_all_sections(&store);
+        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        assert_eq!(playlists.1[1].subtitle, "2 tracks");
+    }
+
 }
