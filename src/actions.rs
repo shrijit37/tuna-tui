@@ -83,6 +83,13 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
                 },
             });
             items.push(ActionItem {
+                label: "▶︎  Start Radio".into(),
+                kind: ActionKind::StartRadio {
+                    uri: uri.clone(),
+                    name: item.name.clone(),
+                },
+            });
+            items.push(ActionItem {
                 label: "＋  Add to Queue".into(),
                 kind: ActionKind::Queue { uri: uri.clone() },
             });
@@ -94,12 +101,35 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
                     track_subtitle: item.subtitle.clone(),
                 },
             });
+            if !item.subtitle.is_empty() {
+                items.push(ActionItem {
+                    label: format!("👤  Go to Artist ({})", item.subtitle),
+                    kind: ActionKind::Open {
+                        uri: format!("yt:artist:{}", item.subtitle),
+                        name: item.subtitle.clone(),
+                    },
+                });
+            }
+            items.push(ActionItem {
+                label: format!("💽  Go to Album ({})", item.name),
+                kind: ActionKind::Open {
+                    uri: format!(
+                        "yt:album:{}",
+                        if item.subtitle.is_empty() {
+                            item.name.clone()
+                        } else {
+                            format!("{} {}", item.name, item.subtitle)
+                        }
+                    ),
+                    name: format!("Album: {}", item.name),
+                },
+            });
             items.push(ActionItem {
                 label: "⧉  Copy Link".into(),
                 kind: ActionKind::CopyLink { uri },
             });
         }
-        "channel" => {
+        "channel" | "artist" => {
             let following = store.contains(StoreKind::Artist, &uri);
             items.push(ActionItem {
                 label: if following {
@@ -112,7 +142,7 @@ pub(crate) fn build_action_menu(store: &Store, item: &LibItem) -> ActionMenu {
                     name: item.name.clone(),
                 },
             });
-            push_context_tail(&mut items, &uri, &item.name, "→  Open");
+            push_context_tail(&mut items, &uri, &item.name, "→  Open Artist");
         }
         "album" => {
             let saved = store.contains(StoreKind::Album, &uri);
@@ -262,5 +292,45 @@ pub(crate) fn run_action(app: &mut App, kind: ActionKind) -> String {
             subtitle,
         } => apply_toggle(app, StoreKind::Playlist, uri, name, subtitle),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_menu_for_video_contains_all_actions() {
+        let store = Store::default();
+        let track = LibItem::track("Kesariya".into(), "Arijit Singh".into(), "yt:video:NJAv_7lHUIU".into());
+        let menu = build_action_menu(&store, &track);
+        assert_eq!(menu.title, "Kesariya");
+        assert!(menu.items.iter().any(|i| i.label.contains("Liked")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Start Radio")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Add to Queue")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Add to Playlist")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Go to Artist")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Go to Album")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Copy Link")));
+    }
+
+    #[test]
+    fn action_menu_for_artist_contains_open_and_follow() {
+        let store = Store::default();
+        let artist = LibItem::ctx("Arijit Singh".into(), "".into(), "yt:artist:Arijit Singh".into());
+        let menu = build_action_menu(&store, &artist);
+        assert!(menu.items.iter().any(|i| i.label.contains("Follow")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Play")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Open Artist")));
+    }
+
+    #[test]
+    fn action_menu_for_album_contains_open_and_save() {
+        let store = Store::default();
+        let album = LibItem::ctx("Brahmastra".into(), "Pritam".into(), "yt:album:Brahmastra".into());
+        let menu = build_action_menu(&store, &album);
+        assert!(menu.items.iter().any(|i| i.label.contains("Save Album")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Play")));
+        assert!(menu.items.iter().any(|i| i.label.contains("Open Album")));
     }
 }

@@ -27,7 +27,7 @@ pub(crate) fn handle_key(
     }
 
     if app.view.actions.is_some() {
-        handle_action_key(app, code, &chans.detail);
+        handle_action_key(app, code, chans);
         return false;
     }
 

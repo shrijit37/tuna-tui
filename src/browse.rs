@@ -181,15 +181,43 @@ pub(crate) fn fetch_detail_blocking(
                 "no uploads — empty or restricted",
             );
         }
+        "artist" => {
+            let vids = yt::ytmusic_search(&format!("{id} songs"), 25);
+            let vids = if vids.is_empty() {
+                yt::ytmusic_search(id, 25)
+            } else {
+                vids
+            };
+            if !vids.is_empty() {
+                items.extend(vids.into_iter().map(|v| LibItem::track(v.title, v.artist, v.uri)));
+            } else {
+                append_or_hint(
+                    &mut items,
+                    yt::search(&format!("{id} songs"), config::get().search_limit)
+                        .into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                    "no songs found for artist",
+                );
+            }
+        }
         "album" => {
-            // YouTube has no first-class albums; the saved slug searches.
-            append_or_hint(
-                &mut items,
-                yt::resolve_kind(kind, id, config::get().search_limit)
-                    .into_iter()
-                    .map(|v| LibItem::track(v.title, v.artist, v.uri)),
-                "nothing loaded — search failed",
-            );
+            let vids = yt::ytmusic_search(&format!("{id} album songs"), 25);
+            let vids = if vids.is_empty() {
+                yt::ytmusic_search(id, 25)
+            } else {
+                vids
+            };
+            if !vids.is_empty() {
+                items.extend(vids.into_iter().map(|v| LibItem::track(v.title, v.artist, v.uri)));
+            } else {
+                append_or_hint(
+                    &mut items,
+                    yt::resolve_kind(kind, id, config::get().search_limit)
+                        .into_iter()
+                        .map(|v| LibItem::track(v.title, v.artist, v.uri)),
+                    "nothing loaded — album search failed",
+                );
+            }
         }
         "video" => {
             append_or_hint(

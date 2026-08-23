@@ -12,6 +12,10 @@ pub(crate) enum ActionKind {
         name: String,
         subtitle: String,
     },
+    StartRadio {
+        uri: String,
+        name: String,
+    },
     Queue {
         uri: String,
     },

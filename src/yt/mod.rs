@@ -312,8 +312,41 @@ pub fn playlist_entries_capped(url: &str, limit: usize) -> Vec<YtVideo> {
 pub fn resolve_kind(kind: &str, id: &str, limit: usize) -> Vec<YtVideo> {
     match kind {
         "playlist" => playlist_entries(&crate::util::playlist_uri(id)),
-        "channel" => playlist_entries(&crate::util::channel_videos_url(id)),
-        "album" => search(id, limit),
+        "channel" => {
+            if id.starts_with("UC") {
+                let vids = playlist_entries(&crate::util::channel_videos_url(id));
+                if !vids.is_empty() {
+                    return vids;
+                }
+            }
+            let vids = ytmusic_search(&format!("{id} songs"), limit);
+            if vids.is_empty() {
+                search(&format!("{id} songs"), limit)
+            } else {
+                vids
+            }
+        }
+        "artist" => {
+            let vids = ytmusic_search(&format!("{id} songs"), limit);
+            if vids.is_empty() {
+                search(&format!("{id} songs"), limit)
+            } else {
+                vids
+            }
+        }
+        "album" => {
+            let vids = ytmusic_search(&format!("{id} album songs"), limit);
+            let vids = if vids.is_empty() {
+                ytmusic_search(id, limit)
+            } else {
+                vids
+            };
+            if vids.is_empty() {
+                search(id, limit)
+            } else {
+                vids
+            }
+        }
         _ => Vec::new(),
     }
 }

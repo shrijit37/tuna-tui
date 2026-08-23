@@ -466,12 +466,12 @@ struct Radio {
 /// The menu, action-status and live-queue channels died with the Spotify API:
 /// the menu is instant (`build_action_menu`), actions write locally, and the
 /// queue renders the engine's loaded list.
-struct UiChannels {
-    lib: flume::Sender<(Section, Vec<LibItem>)>,
-    search: flume::Sender<Vec<LibItem>>,
-    lyrics: flume::Sender<(Vec<(u32, String)>, bool)>,
-    detail: flume::Sender<(String, String, Vec<LibItem>)>,
-    radio: flume::Sender<Result<Radio, String>>,
+pub(crate) struct UiChannels {
+    pub(crate) lib: flume::Sender<(Section, Vec<LibItem>)>,
+    pub(crate) search: flume::Sender<Vec<LibItem>>,
+    pub(crate) lyrics: flume::Sender<(Vec<(u32, String)>, bool)>,
+    pub(crate) detail: flume::Sender<(String, String, Vec<LibItem>)>,
+    pub(crate) radio: flume::Sender<Result<Radio, String>>,
 }
 
 /// Should the 24s sync tick re-run `refresh_local_queue`?
@@ -900,7 +900,7 @@ fn push_transport_modes(app: &mut App) {
 /// deadline, and land the station (or the timeout error) on `tx`. The
 /// in-flight guard and status text are the caller's job — both the fresh
 /// radio key and the resume path share this exact shape.
-fn spawn_radio(
+pub(crate) fn spawn_radio(
     engine: Engine,
     seed: String,
     start_position_ms: u32,

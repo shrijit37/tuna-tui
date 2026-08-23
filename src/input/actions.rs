@@ -12,7 +12,7 @@ use tuna_tui::util::uri_to_url;
 pub(crate) fn handle_action_key(
     app: &mut App,
     code: KeyCode,
-    detail_tx: &flume::Sender<(String, String, Vec<LibItem>)>,
+    chans: &crate::UiChannels,
 ) {
     match code {
         KeyCode::Esc | KeyCode::Char('a') => {
@@ -93,8 +93,20 @@ pub(crate) fn handle_action_key(
             app.play_context_row(uri, name, shuffle);
             app.view.actions = None;
         }
+        ActionKind::StartRadio { uri, name } => {
+            if app.session.radio_in_flight {
+                app.status = "radio already starting…".to_string();
+            } else {
+                app.session.radio_in_flight = true;
+                app.status = format!("starting radio for {name}…");
+                app.transport.source = PlaySource::Radio(uri.clone());
+                app.transport.source_name = format!("Radio · {name}");
+                crate::spawn_radio(app.svc.engine.clone(), uri, 0, chans.radio.clone());
+            }
+            app.view.actions = None;
+        }
         ActionKind::Open { uri, name } => {
-            browse::spawn_detail_fetch(app.store.clone(), uri, name, detail_tx.clone());
+            browse::spawn_detail_fetch(app.store.clone(), uri, name, chans.detail.clone());
             app.view.actions = None;
         }
         ActionKind::CopyLink { uri } => {
