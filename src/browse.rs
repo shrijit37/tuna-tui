@@ -49,8 +49,12 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
     let recent: Vec<LibItem> = history_rows(store.history.iter()).take(50).collect();
     out.push((Section::Recent, recent));
 
-    // Playlists section: user playlists + quick access playlists
+    // Playlists section: create playlist input row + user playlists + quick access playlists
     let mut playlists: Vec<LibItem> = Vec::new();
+    playlists.push(LibItem::action(
+        "＋  New Playlist".into(),
+        "tuna:action:new-playlist".into(),
+    ));
     if !store.playlists.is_empty() {
         playlists.extend(store.playlists.iter().map(|p| {
             let subtitle = if p.subtitle.is_empty() {
@@ -583,7 +587,7 @@ mod tests {
         assert!(album_names.contains(&"luther"));
         assert!(albums_sec.1[0].uri.starts_with("yt:album:"));
 
-        // Playlists should not panic
-        assert!(playlists_sec.1.is_empty() || !playlists_sec.1.is_empty());
+        // Playlists always starts with "New Playlist" action
+        assert_eq!(playlists_sec.1[0].uri, "tuna:action:new-playlist");
     }
 }

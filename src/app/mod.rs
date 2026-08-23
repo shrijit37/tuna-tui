@@ -210,6 +210,12 @@ impl App {
         if item.is_header {
             return Activated::None;
         }
+        if item.uri == "tuna:action:new-playlist" {
+            self.browse.playlist_input = Some(tui_textarea::TextArea::default());
+            self.status = "Type playlist name and press Enter (Esc to cancel)".to_string();
+            return Activated::None;
+        }
+
         if item.is_play {
             // Special synthetic rows: play the Liked list (optionally shuffled).
             // `myx:` rows can only come from state.json written pre-rename; the

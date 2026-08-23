@@ -111,6 +111,18 @@ impl LibItem {
             order: 0,
         }
     }
+    pub(crate) fn action(name: String, uri: String) -> Self {
+        Self {
+            name,
+            subtitle: String::new(),
+            uri,
+            is_track: false,
+            is_header: false,
+            is_play: false,
+            order: 0,
+        }
+    }
+
     pub(crate) fn header(name: &str) -> Self {
         Self {
             name: name.to_string(),
