@@ -18,7 +18,6 @@ pub type Term = Terminal<CrosstermBackend<Stdout>>;
 /// Hold an exclusive lock so only one tuna-tui runs at a time. Returns the lock file
 /// (kept alive for the process lifetime; the OS releases it on exit, even a crash).
 pub fn acquire_single_instance_lock() -> std::fs::File {
-    use fs2::FileExt;
     let path = crate::util::ensure_cache_dir_0700()
         .map(|d| d.join("lock"))
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/tuna-tui.lock"));
@@ -28,7 +27,8 @@ pub fn acquire_single_instance_lock() -> std::fs::File {
         .write(true)
         .open(&path)
         .expect("open lock file");
-    if file.try_lock_exclusive().is_err() {
+    // std's File::try_lock (stable 1.89) — replaces the fs2 dep.
+    if file.try_lock().is_err() {
         eprintln!("tuna-tui is already running (another instance holds the lock).");
         eprintln!(
             "Close it first, or remove {} if it's stale.",

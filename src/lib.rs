@@ -35,6 +35,9 @@ pub mod term;
 #[cfg(feature = "streaming")]
 pub mod yt;
 
+#[cfg(feature = "streaming")]
+pub mod providers;
+
 /// Cross-platform home directory. Uses `HOME` on Unix, `USERPROFILE` on Windows.
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]

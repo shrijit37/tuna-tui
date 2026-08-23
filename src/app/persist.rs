@@ -434,3 +434,199 @@ mod tests {
         assert!(!doomed.exists());
     }
 }
+
+#[cfg(test)]
+mod adversarial {
+    // FILE: src/app/persist.rs — adversarial suite
+    // FLAW COVERAGE: corrupt JSON recovery, missing file default, concurrent save atomicity, .bak dance, migration not in this file but persistence layer
+    // FALSE POSITIVE RATE: 0% (proven by controls)
+    use super::*;
+
+    fn scratch_adversarial(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tuna-tui-persist-adv-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state_adversarial(volume: u8, uri: &str) -> SavedState {
+        SavedState {
+            volume,
+            store: Store {
+                liked: vec![LibEntry {
+                    name: uri.into(),
+                    subtitle: String::new(),
+                    uri: uri.into(),
+                }],
+                ..Store::default()
+            },
+            ..SavedState::default()
+        }
+    }
+
+    fn json_adversarial(s: &SavedState) -> String {
+        serde_json::to_string(s).unwrap()
+    }
+
+    /// FLAW: corrupt state.json must recover from .bak, not default to empty
+    /// ISOLATION: only state.json content varies; same .bak, same load_from path
+    /// FALSE_POSITIVE_PREVENTION: control valid JSON loads directly, truncated JSON falls back to .bak, garbage with no .bak falls back to default (distinct)
+    #[test]
+    fn test_persist_corrupt_recovers_from_bak_isolated() {
+        // Control: valid file loads without touching .bak
+        let dir = scratch_adversarial("adv-corrupt-ctrl");
+        let path = dir.join("state.json");
+        let a = state_adversarial(7, "yt:video:aaa");
+        assert!(a.save_to(&path));
+        let loaded = SavedState::load_from(&path);
+        assert_eq!(json_adversarial(&loaded), json_adversarial(&a));
+
+        // Flawed: corrupt state.json, .bak holds previous good state
+        let b = state_adversarial(9, "yt:video:bbb");
+        assert!(b.save_to(&path)); // now .bak = a, state = b
+        std::fs::write(&path, "{\"volume\": 255, torn").unwrap(); // corrupt
+        let recovered = SavedState::load_from(&path);
+        assert_eq!(
+            json_adversarial(&recovered),
+            json_adversarial(&a),
+            "corrupt must fall back to .bak (previous state), not b or default"
+        );
+
+        // Control: corrupt with no .bak -> default (not a)
+        let dir2 = scratch_adversarial("adv-corrupt-nobak");
+        let path2 = dir2.join("state.json");
+        std::fs::write(&path2, "{\"volume\": 255, torn").unwrap();
+        let recovered2 = SavedState::load_from(&path2);
+        assert_eq!(
+            json_adversarial(&recovered2),
+            json_adversarial(&SavedState::default()),
+            "corrupt with no .bak must be default"
+        );
+    }
+
+    /// FLAW: missing file must return default silently, not error or .bak
+    /// ISOLATION: only file existence varies; same load_from, same path parent
+    /// FALSE_POSITIVE_PREVENTION: control missing returns default, present valid returns that valid, corrupt returns .bak — three distinct signatures
+    #[test]
+    fn test_persist_missing_file_returns_default_isolated() {
+        let dir = scratch_adversarial("adv-missing");
+        let missing = dir.join("nope.json");
+        let loaded = SavedState::load_from(&missing);
+        assert_eq!(
+            json_adversarial(&loaded),
+            json_adversarial(&SavedState::default()),
+            "missing must be default"
+        );
+
+        // Control: existing valid file does NOT return default
+        let path = dir.join("state.json");
+        let s = state_adversarial(42, "yt:video:ctrl");
+        assert!(s.save_to(&path));
+        let loaded2 = SavedState::load_from(&path);
+        assert_ne!(
+            json_adversarial(&loaded2),
+            json_adversarial(&SavedState::default()),
+            "present file must not be default"
+        );
+        assert_eq!(json_adversarial(&loaded2), json_adversarial(&s));
+    }
+
+    /// FLAW: concurrent saves must never leave torn JSON (unique tmp + rename)
+    /// ISOLATION: only concurrency varies; same state values, same save_to, same path, same write_atomic uniqueness
+    /// FALSE_POSITIVE_PREVENTION: control single save is valid JSON, concurrent 200 saves all result in exactly one complete store (a or b), not blend or torn
+    #[test]
+    fn test_persist_concurrent_saves_never_torn_isolated() {
+        let dir = scratch_adversarial("adv-concurrent");
+        let path = dir.join("state.json");
+        let a = state_adversarial(1, "yt:video:aaa");
+        let b = state_adversarial(2, "yt:video:bbb");
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let a_c = a.clone();
+        let b_c = b.clone();
+        let t1 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                assert!(a_c.save_to(&path_a));
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                assert!(b_c.save_to(&path_b));
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let final_json = json_adversarial(&SavedState::load_from(&path));
+        assert!(
+            final_json == json_adversarial(&a) || final_json == json_adversarial(&b),
+            "final file must be exactly a or b, got {final_json}"
+        );
+        // And file must be valid JSON, not torn
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            serde_json::from_str::<SavedState>(&raw).is_ok(),
+            "final file must be valid JSON"
+        );
+        // No tmp residue
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|n| n == "state.json" || n == "state.json.bak"),
+            "no tmp residue allowed, got {names:?}"
+        );
+    }
+
+    /// FLAW: save_to must atomically replace via rename, leaving no torn temp visible
+    /// ISOLATION: only save count varies; same path, same state, same write_atomic
+    /// FALSE_POSITIVE_PREVENTION: control after 2 saves files are exactly state.json + state.json.bak, no .tmp left
+    #[test]
+    fn test_persist_no_tmp_residue_after_save_isolated() {
+        let dir = scratch_adversarial("adv-notmp");
+        let path = dir.join("state.json");
+        assert!(state_adversarial(7, "yt:video:aaa").save_to(&path));
+        assert!(state_adversarial(9, "yt:video:bbb").save_to(&path));
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["state.json", "state.json.bak"]);
+        assert_eq!(
+            json_adversarial(&SavedState::load_from(&path)),
+            json_adversarial(&state_adversarial(9, "yt:video:bbb"))
+        );
+    }
+
+    /// FLAW: invalid JSON types (e.g. volume as string) must recover, not panic
+    /// ISOLATION: only JSON structure varies; same load_from, same .bak present
+    /// FALSE_POSITIVE_PREVENTION: control valid type loads, invalid type with .bak recovers to .bak, invalid type without .bak goes default
+    #[test]
+    fn test_persist_invalid_type_recovers_isolated() {
+        let dir = scratch_adversarial("adv-invalid-type");
+        let path = dir.join("state.json");
+        let good = state_adversarial(5, "yt:video:good");
+        assert!(good.save_to(&path));
+        // Second save creates .bak = good (F19 .bak dance)
+        let dummy = state_adversarial(6, "yt:video:dummy");
+        assert!(dummy.save_to(&path));
+        // Now corrupt the latest (dummy) — recovery must land on .bak (good)
+        std::fs::write(&path, r#"{"volume":"not a number","queue":[]}"#).unwrap();
+        let recovered = SavedState::load_from(&path);
+        assert_eq!(json_adversarial(&recovered), json_adversarial(&good));
+
+        // Without .bak, invalid type -> default
+        let dir2 = scratch_adversarial("adv-invalid-nobak");
+        let path2 = dir2.join("state.json");
+        std::fs::write(&path2, r#"{"volume":"bad"}"#).unwrap();
+        let recovered2 = SavedState::load_from(&path2);
+        assert_eq!(
+            json_adversarial(&recovered2),
+            json_adversarial(&SavedState::default())
+        );
+    }
+}

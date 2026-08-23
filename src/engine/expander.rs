@@ -17,6 +17,7 @@
 //! conventions); live behavior is exercised by `examples/probe`.
 
 use crate::config;
+use crate::providers::{self, PlaybackInfo};
 use crate::util::{track_id_from_uri, uri_parts};
 use crate::yt;
 use std::sync::atomic::AtomicBool;
@@ -88,9 +89,12 @@ impl Expander for YtExpander {
         let Some(id) = track_id_from_uri(uri) else {
             return Err(format!("not a track uri: {uri}"));
         };
-        yt::resolve(&id)
+        // Via the providers seam — yt-dlp adapter today; when the InnerTube
+        // client lands (Myx-mh7.1/.2) it produces the same PlaybackInfo shape
+        // and this call upgrades without touching the engine.
+        providers::ytdlp::resolve_stream(&id)
             .map(ResolvedTrack::from)
-            .ok_or_else(|| format!("couldn't resolve {uri}"))
+            .map_err(|e| format!("couldn't resolve {uri}: {e}"))
     }
 
     fn radio(&self, seed: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>, String> {
@@ -124,15 +128,16 @@ fn station_from(seed: &str, rows: Vec<yt::YtVideo>) -> Result<Vec<String>, Strin
     Ok(uris)
 }
 
-impl From<yt::StreamInfo> for ResolvedTrack {
-    fn from(s: yt::StreamInfo) -> Self {
+impl From<PlaybackInfo> for ResolvedTrack {
+    fn from(p: PlaybackInfo) -> Self {
+        let url = p.audio.first().map(|a| a.url.clone()).unwrap_or_default();
         ResolvedTrack {
-            url: s.url,
-            title: s.video.title,
-            artist: s.video.artist,
-            album: s.video.album,
-            duration_ms: s.video.duration_ms,
-            thumbnail: s.video.thumbnail,
+            url,
+            title: p.title,
+            artist: p.artist,
+            album: p.album,
+            duration_ms: p.duration_ms,
+            thumbnail: p.thumbnail,
         }
     }
 }
