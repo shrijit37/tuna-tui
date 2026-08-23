@@ -17,7 +17,7 @@
 use crate::config;
 use crate::liblog::liblog;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
@@ -67,6 +67,87 @@ pub struct YtVideo {
 pub struct StreamInfo {
     pub url: String,
     pub video: YtVideo,
+}
+
+/// YouTube type-ahead completions for the search box (Myx-a4e.12).
+///
+/// Google's unauthenticated suggest service — the same one YouTube's own
+/// search box drives. Purely additive: never called on the UI path, failures
+/// degrade to an empty vec so the caller keeps whatever it was showing.
+pub fn autocomplete(query: &str, limit: usize) -> Vec<String> {
+    let query = query.trim();
+    let url = format!(
+        "https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q={}",
+        percent_encode(query)
+    );
+    let Ok(resp) = suggest_client().get(url).send() else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.text() else {
+        return Vec::new();
+    };
+    let Some(json) = strip_jsonp(&body) else {
+        return Vec::new();
+    };
+    parse_autocomplete(json, limit)
+}
+
+/// Parse the suggest response body: `["query", [["suggestion", 0], ...], {"k":1}]`
+/// — row[0] is the suggestion text. Pure and total: garbage in, empty vec out
+/// (the caller keeps whatever it was showing).
+fn parse_autocomplete(json: &str, limit: usize) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    v.get(1)
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get(0).and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .take(limit)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Blocking client for the suggest endpoint. 2s cap — a slow suggest must
+/// never stall a worker past the debounce window (the app's own search and
+/// playback deadlines sit well above this).
+fn suggest_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .user_agent("tuna-tui/0.4.0 (yt suggest)")
+            .build()
+            .expect("blocking suggest client")
+    })
+}
+
+/// Unwrap the JSONP response (`window.google.ac.h([...])`) into the raw JSON.
+fn strip_jsonp(body: &str) -> Option<&str> {
+    let start = body.find('[')?;
+    let end = body.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    Some(&body[start..=end])
+}
+
+/// Percent-encode a query for the suggest endpoint's `q=` parameter. Minimal
+/// encoder: everything outside the unreserved set gets %XX.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// `ytsearchN:` — N YouTube video results for a query. Fast (one request):
@@ -1446,5 +1527,46 @@ mod adversarial {
         assert!(c[0].contains("list=RDtest123"));
         assert!(c[1].contains("list=RDAMVMtest123"));
         assert_ne!(c[0], c[1]);
+    }
+}
+
+#[cfg(test)]
+mod autocomplete_tests {
+    use super::{parse_autocomplete, percent_encode, strip_jsonp};
+    #[test]
+    fn parses_jsonp_shape() {
+        let body = r#"window.google.ac.h(["bohemian rhapsody",[["bohemian rhapsody",0],["bohemian rhapsody queen",0]],{"k":1}])"#;
+        let json = strip_jsonp(body).expect("strip_jsonp");
+        let hits = parse_autocomplete(json, 8);
+        assert_eq!(hits, vec!["bohemian rhapsody", "bohemian rhapsody queen"]);
+    }
+
+    #[test]
+    fn jsonp_with_missing_rows_parses_to_empty() {
+        let body = r#"window.google.ac.h(["x",[],{"k":1}])"#;
+        let json = strip_jsonp(body).expect("strip_jsonp");
+        assert!(parse_autocomplete(json, 8).is_empty());
+    }
+
+    #[test]
+    fn garbage_body_strips_to_nothing() {
+        assert!(strip_jsonp("not json at all").is_none());
+        assert!(strip_jsonp("window.google.ac.h()").is_none());
+    }
+
+    #[test]
+    fn percent_encodes_query() {
+        assert_eq!(percent_encode("a b&c"), "a%20b%26c");
+        assert_eq!(percent_encode("queen"), "queen");
+    }
+
+    /// Live smoke against the real suggest endpoint. `#[ignore]`d per the
+    /// project convention (needs network; run with `--ignored`).
+    #[test]
+    #[ignore]
+    fn autocomplete_live_smoke() {
+        let hits = super::autocomplete("bohemian rhapsody", 5);
+        assert!(!hits.is_empty(), "suggest should answer a common query");
+        assert!(hits.iter().any(|h| h.to_lowercase().contains("rhapsody")));
     }
 }

@@ -186,6 +186,98 @@ pub(crate) fn spawn_search(query: String, tx: flume::Sender<Vec<LibItem>>) {
         .expect("spawn search worker");
 }
 
+/// Suggestions: type-ahead completions while the search box is being typed
+/// (Myx-a4e.12). Fed by Google's unauthenticated YouTube suggest, debounced
+/// in this worker, delivered on the same `Vec<LibItem>` search channel as
+/// results. Rows are `LibItem::header`s — inert by construction, so the
+/// existing list nav (which skips headers) can't select them and Enter can't
+/// fire a bogus detail fetch; the real `spawn_search` output replaces them
+/// wholesale when the query is submitted.
+pub(crate) fn spawn_suggestions(rx: flume::Receiver<String>, tx: flume::Sender<Vec<LibItem>>) {
+    std::thread::Builder::new()
+        .name("tuna-suggest".to_string())
+        .spawn(move || {
+            let debounce = std::time::Duration::from_millis(SUGGEST_DEBOUNCE_MS);
+            // Newest ping seen, carried across rounds so a superseded round
+            // re-fires for it without blocking on recv. The fold happens at
+            // fire time, not wakeup time: a slow suggest can never replay a
+            // queue of stale queries after typing stops (S29-2).
+            let mut latest = String::new();
+            loop {
+                // Wait for a ping, unless a superseded round already carries
+                // a newer query to re-fire.
+                if latest.trim().is_empty() {
+                    match rx.recv() {
+                        Ok(first) => latest = newest_pending(&rx, first),
+                        Err(_) => break,
+                    }
+                } else {
+                    latest = newest_pending(&rx, latest);
+                }
+                // Quiet window first: let the typing burst settle, then fold
+                // again so pings that landed mid-window win.
+                std::thread::sleep(debounce);
+                latest = newest_pending(&rx, latest);
+                let query = latest.trim().to_string();
+                if query.is_empty() {
+                    latest.clear();
+                    continue;
+                }
+                let hits = yt::autocomplete(&query, SUGGEST_LIMIT);
+                // Anything queued while the request was in flight means this
+                // reply is already stale — drop it, the carried latest
+                // re-fires for the newer query next round.
+                latest = newest_pending(&rx, latest);
+                if latest != query {
+                    continue;
+                }
+                if !hits.is_empty() {
+                    let mut out = Vec::with_capacity(hits.len() + 1);
+                    out.push(LibItem::header("Suggestions"));
+                    out.extend(hits.into_iter().map(|s| LibItem::header(&s)));
+                    let _ = tx.send(out);
+                }
+                // Round complete — wait for the next ping rather than
+                // re-firing the same query.
+                latest.clear();
+            }
+        })
+        .expect("spawn suggestions worker");
+}
+
+/// How many completions the suggest row renders. Search depth stays on
+/// `config::search_limit` — this is display-only, so a small fixed cap.
+const SUGGEST_LIMIT: usize = 8;
+
+/// Quiet window before a suggest request fires (ms). Trailing-edge: the
+/// burst settles first, then the newest ping wins.
+const SUGGEST_DEBOUNCE_MS: u64 = 250;
+
+/// Fold every ping waiting in `rx` into the newest query (debounce helper —
+/// extracted so the fold is testable offline; the network half is `#[ignore]`).
+fn newest_pending(rx: &flume::Receiver<String>, mut latest: String) -> String {
+    while let Ok(newer) = rx.try_recv() {
+        latest = newer;
+    }
+    latest
+}
+
+#[cfg(test)]
+mod suggest_tests {
+    use super::newest_pending;
+
+    #[test]
+    fn folds_pings_to_newest() {
+        let (tx, rx) = flume::unbounded::<String>();
+        let _ = tx.send("a".to_string());
+        let _ = tx.send("ab".to_string());
+        let _ = tx.send("abc".to_string());
+        assert_eq!(newest_pending(&rx, "a".to_string()), "abc");
+        // Empty channel leaves the carried query untouched.
+        assert_eq!(newest_pending(&rx, "abc".to_string()), "abc");
+    }
+}
+
 /// Drill into a context (playlist / channel / album / single video). The
 /// response tuple `(context_uri, title, items)` matches the old fetch.
 pub(crate) fn spawn_detail_fetch(
