@@ -67,7 +67,7 @@ occasionally misses a synced lyric that clearly exists. Improvement: query lrcli
 `/api/search` with the name, then pick the result whose `duration` is within
 ~10s of the video's, instead of `/api/get?duration=` exact.
 
-### 5. SponsorBlock (a real feature gap)
+### 5. SponsorBlock (a real feature gap)     -----------> Not neaded since moving to innertube which gives direct access to yt-music's api/
 Their `sponsorblock` provider skips intros/outros/sponsors mid-track. Our engine
 is a plain stream with a seek command — segment skipping is *already playable*
 once a sponsorblock lookup exists: on `TrackChanged`, fetch segments, and when

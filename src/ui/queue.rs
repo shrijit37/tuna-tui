@@ -84,6 +84,11 @@ pub(crate) fn render_queue_view(f: &mut Frame, app: &App, theme: Theme, area: Re
                     Style::default().fg(theme.text.into()),
                 )
             };
+            let label = if q.starts_with("yt:video:") || q.starts_with("yt:") {
+                "Loading track…"
+            } else {
+                q.as_str()
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     prefix,
@@ -95,7 +100,7 @@ pub(crate) fn render_queue_view(f: &mut Frame, app: &App, theme: Theme, area: Re
                         theme.muted()
                     },
                 ),
-                Span::styled(truncate(q, max.saturating_sub(6)), style),
+                Span::styled(truncate(label, max.saturating_sub(6)), style),
             ]));
         }
     }
