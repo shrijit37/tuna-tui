@@ -241,29 +241,69 @@ pub struct Config {
     /// the cost of a silent pre-roll on every stream start.
     pub buffer_duration_secs: u8,
 
-    // --- Extended Settings ---
-    /// Animation / Visualizer target FPS (e.g. 30, 60, 120, 240).
+    // --- Visuals & Motion ---
+    /// Animation / Visualizer target FPS (e.g. 30, 60, 120, 240, 1000).
     pub animation_fps: u16,
     /// Character rendering style for the spectrum visualizer.
     pub visualizer_style: VisualizerStyle,
     /// Smoothing filter applied to visualizer frequency bands.
     pub visualizer_smoothing: VisualizerSmoothing,
+    /// Width of each spectrum bar in terminal cells (1..4).
+    pub visualizer_bar_width: u8,
+    /// Color gradient scheme for visualizer (0=default, 1=fire, 2=ocean, 3=forest, 4=sunset, 5=mono).
+    pub visualizer_color_scheme: u8,
+    /// Progress bar glyph style (0=blocks, 1=braille, 2=line, 3=gradient, 4=dual).
+    pub progress_bar_style: u8,
+    /// Theme transition cross-fade duration in milliseconds.
+    pub theme_fade_speed: u16,
+    /// Default to Zen mode (fullscreen Now Playing without left sidebar).
+    pub zen_default: bool,
+    /// Active theme name ("Adaptive", "Tokyo Night", "Catppuccin", etc.).
+    pub theme_name: String,
+
+    // --- Playback & Audio ---
     /// Audio stream quality preference.
     pub audio_quality: AudioQuality,
-    /// Volume increment/decrement step percentage (1..=20).
+    /// Volume increment/decrement step percentage (1..=25).
     pub volume_step: u8,
+    /// Enable crossfade between tracks.
+    pub crossfade_enabled: bool,
+    /// Crossfade overlap duration in milliseconds.
+    pub crossfade_duration_ms: u16,
+    /// Enable gapless playback for consecutive tracks.
+    pub gapless_playback: bool,
+    /// Enable ReplayGain loudness normalization.
+    pub replay_gain: bool,
+    /// Resolve next track stream URL in advance.
+    pub next_track_prefetch: bool,
+
+    // --- Lyrics ---
     /// Text alignment in the lyrics view.
     pub lyrics_alignment: LyricsAlignment,
     /// Whether to auto-transliterate non-Latin (Indic/CJK) lyrics and metadata.
     pub lyrics_transliterate: bool,
-    /// Resolve next track stream URL in advance.
-    pub next_track_prefetch: bool,
+    /// Auto-scroll synced lyrics to keep active verse centered.
+    pub lyrics_auto_scroll: bool,
+    /// Relative font size for lyrics (80..150%).
+    pub lyrics_font_size: u8,
+    /// Highlight style for active verse (0=bold+primary, 1=bold+accent, 2=inverted, 3=underline, 4=block).
+    pub lyrics_highlight_color: u8,
+
+    // --- Interface ---
+    /// UI density: 0=comfortable, 1=standard, 2=compact.
+    pub ui_density: u8,
+    /// Show track thumbnails in Queue view.
+    pub show_album_art_in_queue: bool,
+    /// Show progress bar and time in footer.
+    pub show_progress_in_footer: bool,
+    /// Footer clock format: 0=12h, 1=24h, 2=relative, 3=hidden.
+    pub footer_clock_format: u8,
+    /// Sidebar width as percentage of terminal width (20..50).
+    pub sidebar_width_pct: u8,
+
+    // --- System ---
     /// Enable MPRIS / system media control integration.
     pub mpris_enabled: bool,
-    /// Active theme name ("Adaptive", "Tokyo Night", "Catppuccin", etc.).
-    pub theme_name: String,
-    /// Default to Zen mode (fullscreen Now Playing without left sidebar).
-    pub zen_default: bool,
 }
 
 impl Default for Config {
@@ -282,14 +322,34 @@ impl Default for Config {
             animation_fps: 120,
             visualizer_style: VisualizerStyle::Block,
             visualizer_smoothing: VisualizerSmoothing::Balanced,
+            visualizer_bar_width: 1,
+            visualizer_color_scheme: 0,
+            progress_bar_style: 0,
+            theme_fade_speed: 1500,
+            zen_default: false,
+            theme_name: "Adaptive".to_string(),
+
             audio_quality: AudioQuality::Best,
             volume_step: 5,
+            crossfade_enabled: false,
+            crossfade_duration_ms: 3000,
+            gapless_playback: true,
+            replay_gain: false,
+            next_track_prefetch: true,
+
             lyrics_alignment: LyricsAlignment::Center,
             lyrics_transliterate: true,
-            next_track_prefetch: true,
+            lyrics_auto_scroll: true,
+            lyrics_font_size: 100,
+            lyrics_highlight_color: 0,
+
+            ui_density: 1,
+            show_album_art_in_queue: false,
+            show_progress_in_footer: true,
+            footer_clock_format: 1,
+            sidebar_width_pct: 30,
+
             mpris_enabled: true,
-            theme_name: "Adaptive".to_string(),
-            zen_default: false,
         }
     }
 }
@@ -487,6 +547,25 @@ impl Config {
             visualizer_smoothing: text("visualizer_smoothing")
                 .and_then(|s| VisualizerSmoothing::parse_str(&s))
                 .unwrap_or(d.visualizer_smoothing),
+            visualizer_bar_width: int("visualizer_bar_width")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (1..=4).contains(v))
+                .unwrap_or(d.visualizer_bar_width),
+            visualizer_color_scheme: int("visualizer_color_scheme")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 5)
+                .unwrap_or(d.visualizer_color_scheme),
+            progress_bar_style: int("progress_bar_style")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 4)
+                .unwrap_or(d.progress_bar_style),
+            theme_fade_speed: int("theme_fade_speed")
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v >= 200 && *v <= 5000)
+                .unwrap_or(d.theme_fade_speed),
+            zen_default: boolean("zen_default").unwrap_or(d.zen_default),
+            theme_name: text("theme_name").unwrap_or(d.theme_name),
+
             audio_quality: text("audio_quality")
                 .and_then(|s| AudioQuality::parse_str(&s))
                 .unwrap_or(d.audio_quality),
@@ -494,14 +573,45 @@ impl Config {
                 .and_then(|v| u8::try_from(v).ok())
                 .filter(|v| (1..=50).contains(v))
                 .unwrap_or(d.volume_step),
+            crossfade_enabled: boolean("crossfade_enabled").unwrap_or(d.crossfade_enabled),
+            crossfade_duration_ms: int("crossfade_duration_ms")
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v >= 100 && *v <= 20000)
+                .unwrap_or(d.crossfade_duration_ms),
+            gapless_playback: boolean("gapless_playback").unwrap_or(d.gapless_playback),
+            replay_gain: boolean("replay_gain").unwrap_or(d.replay_gain),
+            next_track_prefetch: boolean("next_track_prefetch").unwrap_or(d.next_track_prefetch),
+
             lyrics_alignment: text("lyrics_alignment")
                 .and_then(|s| LyricsAlignment::parse_str(&s))
                 .unwrap_or(d.lyrics_alignment),
             lyrics_transliterate: boolean("lyrics_transliterate").unwrap_or(d.lyrics_transliterate),
-            next_track_prefetch: boolean("next_track_prefetch").unwrap_or(d.next_track_prefetch),
+            lyrics_auto_scroll: boolean("lyrics_auto_scroll").unwrap_or(d.lyrics_auto_scroll),
+            lyrics_font_size: int("lyrics_font_size")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (50..=200).contains(v))
+                .unwrap_or(d.lyrics_font_size),
+            lyrics_highlight_color: int("lyrics_highlight_color")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 4)
+                .unwrap_or(d.lyrics_highlight_color),
+
+            ui_density: int("ui_density")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 2)
+                .unwrap_or(d.ui_density),
+            show_album_art_in_queue: boolean("show_album_art_in_queue").unwrap_or(d.show_album_art_in_queue),
+            show_progress_in_footer: boolean("show_progress_in_footer").unwrap_or(d.show_progress_in_footer),
+            footer_clock_format: int("footer_clock_format")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 3)
+                .unwrap_or(d.footer_clock_format),
+            sidebar_width_pct: int("sidebar_width_pct")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| (10..=60).contains(v))
+                .unwrap_or(d.sidebar_width_pct),
+
             mpris_enabled: boolean("mpris_enabled").unwrap_or(d.mpris_enabled),
-            theme_name: text("theme_name").unwrap_or(d.theme_name),
-            zen_default: boolean("zen_default").unwrap_or(d.zen_default),
         }
     }
 
@@ -514,6 +624,10 @@ impl Config {
         out.push_str(&format!("animation_fps = {}\n", self.animation_fps));
         out.push_str(&format!("visualizer_style = \"{}\"\n", self.visualizer_style.as_str()));
         out.push_str(&format!("visualizer_smoothing = \"{}\"\n", self.visualizer_smoothing.as_str()));
+        out.push_str(&format!("visualizer_bar_width = {}\n", self.visualizer_bar_width));
+        out.push_str(&format!("visualizer_color_scheme = {}\n", self.visualizer_color_scheme));
+        out.push_str(&format!("progress_bar_style = {}\n", self.progress_bar_style));
+        out.push_str(&format!("theme_fade_speed = {}\n", self.theme_fade_speed));
         if let Some(proto) = &self.protocol {
             out.push_str(&format!("protocol = \"{}\"\n", proto));
         }
@@ -524,16 +638,28 @@ impl Config {
         out.push_str(&format!("audio_quality = \"{}\"\n", self.audio_quality.as_str()));
         out.push_str(&format!("buffer_duration_secs = {}\n", self.buffer_duration_secs));
         out.push_str(&format!("volume_step = {}\n", self.volume_step));
+        out.push_str(&format!("crossfade_enabled = {}\n", self.crossfade_enabled));
+        out.push_str(&format!("crossfade_duration_ms = {}\n", self.crossfade_duration_ms));
+        out.push_str(&format!("gapless_playback = {}\n", self.gapless_playback));
+        out.push_str(&format!("replay_gain = {}\n", self.replay_gain));
         out.push_str(&format!("restore_on_startup = {}\n", self.restore_on_startup));
         out.push_str(&format!("next_track_prefetch = {}\n\n", self.next_track_prefetch));
 
         out.push_str("[lyrics]\n");
         out.push_str(&format!("lyrics_alignment = \"{}\"\n", self.lyrics_alignment.as_str()));
-        out.push_str(&format!("lyrics_transliterate = {}\n\n", self.lyrics_transliterate));
+        out.push_str(&format!("lyrics_transliterate = {}\n", self.lyrics_transliterate));
+        out.push_str(&format!("lyrics_auto_scroll = {}\n", self.lyrics_auto_scroll));
+        out.push_str(&format!("lyrics_font_size = {}\n", self.lyrics_font_size));
+        out.push_str(&format!("lyrics_highlight_color = {}\n\n", self.lyrics_highlight_color));
 
-        out.push_str("[search]\n");
+        out.push_str("[interface]\n");
         out.push_str(&format!("search_limit = {}\n", self.search_limit));
-        out.push_str(&format!("scrolloff = {}\n\n", self.scrolloff));
+        out.push_str(&format!("scrolloff = {}\n", self.scrolloff));
+        out.push_str(&format!("ui_density = {}\n", self.ui_density));
+        out.push_str(&format!("show_album_art_in_queue = {}\n", self.show_album_art_in_queue));
+        out.push_str(&format!("show_progress_in_footer = {}\n", self.show_progress_in_footer));
+        out.push_str(&format!("footer_clock_format = {}\n", self.footer_clock_format));
+        out.push_str(&format!("sidebar_width_pct = {}\n\n", self.sidebar_width_pct));
 
         out.push_str("[system]\n");
         out.push_str(&format!("mpris_enabled = {}\n", self.mpris_enabled));
@@ -546,6 +672,7 @@ impl Config {
 
         out
     }
+
 
     /// Save configuration to file path.
     pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
