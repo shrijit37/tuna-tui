@@ -154,7 +154,7 @@ pub(crate) fn apply_meta(
     app.view.lyrics.clear();
     app.view.lyrics_synced = false;
 
-    // Fetch synced lyrics from lrclib for the new track.
+    // Fetch lyrics for the new track (fast cache check -> LRCLIB -> YTM fallback).
     if !meta.title.is_empty() {
         let (artist, title, album, dur, uri) = (
             meta.artist.clone(),
@@ -169,26 +169,26 @@ pub(crate) fn apply_meta(
             if !res.0.is_empty() {
                 let _ = tx.send(res);
             } else if let Some(id) = tuna_tui::util::track_id_from_uri(&uri) {
-                if let Some(yt_lyrics) = tuna_tui::providers::ytmusic::lyrics(&id) {
-                    let lines: Vec<(u32, String)> = yt_lyrics
-                        .lines()
-                        .map(|l| {
-                            let text = if tuna_tui::lyrics::transliterate::contains_indic(l) {
-                                tuna_tui::lyrics::transliterate::transliterate_indic(l)
-                            } else {
-                                l.to_string()
-                            };
-                            (0u32, text)
-                        })
-                        .collect();
-                    let _ = tx.send((lines, false));
-                } else {
-                    let _ = tx.send((Vec::new(), false));
-                }
+                let yt_res = tuna_tui::lyrics::fetch::fetch_ytmusic_lyrics(&id);
+                let _ = tx.send(yt_res);
             } else {
                 let _ = tx.send((Vec::new(), false));
             }
         });
+    }
+
+    // Prefetch lyrics for the next track in the queue (0ms latency on track change)
+    if let Some(next_uri) = app.transport.queue_uris.get(1) {
+        if let Some((next_title, next_artist)) = app.session.meta_cache.get(next_uri).cloned() {
+            let next_vid = tuna_tui::util::track_id_from_uri(next_uri);
+            tuna_tui::lyrics::fetch::prefetch_lyrics(
+                next_artist,
+                next_title,
+                String::new(),
+                0,
+                next_vid,
+            );
+        }
     }
 
     app.playback.now = Some(NowPlaying {
