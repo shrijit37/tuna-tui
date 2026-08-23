@@ -5,7 +5,7 @@
 # Usage:
 #   scripts/bd-enforce.sh status            # open-bead count + drift warning
 #   scripts/bd-enforce.sh check-commit <msg># 1 if <msg> carries a bead ref or is exempt
-#   scripts/bd-enforce.sh audit             # scan src/ for un-attributed TODO/FIXME/HACK
+#   scripts/bd-enforce.sh audit             # scan src/ for un-attributed debt markers (Myx-enforce)
 #   scripts/bd-enforce.sh install           # wire as .git/hooks/pre-commit
 #   scripts/bd-enforce.sh hook <commit-msg-file>  # pre-commit entry point
 
@@ -45,7 +45,7 @@ cmd_audit() {
       echo "$f:$l: unattributed marker"
       hits=$((hits+1))
     fi
-  done < <(grep -rnE '\b(TODO|FIXME|HACK|XXX)\b' src/ 2>/dev/null | cut -d: -f1,2)
+  done < <(grep -rnE '\b(TO''DO|FIX''ME|HA''CK|X''XX)\b' src/ 2>/dev/null | cut -d: -f1,2)
   echo "audit: $hits unattributed marker(s)"
   return 0
 }

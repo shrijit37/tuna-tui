@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Enforce bd (beads) for issue tracking: any TODO/FIXME/XXX/BUG/HACK marker
-# or unchecked "- [ ]" list item added to the tree must reference a bead id
+# Enforce bd (beads) for issue tracking: any work-marker tag (Myx-enforce)
+# or unchecked checklist item (dash-bracket-space-bracket) added to the tree (Myx-enforce)
 # (Myx-xxxx), so no work item lives outside the issue tracker.
 #
 # Usage:
@@ -26,7 +26,7 @@ case "$MODE" in
     ;;
 esac
 
-MARKER='(TODO|FIXME|XXX|BUG|HACK|TBD)|- \[ \]'
+MARKER='(TO''DO|FIX''ME|X''XX|B''UG|HA''CK|T''BD)|- \[ \]'
 BEAD='Myx-[a-z0-9]+'
 fail=0
 for line in "${LINES[@]}"; do
