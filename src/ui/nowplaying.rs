@@ -31,13 +31,6 @@ pub(crate) fn render_nowplaying_view(
     ])
     .split(area);
     let top = chunks[0];
-    // Push the art + info group down a little from the top.
-    let top = Rect {
-        x: top.x,
-        y: top.y + 3,
-        width: top.width,
-        height: top.height.saturating_sub(3),
-    };
     let viz_area = chunks[1];
 
     // Derive the cover's cell footprint from the terminal's font aspect so a
