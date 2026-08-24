@@ -368,12 +368,7 @@ pub(crate) fn fetch_detail_blocking(
             );
         }
         "artist" => {
-            let vids = yt::ytmusic_search(&format!("{id} songs"), 25);
-            let vids = if vids.is_empty() {
-                yt::ytmusic_search(id, 25)
-            } else {
-                vids
-            };
+            let vids = yt::fetch_artist_songs(id, 100);
             if !vids.is_empty() {
                 items.extend(
                     vids.into_iter()
@@ -390,12 +385,7 @@ pub(crate) fn fetch_detail_blocking(
             }
         }
         "album" => {
-            let vids = yt::ytmusic_search(&format!("{id} album songs"), 25);
-            let vids = if vids.is_empty() {
-                yt::ytmusic_search(id, 25)
-            } else {
-                vids
-            };
+            let vids = yt::fetch_album_tracks(id);
             if !vids.is_empty() {
                 items.extend(
                     vids.into_iter()

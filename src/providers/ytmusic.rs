@@ -586,6 +586,365 @@ pub fn lyrics(video_id: &str) -> Option<String> {
     }
 }
 
+/// Fetch the complete tracklist of an album from YouTube Music InnerTube.
+pub fn fetch_album_tracks(album_query: &str) -> Option<Vec<YtVideo>> {
+    let query = album_query.trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    let browse_id = if query.starts_with("MPREb_")
+        || query.starts_with("OLAK5uy_")
+        || query.starts_with("FEmusic_")
+    {
+        query.to_string()
+    } else {
+        let search_body = serde_json::json!({
+            "context": innertube_context(),
+            "query": query,
+            "params": "EgWKAQIYAWoKEAkQBRAKEAMQBA=="
+        });
+        let search_root = post(SEARCH_URL, search_body)?;
+        find_album_browse_id(&search_root)?
+    };
+
+    let browse_body = serde_json::json!({
+        "context": innertube_context(),
+        "browseId": browse_id,
+    });
+    let browse_root = post(BROWSE_URL, browse_body)?;
+
+    let (album_title, album_artist, album_thumb) = parse_album_header(&browse_root);
+    let fallback_artist = if !album_artist.is_empty() {
+        album_artist
+    } else {
+        query.to_string()
+    };
+
+    let mut items = Vec::new();
+    collect_mrlir(&browse_root, &mut items);
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut tracks = Vec::new();
+    for item in items {
+        let Some(video_id) = extract_video_id(item) else {
+            continue;
+        };
+        let Some(title) = extract_title(item) else {
+            continue;
+        };
+        let (artists_raw, _album_raw, duration_ms) = parse_subtitle(item);
+        let duration_ms = duration_ms.or_else(|| extract_fixed_duration(item));
+        let artist = if !artists_raw.is_empty() {
+            artists_raw.join(", ")
+        } else {
+            fallback_artist.clone()
+        };
+        let thumbnail = thumbnail_from_value(item).or_else(|| album_thumb.clone());
+
+        tracks.push(YtVideo {
+            uri: format!("yt:video:{video_id}"),
+            title,
+            artist,
+            album: if !album_title.is_empty() {
+                Some(album_title.clone())
+            } else {
+                None
+            },
+            duration_ms,
+            thumbnail,
+        });
+    }
+
+    if tracks.is_empty() {
+        None
+    } else {
+        Some(tracks)
+    }
+}
+
+/// Fetch the top songs / discography of an artist from YouTube Music InnerTube.
+pub fn fetch_artist_songs(artist_query: &str, limit: usize) -> Option<Vec<YtVideo>> {
+    let query = artist_query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let limit = limit.max(1);
+
+    let browse_id = if query.starts_with("UC") || query.starts_with("FEmusic_artist_") {
+        query.to_string()
+    } else {
+        let search_body = serde_json::json!({
+            "context": innertube_context(),
+            "query": query,
+            "params": "EgWKAQIgAWoKEAkQBRAKEAMQBA=="
+        });
+        let search_root = post(SEARCH_URL, search_body)?;
+        find_artist_browse_id(&search_root)?
+    };
+
+    let browse_body = serde_json::json!({
+        "context": innertube_context(),
+        "browseId": browse_id,
+    });
+    let browse_root = post(BROWSE_URL, browse_body)?;
+
+    // Check for Top Songs / Songs shelf playlist
+    let top_songs_playlist_id = find_artist_top_songs_playlist_id(&browse_root);
+
+    if let Some(playlist_id) = top_songs_playlist_id {
+        let playlist_body = serde_json::json!({
+            "context": innertube_context(),
+            "browseId": playlist_id,
+        });
+        if let Some(playlist_root) = post(BROWSE_URL, playlist_body) {
+            let mut items = Vec::new();
+            collect_mrlir(&playlist_root, &mut items);
+            let tracks: Vec<YtVideo> = items
+                .into_iter()
+                .take(limit)
+                .filter_map(ytvideo_from_mrlir)
+                .collect();
+            if !tracks.is_empty() {
+                return Some(tracks);
+            }
+        }
+    }
+
+    // Fallback: extract direct items from the artist page shelf
+    let mut items = Vec::new();
+    collect_mrlir(&browse_root, &mut items);
+    let tracks: Vec<YtVideo> = items
+        .into_iter()
+        .take(limit)
+        .filter_map(ytvideo_from_mrlir)
+        .collect();
+
+    if tracks.is_empty() {
+        None
+    } else {
+        Some(tracks)
+    }
+}
+
+fn ytvideo_from_mrlir(item: &serde_json::Value) -> Option<YtVideo> {
+    let video_id = extract_video_id(item)?;
+    let title = extract_title(item)?;
+    let (artists_raw, album_raw, duration_ms) = parse_subtitle(item);
+    let duration_ms = duration_ms.or_else(|| extract_fixed_duration(item));
+    let thumbnail = thumbnail_from_value(item);
+    let artist = if !artists_raw.is_empty() {
+        artists_raw.join(", ")
+    } else {
+        String::new()
+    };
+
+    Some(YtVideo {
+        uri: format!("yt:video:{video_id}"),
+        title,
+        artist,
+        album: album_raw,
+        duration_ms,
+        thumbnail,
+    })
+}
+
+fn extract_fixed_duration(item: &serde_json::Value) -> Option<u32> {
+    let fixed = item.get("fixedColumns")?.as_array()?;
+    let col = fixed
+        .first()?
+        .get("musicResponsiveListItemFixedColumnRenderer")?;
+    let text = col
+        .get("text")?
+        .get("runs")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()?;
+    parse_duration_to_ms(text)
+}
+
+fn parse_album_header(root: &serde_json::Value) -> (String, String, Option<String>) {
+    let mut title = String::new();
+    let mut artist = String::new();
+    let mut thumb = None;
+
+    if let Some(hdr) = deep_find_key(root, "musicResponsiveHeaderRenderer")
+        .or_else(|| deep_find_key(root, "musicDetailHeaderRenderer"))
+        .or_else(|| deep_find_key(root, "musicHeaderRenderer"))
+    {
+        if let Some(t) = hdr
+            .get("title")
+            .and_then(|t| t.get("runs"))
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("text"))
+            .and_then(|s| s.as_str())
+        {
+            title = t.to_string();
+        }
+        if let Some(a) = hdr
+            .get("straplineTextOne")
+            .and_then(|t| t.get("runs"))
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("text"))
+            .and_then(|s| s.as_str())
+        {
+            artist = a.to_string();
+        } else if let Some(a) = hdr
+            .get("subtitle")
+            .and_then(|t| t.get("runs"))
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("text"))
+            .and_then(|s| s.as_str())
+        {
+            artist = a.to_string();
+        }
+        thumb = thumbnail_from_value(hdr);
+    }
+    (title, artist, thumb)
+}
+
+fn deep_find_key<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(found) = map.get(key) {
+                return Some(found);
+            }
+            for child in map.values() {
+                if let Some(found) = deep_find_key(child, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for e in arr {
+                if let Some(found) = deep_find_key(e, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_album_browse_id(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(nav) = map
+                .get("navigationEndpoint")
+                .and_then(|n| n.get("browseEndpoint"))
+            {
+                if let Some(id) = nav.get("browseId").and_then(|b| b.as_str()) {
+                    if id.starts_with("MPREb_")
+                        || id.starts_with("OLAK5uy_")
+                        || id.starts_with("FEmusic_")
+                    {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(id) = find_album_browse_id(child) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for e in arr {
+                if let Some(id) = find_album_browse_id(e) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_artist_browse_id(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(nav) = map
+                .get("navigationEndpoint")
+                .and_then(|n| n.get("browseEndpoint"))
+            {
+                if let Some(id) = nav.get("browseId").and_then(|b| b.as_str()) {
+                    if id.starts_with("UC") || id.starts_with("FEmusic_artist_") {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(id) = find_artist_browse_id(child) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for e in arr {
+                if let Some(id) = find_artist_browse_id(e) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_artist_top_songs_playlist_id(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(shelf) = map.get("musicShelfRenderer") {
+                let title = shelf
+                    .get("title")
+                    .and_then(|t| t.get("runs"))
+                    .and_then(|r| r.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|e| e.get("text"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                if title.to_ascii_lowercase().contains("song") {
+                    if let Some(btn) = shelf
+                        .get("bottomEndpoint")
+                        .and_then(|b| b.get("browseEndpoint"))
+                    {
+                        if let Some(id) = btn.get("browseId").and_then(|b| b.as_str()) {
+                            if id.starts_with("VL") || id.starts_with("OLAK") {
+                                return Some(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(id) = find_artist_top_songs_playlist_id(child) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for e in arr {
+                if let Some(id) = find_artist_top_songs_playlist_id(e) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Query YouTube Music for the official 1:1 square album art (`544x544`)
 /// for a video ID, falling back to a YouTube Music search by title if needed.
 pub fn square_album_art(video_id: &str, title_hint: &str) -> Option<String> {

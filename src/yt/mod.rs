@@ -400,35 +400,60 @@ pub fn resolve_kind(kind: &str, id: &str, limit: usize) -> Vec<YtVideo> {
                     return vids;
                 }
             }
-            let vids = ytmusic_search(&format!("{id} songs"), limit);
+            let vids = fetch_artist_songs(id, limit);
             if vids.is_empty() {
-                search(&format!("{id} songs"), limit)
+                ytmusic_search(&format!("{id} songs"), limit)
             } else {
                 vids
             }
         }
         "artist" => {
-            let vids = ytmusic_search(&format!("{id} songs"), limit);
+            let vids = fetch_artist_songs(id, limit);
             if vids.is_empty() {
-                search(&format!("{id} songs"), limit)
+                ytmusic_search(&format!("{id} songs"), limit)
             } else {
                 vids
             }
         }
         "album" => {
-            let vids = ytmusic_search(&format!("{id} album songs"), limit);
-            let vids = if vids.is_empty() {
-                ytmusic_search(id, limit)
-            } else {
-                vids
-            };
+            let vids = fetch_album_tracks(id);
             if vids.is_empty() {
-                search(id, limit)
+                ytmusic_search(&format!("{id} album songs"), limit)
             } else {
                 vids
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// Fetch the full tracklist of an album from YouTube Music, falling back to search.
+pub fn fetch_album_tracks(query: &str) -> Vec<YtVideo> {
+    if let Some(tracks) = crate::providers::ytmusic::fetch_album_tracks(query) {
+        if !tracks.is_empty() {
+            return tracks;
+        }
+    }
+    let vids = ytmusic_search(&format!("{query} album songs"), 25);
+    if vids.is_empty() {
+        search(&format!("{query} album"), 25)
+    } else {
+        vids
+    }
+}
+
+/// Fetch the top songs / discography of an artist from YouTube Music, falling back to search.
+pub fn fetch_artist_songs(query: &str, limit: usize) -> Vec<YtVideo> {
+    if let Some(tracks) = crate::providers::ytmusic::fetch_artist_songs(query, limit) {
+        if !tracks.is_empty() {
+            return tracks;
+        }
+    }
+    let vids = ytmusic_search(&format!("{query} songs"), limit);
+    if vids.is_empty() {
+        search(&format!("{query} songs"), limit)
+    } else {
+        vids
     }
 }
 
