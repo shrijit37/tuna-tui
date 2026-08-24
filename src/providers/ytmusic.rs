@@ -593,27 +593,46 @@ pub fn fetch_album_tracks(album_query: &str) -> Option<Vec<YtVideo>> {
         return None;
     }
 
-    let browse_id = if query.starts_with("MPREb_")
+    let mut browse_id = if query.starts_with("MPREb_")
         || query.starts_with("OLAK5uy_")
         || query.starts_with("FEmusic_")
     {
-        query.to_string()
+        Some(query.to_string())
     } else {
+        None
+    };
+
+    // 1. Try finding direct album link from song search (accurate for song-to-album lookup)
+    if browse_id.is_none() {
+        let song_body = serde_json::json!({
+            "context": innertube_context(),
+            "query": query,
+            "params": "EgWKAQIIAQ=="
+        });
+        if let Some(song_root) = post(SEARCH_URL, song_body) {
+            browse_id = find_album_browse_id_from_song_search(&song_root);
+        }
+    }
+
+    // 2. If not found in song search, search albums with album filter
+    if browse_id.is_none() {
         let search_body = serde_json::json!({
             "context": innertube_context(),
             "query": query,
             "params": "EgWKAQIYAWoKEAkQBRAKEAMQBA=="
         });
-        let search_root = post(SEARCH_URL, search_body)?;
-        find_album_browse_id(&search_root)?
-    };
+        if let Some(search_root) = post(SEARCH_URL, search_body) {
+            browse_id = find_album_browse_id(&search_root);
+        }
+    }
+
+    let browse_id = browse_id?;
 
     let browse_body = serde_json::json!({
         "context": innertube_context(),
         "browseId": browse_id,
     });
     let browse_root = post(BROWSE_URL, browse_body)?;
-
     let (album_title, album_artist, album_thumb) = parse_album_header(&browse_root);
     let fallback_artist = if !album_artist.is_empty() {
         album_artist
@@ -867,6 +886,41 @@ fn find_album_browse_id(v: &serde_json::Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn find_album_browse_id_from_song_search(root: &serde_json::Value) -> Option<String> {
+    let mut items = Vec::new();
+    collect_mrlir(root, &mut items);
+    for item in items.into_iter().take(5) {
+        if let Some(flex) = item.get("flexColumns").and_then(|v| v.as_array()) {
+            if flex.len() > 1 {
+                if let Some(col) = flex[1].get("musicResponsiveListItemFlexColumnRenderer") {
+                    if let Some(runs) = col
+                        .get("text")
+                        .and_then(|t| t.get("runs"))
+                        .and_then(|r| r.as_array())
+                    {
+                        for r in runs {
+                            if let Some(b) = r
+                                .get("navigationEndpoint")
+                                .and_then(|n| n.get("browseEndpoint"))
+                                .and_then(|e| e.get("browseId"))
+                                .and_then(|s| s.as_str())
+                            {
+                                if b.starts_with("MPREb_")
+                                    || b.starts_with("OLAK5uy_")
+                                    || b.starts_with("FEmusic_")
+                                {
+                                    return Some(b.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn find_artist_browse_id(v: &serde_json::Value) -> Option<String> {
