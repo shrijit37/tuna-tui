@@ -782,7 +782,10 @@ impl SettingsState {
     }
 
     pub fn next_tab(&mut self) {
-        let idx = SettingsTab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
+        let idx = SettingsTab::ALL
+            .iter()
+            .position(|t| *t == self.tab)
+            .unwrap_or(0);
         let next_idx = (idx + 1) % SettingsTab::ALL.len();
         self.tab = SettingsTab::ALL[next_idx];
         self.selected = 0;
@@ -790,7 +793,10 @@ impl SettingsState {
     }
 
     pub fn prev_tab(&mut self) {
-        let idx = SettingsTab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
+        let idx = SettingsTab::ALL
+            .iter()
+            .position(|t| *t == self.tab)
+            .unwrap_or(0);
         let prev_idx = if idx == 0 {
             SettingsTab::ALL.len() - 1
         } else {
@@ -906,7 +912,10 @@ impl SettingsState {
             }
             "viz_style" => {
                 let all = VisualizerStyle::ALL;
-                let current_idx = all.iter().position(|s| *s == self.visualizer_style).unwrap_or(0);
+                let current_idx = all
+                    .iter()
+                    .position(|s| *s == self.visualizer_style)
+                    .unwrap_or(0);
                 let next_idx = if forward {
                     (current_idx + 1) % all.len()
                 } else if current_idx == 0 {
@@ -918,7 +927,10 @@ impl SettingsState {
             }
             "viz_smoothing" => {
                 let all = VisualizerSmoothing::ALL;
-                let current_idx = all.iter().position(|s| *s == self.visualizer_smoothing).unwrap_or(1);
+                let current_idx = all
+                    .iter()
+                    .position(|s| *s == self.visualizer_smoothing)
+                    .unwrap_or(1);
                 let next_idx = if forward {
                     (current_idx + 1) % all.len()
                 } else if current_idx == 0 {
@@ -952,7 +964,13 @@ impl SettingsState {
                 }
             }
             "protocol" => {
-                let options = [None, Some("kitty"), Some("sixel"), Some("iterm2"), Some("halfblocks")];
+                let options = [
+                    None,
+                    Some("kitty"),
+                    Some("sixel"),
+                    Some("iterm2"),
+                    Some("halfblocks"),
+                ];
                 let current_idx = match self.protocol.as_deref() {
                     Some("kitty") => 1,
                     Some("sixel") => 2,
@@ -974,7 +992,10 @@ impl SettingsState {
             // Playback
             "audio_quality" => {
                 let all = AudioQuality::ALL;
-                let current_idx = all.iter().position(|q| *q == self.audio_quality).unwrap_or(0);
+                let current_idx = all
+                    .iter()
+                    .position(|q| *q == self.audio_quality)
+                    .unwrap_or(0);
                 let next_idx = if forward {
                     (current_idx + 1) % all.len()
                 } else if current_idx == 0 {
@@ -1014,7 +1035,10 @@ impl SettingsState {
             // Lyrics
             "lyrics_align" => {
                 let all = LyricsAlignment::ALL;
-                let current_idx = all.iter().position(|a| *a == self.lyrics_alignment).unwrap_or(0);
+                let current_idx = all
+                    .iter()
+                    .position(|a| *a == self.lyrics_alignment)
+                    .unwrap_or(0);
                 let next_idx = if forward {
                     (current_idx + 1) % all.len()
                 } else if current_idx == 0 {
@@ -1104,7 +1128,7 @@ impl SettingsState {
                 } else if !forward && self.debug_log_level > 0 {
                     self.debug_log_level -= 1;
                 }
-            },
+            }
             "clear_cache" => return Some(SettingsAction::ClearCache),
             "cache_size" => {
                 let max = 5;
@@ -1115,10 +1139,12 @@ impl SettingsState {
                 }
             }
             "export_config" => {
-                self.status_msg = Some("Config exported to clipboard (not yet implemented)".to_string());
+                self.status_msg =
+                    Some("Config exported to clipboard (not yet implemented)".to_string());
             }
             "reset_defaults" => {
-                self.status_msg = Some("Reset requires confirmation (not yet implemented)".to_string());
+                self.status_msg =
+                    Some("Reset requires confirmation (not yet implemented)".to_string());
             }
             _ => {}
         }

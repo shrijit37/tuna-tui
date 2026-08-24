@@ -41,8 +41,7 @@ pub(crate) fn handle_key(
                     // read must reflect the saved settings without a restart.
                     app.config = cfg;
                     if app.config.theme_name != "Adaptive" {
-                        if let Some(t) = tuna_tui::theme::Theme::from_name(&app.config.theme_name)
-                        {
+                        if let Some(t) = tuna_tui::theme::Theme::from_name(&app.config.theme_name) {
                             app.theme.start_fade(t);
                         }
                     }
@@ -125,8 +124,12 @@ pub(crate) fn handle_key(
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
                         let uri = format!("tuna:playlist:{now}");
-                        app.store
-                            .toggle(StoreKind::Playlist, name.clone(), "0 tracks".to_string(), uri);
+                        app.store.toggle(
+                            StoreKind::Playlist,
+                            name.clone(),
+                            "0 tracks".to_string(),
+                            uri,
+                        );
                         app.store_dirty = true;
                         for (section, items) in crate::browse::build_all_sections(&app.store) {
                             app.browse.library.set(section, items);

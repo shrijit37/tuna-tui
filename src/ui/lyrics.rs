@@ -97,8 +97,5 @@ pub(crate) fn render_lyrics(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
         tuna_tui::config::LyricsAlignment::Left => Alignment::Left,
         tuna_tui::config::LyricsAlignment::Right => Alignment::Right,
     };
-    f.render_widget(
-        Paragraph::new(lines).alignment(alignment),
-        lyrics_area,
-    );
+    f.render_widget(Paragraph::new(lines).alignment(alignment), lyrics_area);
 }

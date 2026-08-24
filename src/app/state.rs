@@ -68,7 +68,6 @@ pub(crate) struct BrowseState {
     // Drill-in stack (artist → album → …). Topmost is what's shown.
     pub(crate) details: Vec<Detail>,
     pub(crate) playlist_input: Option<tui_textarea::TextArea<'static>>,
-
 }
 
 /// The `/` search overlay: whether the prompt is capturing keys, the typed

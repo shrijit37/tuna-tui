@@ -544,7 +544,11 @@ impl Config {
         let get_val = |k: &str| -> Option<&toml::Value> {
             table.get(k).or_else(|| {
                 for section in ["display", "audio", "lyrics", "search", "system"] {
-                    if let Some(v) = table.get(section).and_then(|t| t.as_table()).and_then(|t| t.get(k)) {
+                    if let Some(v) = table
+                        .get(section)
+                        .and_then(|t| t.as_table())
+                        .and_then(|t| t.get(k))
+                    {
                         return Some(v);
                     }
                 }
@@ -553,11 +557,7 @@ impl Config {
         };
         let int = |k: &str| get_val(k).and_then(toml::Value::as_integer);
         let boolean = |k: &str| get_val(k).and_then(toml::Value::as_bool);
-        let text = |k: &str| {
-            get_val(k)
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned)
-        };
+        let text = |k: &str| get_val(k).and_then(toml::Value::as_str).map(str::to_owned);
         Config {
             scrolloff: int("scrolloff")
                 .and_then(|v| usize::try_from(v).ok())
@@ -639,8 +639,10 @@ impl Config {
                 .and_then(|v| u8::try_from(v).ok())
                 .filter(|v| *v <= 2)
                 .unwrap_or(d.ui_density),
-            show_album_art_in_queue: boolean("show_album_art_in_queue").unwrap_or(d.show_album_art_in_queue),
-            show_progress_in_footer: boolean("show_progress_in_footer").unwrap_or(d.show_progress_in_footer),
+            show_album_art_in_queue: boolean("show_album_art_in_queue")
+                .unwrap_or(d.show_album_art_in_queue),
+            show_progress_in_footer: boolean("show_progress_in_footer")
+                .unwrap_or(d.show_progress_in_footer),
             footer_clock_format: int("footer_clock_format")
                 .and_then(|v| u8::try_from(v).ok())
                 .filter(|v| *v <= 3)
@@ -653,10 +655,14 @@ impl Config {
             mpris_enabled: boolean("mpris_enabled").unwrap_or(d.mpris_enabled),
 
             debug_mode: boolean("debug_mode").unwrap_or(d.debug_mode),
-            debug_verbose_logging: boolean("debug_verbose_logging").unwrap_or(d.debug_verbose_logging),
-            debug_performance_overlay: boolean("debug_performance_overlay").unwrap_or(d.debug_performance_overlay),
-            debug_network_logging: boolean("debug_network_logging").unwrap_or(d.debug_network_logging),
-            debug_audio_diagnostics: boolean("debug_audio_diagnostics").unwrap_or(d.debug_audio_diagnostics),
+            debug_verbose_logging: boolean("debug_verbose_logging")
+                .unwrap_or(d.debug_verbose_logging),
+            debug_performance_overlay: boolean("debug_performance_overlay")
+                .unwrap_or(d.debug_performance_overlay),
+            debug_network_logging: boolean("debug_network_logging")
+                .unwrap_or(d.debug_network_logging),
+            debug_audio_diagnostics: boolean("debug_audio_diagnostics")
+                .unwrap_or(d.debug_audio_diagnostics),
             debug_engine_state: boolean("debug_engine_state").unwrap_or(d.debug_engine_state),
             debug_visualizer_raw: boolean("debug_visualizer_raw").unwrap_or(d.debug_visualizer_raw),
             debug_cache_stats: boolean("debug_cache_stats").unwrap_or(d.debug_cache_stats),
@@ -677,11 +683,26 @@ impl Config {
 
         out.push_str("[display]\n");
         out.push_str(&format!("animation_fps = {}\n", self.animation_fps));
-        out.push_str(&format!("visualizer_style = \"{}\"\n", self.visualizer_style.as_str()));
-        out.push_str(&format!("visualizer_smoothing = \"{}\"\n", self.visualizer_smoothing.as_str()));
-        out.push_str(&format!("visualizer_bar_width = {}\n", self.visualizer_bar_width));
-        out.push_str(&format!("visualizer_color_scheme = {}\n", self.visualizer_color_scheme));
-        out.push_str(&format!("progress_bar_style = {}\n", self.progress_bar_style));
+        out.push_str(&format!(
+            "visualizer_style = \"{}\"\n",
+            self.visualizer_style.as_str()
+        ));
+        out.push_str(&format!(
+            "visualizer_smoothing = \"{}\"\n",
+            self.visualizer_smoothing.as_str()
+        ));
+        out.push_str(&format!(
+            "visualizer_bar_width = {}\n",
+            self.visualizer_bar_width
+        ));
+        out.push_str(&format!(
+            "visualizer_color_scheme = {}\n",
+            self.visualizer_color_scheme
+        ));
+        out.push_str(&format!(
+            "progress_bar_style = {}\n",
+            self.progress_bar_style
+        ));
         out.push_str(&format!("theme_fade_speed = {}\n", self.theme_fade_speed));
         if let Some(proto) = &self.protocol {
             out.push_str(&format!("protocol = \"{}\"\n", proto));
@@ -690,31 +711,70 @@ impl Config {
         out.push_str(&format!("theme_name = \"{}\"\n\n", self.theme_name));
 
         out.push_str("[audio]\n");
-        out.push_str(&format!("audio_quality = \"{}\"\n", self.audio_quality.as_str()));
-        out.push_str(&format!("buffer_duration_secs = {}\n", self.buffer_duration_secs));
+        out.push_str(&format!(
+            "audio_quality = \"{}\"\n",
+            self.audio_quality.as_str()
+        ));
+        out.push_str(&format!(
+            "buffer_duration_secs = {}\n",
+            self.buffer_duration_secs
+        ));
         out.push_str(&format!("volume_step = {}\n", self.volume_step));
         out.push_str(&format!("crossfade_enabled = {}\n", self.crossfade_enabled));
-        out.push_str(&format!("crossfade_duration_ms = {}\n", self.crossfade_duration_ms));
+        out.push_str(&format!(
+            "crossfade_duration_ms = {}\n",
+            self.crossfade_duration_ms
+        ));
         out.push_str(&format!("gapless_playback = {}\n", self.gapless_playback));
         out.push_str(&format!("replay_gain = {}\n", self.replay_gain));
-        out.push_str(&format!("restore_on_startup = {}\n", self.restore_on_startup));
-        out.push_str(&format!("next_track_prefetch = {}\n\n", self.next_track_prefetch));
+        out.push_str(&format!(
+            "restore_on_startup = {}\n",
+            self.restore_on_startup
+        ));
+        out.push_str(&format!(
+            "next_track_prefetch = {}\n\n",
+            self.next_track_prefetch
+        ));
 
         out.push_str("[lyrics]\n");
-        out.push_str(&format!("lyrics_alignment = \"{}\"\n", self.lyrics_alignment.as_str()));
-        out.push_str(&format!("lyrics_transliterate = {}\n", self.lyrics_transliterate));
-        out.push_str(&format!("lyrics_auto_scroll = {}\n", self.lyrics_auto_scroll));
+        out.push_str(&format!(
+            "lyrics_alignment = \"{}\"\n",
+            self.lyrics_alignment.as_str()
+        ));
+        out.push_str(&format!(
+            "lyrics_transliterate = {}\n",
+            self.lyrics_transliterate
+        ));
+        out.push_str(&format!(
+            "lyrics_auto_scroll = {}\n",
+            self.lyrics_auto_scroll
+        ));
         out.push_str(&format!("lyrics_font_size = {}\n", self.lyrics_font_size));
-        out.push_str(&format!("lyrics_highlight_color = {}\n\n", self.lyrics_highlight_color));
+        out.push_str(&format!(
+            "lyrics_highlight_color = {}\n\n",
+            self.lyrics_highlight_color
+        ));
 
         out.push_str("[interface]\n");
         out.push_str(&format!("search_limit = {}\n", self.search_limit));
         out.push_str(&format!("scrolloff = {}\n", self.scrolloff));
         out.push_str(&format!("ui_density = {}\n", self.ui_density));
-        out.push_str(&format!("show_album_art_in_queue = {}\n", self.show_album_art_in_queue));
-        out.push_str(&format!("show_progress_in_footer = {}\n", self.show_progress_in_footer));
-        out.push_str(&format!("footer_clock_format = {}\n", self.footer_clock_format));
-        out.push_str(&format!("sidebar_width_pct = {}\n\n", self.sidebar_width_pct));
+        out.push_str(&format!(
+            "show_album_art_in_queue = {}\n",
+            self.show_album_art_in_queue
+        ));
+        out.push_str(&format!(
+            "show_progress_in_footer = {}\n",
+            self.show_progress_in_footer
+        ));
+        out.push_str(&format!(
+            "footer_clock_format = {}\n",
+            self.footer_clock_format
+        ));
+        out.push_str(&format!(
+            "sidebar_width_pct = {}\n\n",
+            self.sidebar_width_pct
+        ));
 
         out.push_str("[system]\n");
         out.push_str(&format!("mpris_enabled = {}\n", self.mpris_enabled));
@@ -728,21 +788,44 @@ impl Config {
 
         out.push_str("[debug]\n");
         out.push_str(&format!("debug_mode = {}\n", self.debug_mode));
-        out.push_str(&format!("debug_verbose_logging = {}\n", self.debug_verbose_logging));
-        out.push_str(&format!("debug_performance_overlay = {}\n", self.debug_performance_overlay));
-        out.push_str(&format!("debug_network_logging = {}\n", self.debug_network_logging));
-        out.push_str(&format!("debug_audio_diagnostics = {}\n", self.debug_audio_diagnostics));
-        out.push_str(&format!("debug_engine_state = {}\n", self.debug_engine_state));
-        out.push_str(&format!("debug_visualizer_raw = {}\n", self.debug_visualizer_raw));
+        out.push_str(&format!(
+            "debug_verbose_logging = {}\n",
+            self.debug_verbose_logging
+        ));
+        out.push_str(&format!(
+            "debug_performance_overlay = {}\n",
+            self.debug_performance_overlay
+        ));
+        out.push_str(&format!(
+            "debug_network_logging = {}\n",
+            self.debug_network_logging
+        ));
+        out.push_str(&format!(
+            "debug_audio_diagnostics = {}\n",
+            self.debug_audio_diagnostics
+        ));
+        out.push_str(&format!(
+            "debug_engine_state = {}\n",
+            self.debug_engine_state
+        ));
+        out.push_str(&format!(
+            "debug_visualizer_raw = {}\n",
+            self.debug_visualizer_raw
+        ));
         out.push_str(&format!("debug_cache_stats = {}\n", self.debug_cache_stats));
-        out.push_str(&format!("debug_lyrics_timing = {}\n", self.debug_lyrics_timing));
-        out.push_str(&format!("debug_search_queries = {}\n", self.debug_search_queries));
+        out.push_str(&format!(
+            "debug_lyrics_timing = {}\n",
+            self.debug_lyrics_timing
+        ));
+        out.push_str(&format!(
+            "debug_search_queries = {}\n",
+            self.debug_search_queries
+        ));
         out.push_str(&format!("debug_log_file = {}\n", self.debug_log_file));
         out.push_str(&format!("debug_log_level = {}\n", self.debug_log_level));
 
         out
     }
-
 
     /// Save configuration to file path.
     pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {

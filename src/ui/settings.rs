@@ -17,7 +17,9 @@ pub(crate) fn render_settings_overlay(f: &mut Frame, app: &App, theme: Theme, ar
 
     // Center an 80x24 modal box within the terminal area
     let w = (area.width.saturating_sub(4)).clamp(60, 90).min(area.width);
-    let h = (area.height.saturating_sub(4)).clamp(18, 28).min(area.height);
+    let h = (area.height.saturating_sub(4))
+        .clamp(18, 28)
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal_rect = Rect {

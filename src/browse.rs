@@ -58,7 +58,11 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
     if !store.playlists.is_empty() {
         playlists.extend(store.playlists.iter().map(|p| {
             let count = p.tracks.len();
-            let subtitle = if count > 0 || p.subtitle.is_empty() || p.subtitle.ends_with("tracks") || p.subtitle.ends_with("track") {
+            let subtitle = if count > 0
+                || p.subtitle.is_empty()
+                || p.subtitle.ends_with("tracks")
+                || p.subtitle.ends_with("track")
+            {
                 if count == 1 {
                     "1 track".to_string()
                 } else {
@@ -605,7 +609,10 @@ mod tests {
             "tuna:playlist:123".to_string(),
         );
         let sections = build_all_sections(&store);
-        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        let playlists = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Playlists)
+            .unwrap();
         assert_eq!(playlists.1[1].subtitle, "0 tracks");
 
         store.add_to_playlist(
@@ -618,7 +625,10 @@ mod tests {
             },
         );
         let sections = build_all_sections(&store);
-        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        let playlists = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Playlists)
+            .unwrap();
         assert_eq!(playlists.1[1].subtitle, "1 track");
 
         store.add_to_playlist(
@@ -631,8 +641,10 @@ mod tests {
             },
         );
         let sections = build_all_sections(&store);
-        let playlists = sections.iter().find(|(s, _)| *s == Section::Playlists).unwrap();
+        let playlists = sections
+            .iter()
+            .find(|(s, _)| *s == Section::Playlists)
+            .unwrap();
         assert_eq!(playlists.1[1].subtitle, "2 tracks");
     }
-
 }

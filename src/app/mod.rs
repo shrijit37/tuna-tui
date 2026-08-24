@@ -23,6 +23,7 @@ mod playback;
 mod settings;
 mod state;
 
+use crate::*;
 pub(crate) use action::*;
 pub(crate) use event::*;
 pub(crate) use frame::*;
@@ -31,7 +32,6 @@ pub(crate) use persist::*;
 pub(crate) use playback::*;
 pub(crate) use settings::*;
 pub(crate) use state::*;
-use crate::*;
 
 pub(crate) struct App {
     pub(crate) svc: Services,
@@ -298,10 +298,9 @@ impl App {
             if self.search.searching {
                 // A search-result song starts that song's radio (seed + similar).
                 if !item.name.is_empty() {
-                    self.session.meta_cache.insert(
-                        item.uri.clone(),
-                        (item.name.clone(), item.subtitle.clone()),
-                    );
+                    self.session
+                        .meta_cache
+                        .insert(item.uri.clone(), (item.name.clone(), item.subtitle.clone()));
                 }
                 self.transport.source = PlaySource::Radio(item.uri.clone());
                 self.transport.source_name = format!("Radio · {}", item.name);

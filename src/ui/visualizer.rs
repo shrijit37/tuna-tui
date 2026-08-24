@@ -71,10 +71,16 @@ pub(crate) fn render_visualizer(
 
     // 3. Paint cells directly using selected visualizer style glyphs:
     let (solid_glyph, levels): (&str, &[&str; 8]) = match app.config.visualizer_style {
-        tuna_tui::config::VisualizerStyle::Block => ("█", &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]),
-        tuna_tui::config::VisualizerStyle::Braille => ("⣿", &["⠁", "⠃", "⠇", "⡇", "⣇", "⣧", "⣷", "⣿"]),
+        tuna_tui::config::VisualizerStyle::Block => {
+            ("█", &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"])
+        }
+        tuna_tui::config::VisualizerStyle::Braille => {
+            ("⣿", &["⠁", "⠃", "⠇", "⡇", "⣇", "⣧", "⣷", "⣿"])
+        }
         tuna_tui::config::VisualizerStyle::Line => ("─", &["─", "─", "─", "─", "─", "─", "─", "─"]),
-        tuna_tui::config::VisualizerStyle::Solid => ("█", &["█", "█", "█", "█", "█", "█", "█", "█"]),
+        tuna_tui::config::VisualizerStyle::Solid => {
+            ("█", &["█", "█", "█", "█", "█", "█", "█", "█"])
+        }
     };
     let stops = [theme.info, theme.primary, theme.accent];
     let buf = f.buffer_mut();

@@ -196,13 +196,7 @@ pub(crate) fn render_progress(
         }
     }
     let right_x = area.x + (left_len + bar_w) as u16;
-    buf.set_stringn(
-        right_x,
-        area.y,
-        &right,
-        right_len,
-        theme.muted(),
-    );
+    buf.set_stringn(right_x, area.y, &right, right_len, theme.muted());
 }
 
 /// The volume meter — a graduated ramp + percentage, right-aligned in `area`.

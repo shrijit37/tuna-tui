@@ -1550,7 +1550,10 @@ mod tests {
         let buf = image::RgbaImage::new(100, 100);
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgba8(buf)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .expect("png encode");
         let img = decode_cover(&bytes).expect("cover decodes");
         assert_eq!((img.width(), img.height()), (100, 100));

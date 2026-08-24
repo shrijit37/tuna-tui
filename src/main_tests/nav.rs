@@ -225,7 +225,12 @@ fn an_untouched_screen_redraws_rarely() {
 #[test]
 fn animation_redraws_at_animation_frame_rate() {
     assert!(should_draw(false, true, MIN_FRAME, MIN_FRAME));
-    assert!(!should_draw(false, true, Duration::from_millis(4), MIN_FRAME));
+    assert!(!should_draw(
+        false,
+        true,
+        Duration::from_millis(4),
+        MIN_FRAME
+    ));
 }
 
 #[test]
