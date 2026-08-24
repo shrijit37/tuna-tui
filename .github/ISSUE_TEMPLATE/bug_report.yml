@@ -1,0 +1,71 @@
+name: Bug Report
+description: File a bug report to help us improve Tuna TUI
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! Please provide as much detail as possible.
+
+  - type: input
+    id: version
+    attributes:
+      label: Tuna TUI Version
+      description: What version of tuna-tui are you using? (e.g. `tuna-tui --version` or git commit)
+      placeholder: "0.4.0"
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Operating System & Terminal Emulator
+      description: OS and terminal emulator details (e.g. Arch Linux, foot / kitty / WezTerm, macOS Terminal)
+      placeholder: "Arch Linux, Kitty 0.35"
+    validations:
+      required: true
+
+  - type: input
+    id: ytdlp_version
+    attributes:
+      label: yt-dlp & ffmpeg Versions
+      description: Output of `yt-dlp --version` and `ffmpeg -version`
+      placeholder: "yt-dlp 2026.08.01, ffmpeg 7.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: describe
+    attributes:
+      label: Describe the Bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Run `tuna-tui`
+        2. Search for '...'
+        3. Press 'Enter' on track
+        4. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Terminal Output
+      description: Please copy relevant log lines from `~/.local/state/tuna-tui/tuna.log` or console output.
+      render: shell

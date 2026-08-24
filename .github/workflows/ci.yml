@@ -4,7 +4,7 @@ name: CI
 # commit on a PR branch from running the whole matrix twice.
 on:
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
 
 # A new push supersedes whatever was still running for the same ref.

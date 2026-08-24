@@ -1,112 +1,143 @@
-# Tuna TUI
+<div align="center">
 
-A lean, beautiful terminal music player. Rust + [ratatui], playing YouTube
-through `yt-dlp → ffmpeg → rodio`, with local library, lyrics, cover-art theme
-fades, a spectrum visualizer, and media-key/MPRIS support. MIT licensed.
+# 🐟 Tuna TUI
 
-[ratatui]: https://ratatui.rs
+**A lean, beautiful terminal music player for YouTube & YouTube Music.**
 
-## Features
+[![CI](https://github.com/shrijit37/tuna-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/shrijit37/tuna-tui/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/tuna-tui.svg)](https://crates.io/crates/tuna-tui)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-- **Search** YouTube (`ytsearchN:` flat results) and play straight from the results
-- **Home** — rolling history of what you actually played (play counts + recency)
-- **Library** — liked tracks, albums, artists, and playlists persisted locally;
-  external playlists and album slugs drill in through YouTube
-- **Resilient playback engine** — a watchdog re-resolves stalled or dropped
-  streams (googlevideo connections die mid-stream on some networks; the engine
-  recovers instead of stalling)
-- **Lyrics** from lrclib.net, keyed on artist/title/album/duration
-- **Cover art + adaptive theme fade**, generated from each track's artwork
-- **Radio** from any track, with a fallback chain for fresh/obscure seeds
-- **Queue** view that mirrors the playing list; add-to-queue from the actions menu
-- **Volume / shuffle / repeat / seek** — local mixer and queue operations
-- **Resume on startup** — the session snapshot (`state.json`) restores your
-  context and seek position
-- **Media keys / MPRIS** (souvlaki), **zen mode**, instant **actions menu**,
-  per-column **sort**, and a **TXC color protocol** (pure data types + color
-  math, usable standalone without the streaming backend)
-- **FFT visualizer** fed from what is actually served to the audio device
+*Fast, minimal, and fully featured. Powered by Rust + [Ratatui], playing YouTube streams via `yt-dlp → ffmpeg → rodio` with live FFT audio visualizer, synchronized lyrics, cover art color palettes, and MPRIS media keys.*
 
-## Requirements
+</div>
 
-- `yt-dlp` and `ffmpeg` **on `PATH`** — the app shells out to both
-  (search/resolve and stream decode). Nothing plays without them.
-- A terminal with a tty (ratatui/crossterm; CSI-u terminals like foot,
-  kitty, or WezTerm unlock `Shift+Enter` to play the selected item directly).
+---
 
-## Install
+## ✨ Features
 
-| Method | Command / notes |
+- 🔍 **Instant Search** — Fast YouTube & YouTube Music InnerTube search with query suggestions.
+- 📻 **Endless Radio** — Smart radio track recommendations from any seed song or artist.
+- 📜 **Synchronized Lyrics** — Live scrolling lyrics from `lrclib.net` with InnerTube fallback and automatic Indic/Devanagari transliteration.
+- 🎨 **Adaptive Cover Art & Themes** — High-resolution album artwork (Sixel/Kitty graphics) with real-time dynamic palette generation.
+- 📊 **Audio Spectrum Visualizer** — Real-time FFT visualizer (60–120 FPS) with customizable decay and visual styles.
+- ⚙️ **Interactive Settings Menu** — Dual-pane configuration menu with 5 tabs and instant TOML persistence.
+- 💾 **Local Library & History** — Liked songs, custom playlists with inline creation, and history tracking.
+- 🔄 **Resilient Playback Engine** — Automatic recovery from transient stream drops and mid-track reconnects.
+- 🎹 **Media Keys & MPRIS** — Full hardware media key and system desktop integration via Souvlaki/zbus.
+- 🛠️ **Standalone TXC Protocol** — Decoupled terminal color and theme protocol available as a standalone library/CLI.
+
+---
+
+## 📋 Requirements
+
+- **`yt-dlp`** and **`ffmpeg`** installed and available on your `PATH`.
+- A terminal with truecolor support (e.g. Foot, Kitty, WezTerm, Alacritty, Ghostty, iTerm2).
+
+---
+
+## 📦 Installation
+
+### Cargo (crates.io)
+```bash
+cargo install tuna-tui
+```
+
+### Arch Linux (AUR)
+```bash
+paru -S tuna-tui
+# or
+yay -S tuna-tui
+```
+
+### Homebrew (macOS / Linux)
+```bash
+brew install shrijit37/homebrew-tap/tuna-tui
+```
+
+### Nix / NixOS
+```bash
+nix run github:shrijit37/tuna-tui
+```
+
+### From Source
+```bash
+git clone https://github.com/shrijit37/tuna-tui.git
+cd tuna-tui
+cargo build --release
+# Binary available at target/release/tuna-tui
+```
+
+---
+
+## ⌨️ Keybindings
+
+| Key | Action |
 |---|---|
-| cargo (crates.io) | `cargo install tuna-tui` — requires `yt-dlp` + `ffmpeg` installed separately |
-| Nix | `nix run github:shrijit37/tuna-tui` (flake: dev shell + build) |
-| Debian / Ubuntu | `.deb` from the GitHub release — declares `libasound2`, `libssl3`, `yt-dlp`, `ffmpeg` |
-| Homebrew | `brew install shrijit37/homebrew-tap/tuna-tui` — formula declares `yt-dlp` and `ffmpeg` |
-| Arch (AUR) | `tuna-tui` package — depends on `yt-dlp`, `ffmpeg`, `alsa-lib`, `openssl` |
-| From source | `cargo build --release` (default features `streaming` + `txc`); `--no-default-features --features txc` builds the protocol-only half |
+| `j` / `k`, `↑` / `↓` | Move selection down / up |
+| `Enter` | Open / drill into playlist, album, artist; run search |
+| `Shift+Enter` | Play highlighted item directly (CSI-u terminals) |
+| `Tab` / `]`, `Shift+Tab` / `[` | Next / previous library section |
+| `←` / `→` | Switch right-pane view (Now Playing / Queue / Lyrics) |
+| `Shift+←` / `Shift+→` | Seek −5s / +5s |
+| `/` | Open search prompt (`Esc` to cancel, `Ctrl+U` to clear) |
+| `Space` / `p` | Play / pause |
+| `n` / `b` | Next / previous track |
+| `+` / `=` , `-` / `_` | Volume up / down |
+| `s` / `S` | Toggle shuffle / shuffle & play current list |
+| `R` / `r` | Toggle repeat mode / refresh library |
+| `a` | Open actions menu (Like, Add to Queue, Copy Link, etc.) |
+| `o` | Cycle sorting mode for active list |
+| `z` | Toggle Zen Mode (hide sidebar) |
+| `q` | Quit application |
 
-The binary is self-contained except for `yt-dlp`/`ffmpeg` and the system
-libraries it links (`libasound2` for audio output, `libssl3` for HTTPS).
+---
 
-## Usage
+## ⚙️ Configuration
 
-Run `tuna-tui` in a terminal. The left pane is the library (Home / Liked /
-Albums / Artists / Playlists), the right pane shows Now Playing, Queue, or
-Lyrics, and the footer holds transport state.
+Configuration is automatically persisted to `~/.config/tuna-tui/config.toml`. You can configure settings directly through the in-app **Settings Menu** or by editing the TOML file:
 
-| Keys | Action |
-|---|---|
-| `j` / `k`, `↑` / `↓` | move selection |
-| `Enter` | open / drill in (playlist, album, artist); in search, run the search |
-| `Shift+Enter` | play the selected item outright (needs a CSI-u terminal) |
-| `Tab` / `]`, `Shift+Tab` / `[` | next / previous library section |
-| `←` / `→` | rotate the right-pane view (Now Playing / Queue / Lyrics) |
-| `Shift+←` / `Shift+→` | seek −5 s / +5 s |
-| `/` | search (type, `Enter` to run, `Esc` to cancel; `Ctrl+U` clears) |
-| `Space` / `p` | play / pause (or resume your last context on a fresh start) |
-| `n` / `b` | next / previous track |
-| `+` / `=` , `-` / `_` | volume up / down (5 steps) |
-| `s` | toggle shuffle · `S` shuffle and play the selection |
-| `R` | toggle repeat · `r` reload the library |
-| `P` | play the highlighted playlist / album / artist directly |
-| `a` | actions menu on the selection (like, add to queue, copy link, open…) |
-| `o` | cycle sort for the current list |
-| `z` | zen mode (hide the library) |
-| `q` | quit · `Ctrl+C` twice also quits |
-| `Esc` | back one level |
-| media keys | play/pause, next, previous, stop, volume |
+```toml
+search_limit = 20
+volume = 80
+animation_fps = 120
+volume_step = 5
+next_track_prefetch = true
 
-## Configuration and data
+[visualizer]
+style = "bars"
+smoothing = true
 
-- `~/.config/tuna-tui/config.toml` — user settings: `search_limit`,
-  `audio_format`, and an optional `cookies_file` for `yt-dlp --cookies`
-  (Netscape format; quiets the bot checks on throttled networks and unlocks
-  private playlists). The `TUNA_PROTOCOL` environment variable overrides the
-  protocol for URL building.
-- `~/.cache/tuna-tui/state.json` — session snapshot: playback context, store
-  (liked / albums / artists / playlists / history), and last seek position.
-  Items are `tuna:` URIs; legacy `myx:` rows from before the rebrand still
-  parse. One-time migration moves the old `~/.config/myx` / `~/.cache/myx`
-  dirs to the `tuna-tui` names (log with `TUNA_LOG=1`).
+[lyrics]
+alignment = "center"
+transliterate_indic = true
+```
 
-## Known limits
+---
 
-- YouTube streaming is a ToS grey zone: anonymized traffic can hit bot checks
-  (set `cookies_file`); the stream leg pins `player_client=android`, which is
-  the verified-unthrottle mitigation on at least one box, and the watchdog
-  recovers from per-connection drops.
-- No first-class album/artist entities on YouTube — those live in your local
-  library; album drill-in is a slug search.
-- Seek restarts the stream (`-ss`, ~1 s). Multi-device Connect had no YouTube
-  equivalent and was dropped with the Spotify backend.
+## 🤝 Contributing
 
-## Development
+Contributions are warmly welcomed! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) for details on setting up the development environment, running tests, and submitting PRs.
 
-`examples/probe` drives the `Expander` (yt-dlp resolve + ffmpeg decode);
-`theme_demo` and `txc_demo` exercise the theme and color protocol.
-CI runs fmt/clippy (warnings denied)/tests on Linux, macOS, and Windows;
-live-network tests are `#[ignore]`d.
+Please also review our [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## License
+---
 
-MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright (c) 2026 Haseeb Khalid, Shrijit Srivastava.
+## 📜 Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a detailed history of changes and release notes.
+
+---
+
+## 🛡️ Security
+
+Please report any security concerns following our [Security Policy](SECURITY.md).
+
+---
+
+## 📄 License
+
+Tuna TUI is licensed under the [MIT License](LICENSE).
+
+[Ratatui]: https://ratatui.rs
