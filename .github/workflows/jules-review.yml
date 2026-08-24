@@ -18,7 +18,7 @@ jobs:
     steps:
       # Pinned to the v1.6.0 release (SHA reviewed 2026-08-18).
       # Bump deliberately: read the diff between tags first, then update this SHA.
-      - uses: thalesraymond/jules-pr-reviewer@c033a37855c3b85caa89bd4ee944b2b6af1bc104
+      - uses: thalesraymond/jules-pr-reviewer@0ef1e60f7ac68a03b15c1a04c2e55f73942e8480
         with:
           jules_api_key: ${{ secrets.JULES_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
