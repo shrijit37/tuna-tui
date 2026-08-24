@@ -304,6 +304,32 @@ pub struct Config {
     // --- System ---
     /// Enable MPRIS / system media control integration.
     pub mpris_enabled: bool,
+
+    // --- Debug & Diagnostics ---
+    /// Master toggle for all debug subsystems.
+    pub debug_mode: bool,
+    /// Verbose logging of engine events, metadata fetches, state transitions.
+    pub debug_verbose_logging: bool,
+    /// Real-time performance overlay (FPS, frame time, CPU, buffer health).
+    pub debug_performance_overlay: bool,
+    /// Network request/response logging with timing.
+    pub debug_network_logging: bool,
+    /// Audio decoder, buffer, underrun, sample rate logging.
+    pub debug_audio_diagnostics: bool,
+    /// Engine queue, track loading, shuffle state logging.
+    pub debug_engine_state: bool,
+    /// Raw FFT magnitudes, band values, peak envelope per frame.
+    pub debug_visualizer_raw: bool,
+    /// Metadata cache hits/misses, eviction, LRU order logging.
+    pub debug_cache_stats: bool,
+    /// Lyrics sync parsing, line matching, scroll drift logging.
+    pub debug_lyrics_timing: bool,
+    /// Search query, suggestion, result count, latency logging.
+    pub debug_search_queries: bool,
+    /// Write debug output to rotating file (~/.cache/tuna-tui/debug.log).
+    pub debug_log_file: bool,
+    /// Debug log verbosity: 0=Error, 1=Warn, 2=Info, 3=Debug, 4=Trace.
+    pub debug_log_level: u8,
 }
 
 impl Default for Config {
@@ -350,6 +376,19 @@ impl Default for Config {
             sidebar_width_pct: 30,
 
             mpris_enabled: true,
+
+            debug_mode: false,
+            debug_verbose_logging: false,
+            debug_performance_overlay: false,
+            debug_network_logging: false,
+            debug_audio_diagnostics: false,
+            debug_engine_state: false,
+            debug_visualizer_raw: false,
+            debug_cache_stats: false,
+            debug_lyrics_timing: false,
+            debug_search_queries: false,
+            debug_log_file: false,
+            debug_log_level: 0,
         }
     }
 }
@@ -612,6 +651,22 @@ impl Config {
                 .unwrap_or(d.sidebar_width_pct),
 
             mpris_enabled: boolean("mpris_enabled").unwrap_or(d.mpris_enabled),
+
+            debug_mode: boolean("debug_mode").unwrap_or(d.debug_mode),
+            debug_verbose_logging: boolean("debug_verbose_logging").unwrap_or(d.debug_verbose_logging),
+            debug_performance_overlay: boolean("debug_performance_overlay").unwrap_or(d.debug_performance_overlay),
+            debug_network_logging: boolean("debug_network_logging").unwrap_or(d.debug_network_logging),
+            debug_audio_diagnostics: boolean("debug_audio_diagnostics").unwrap_or(d.debug_audio_diagnostics),
+            debug_engine_state: boolean("debug_engine_state").unwrap_or(d.debug_engine_state),
+            debug_visualizer_raw: boolean("debug_visualizer_raw").unwrap_or(d.debug_visualizer_raw),
+            debug_cache_stats: boolean("debug_cache_stats").unwrap_or(d.debug_cache_stats),
+            debug_lyrics_timing: boolean("debug_lyrics_timing").unwrap_or(d.debug_lyrics_timing),
+            debug_search_queries: boolean("debug_search_queries").unwrap_or(d.debug_search_queries),
+            debug_log_file: boolean("debug_log_file").unwrap_or(d.debug_log_file),
+            debug_log_level: int("debug_log_level")
+                .and_then(|v| u8::try_from(v).ok())
+                .filter(|v| *v <= 4)
+                .unwrap_or(d.debug_log_level),
         }
     }
 
@@ -669,6 +724,21 @@ impl Config {
         if let Some(cookies) = &self.cookies_file {
             out.push_str(&format!("cookies_file = \"{}\"\n", cookies));
         }
+        out.push('\n');
+
+        out.push_str("[debug]\n");
+        out.push_str(&format!("debug_mode = {}\n", self.debug_mode));
+        out.push_str(&format!("debug_verbose_logging = {}\n", self.debug_verbose_logging));
+        out.push_str(&format!("debug_performance_overlay = {}\n", self.debug_performance_overlay));
+        out.push_str(&format!("debug_network_logging = {}\n", self.debug_network_logging));
+        out.push_str(&format!("debug_audio_diagnostics = {}\n", self.debug_audio_diagnostics));
+        out.push_str(&format!("debug_engine_state = {}\n", self.debug_engine_state));
+        out.push_str(&format!("debug_visualizer_raw = {}\n", self.debug_visualizer_raw));
+        out.push_str(&format!("debug_cache_stats = {}\n", self.debug_cache_stats));
+        out.push_str(&format!("debug_lyrics_timing = {}\n", self.debug_lyrics_timing));
+        out.push_str(&format!("debug_search_queries = {}\n", self.debug_search_queries));
+        out.push_str(&format!("debug_log_file = {}\n", self.debug_log_file));
+        out.push_str(&format!("debug_log_level = {}\n", self.debug_log_level));
 
         out
     }

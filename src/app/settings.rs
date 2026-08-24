@@ -107,9 +107,23 @@ pub struct SettingsState {
     pub show_progress_in_footer: bool,
     pub footer_clock_format: u8,
     pub sidebar_width_pct: u8,
-
     // System
     pub mpris_enabled: bool,
+
+    // Debug & Diagnostics
+    pub debug_mode: bool,
+    pub debug_verbose_logging: bool,
+    pub debug_performance_overlay: bool,
+    pub debug_network_logging: bool,
+    pub debug_audio_diagnostics: bool,
+    pub debug_engine_state: bool,
+    pub debug_visualizer_raw: bool,
+    pub debug_cache_stats: bool,
+    pub debug_lyrics_timing: bool,
+    pub debug_search_queries: bool,
+    pub debug_log_file: bool,
+    pub debug_log_level: u8,
+
     pub status_msg: Option<String>,
 }
 
@@ -161,6 +175,21 @@ impl SettingsState {
 
             // System
             mpris_enabled: c.mpris_enabled,
+
+            // Debug
+            debug_mode: c.debug_mode,
+            debug_verbose_logging: c.debug_verbose_logging,
+            debug_performance_overlay: c.debug_performance_overlay,
+            debug_network_logging: c.debug_network_logging,
+            debug_audio_diagnostics: c.debug_audio_diagnostics,
+            debug_engine_state: c.debug_engine_state,
+            debug_visualizer_raw: c.debug_visualizer_raw,
+            debug_cache_stats: c.debug_cache_stats,
+            debug_lyrics_timing: c.debug_lyrics_timing,
+            debug_search_queries: c.debug_search_queries,
+            debug_log_file: c.debug_log_file,
+            debug_log_level: c.debug_log_level,
+
             status_msg: None,
         }
     }
@@ -615,6 +644,90 @@ impl SettingsState {
                     control: SettingControl::Toggle(self.mpris_enabled),
                 },
                 SettingRow {
+                    id: "sep_debug",
+                    label: "",
+                    description: "",
+                    control: SettingControl::Separator("━━━  Debug & Diagnostics  ━━━"),
+                },
+                SettingRow {
+                    id: "debug_mode",
+                    label: "Debug Mode (Master Toggle)",
+                    description: "Enable all debug subsystems. When on, individual toggles below take effect.",
+                    control: SettingControl::Toggle(self.debug_mode),
+                },
+                SettingRow {
+                    id: "debug_verbose",
+                    label: "Verbose Logging",
+                    description: "Log every engine event, metadata fetch, and state transition to console/file.",
+                    control: SettingControl::Toggle(self.debug_verbose_logging),
+                },
+                SettingRow {
+                    id: "debug_perf",
+                    label: "Performance Overlay",
+                    description: "Show real-time FPS, frame time, CPU/memory, audio buffer health in corner.",
+                    control: SettingControl::Toggle(self.debug_performance_overlay),
+                },
+                SettingRow {
+                    id: "debug_network",
+                    label: "Network Request Logging",
+                    description: "Log all HTTP requests/responses (YouTube, LRCLIB, metadata) with timing.",
+                    control: SettingControl::Toggle(self.debug_network_logging),
+                },
+                SettingRow {
+                    id: "debug_audio",
+                    label: "Audio Pipeline Diagnostics",
+                    description: "Log decoder state, buffer levels, underruns, sample rate changes, seek operations.",
+                    control: SettingControl::Toggle(self.debug_audio_diagnostics),
+                },
+                SettingRow {
+                    id: "debug_engine",
+                    label: "Engine State Inspection",
+                    description: "Log queue transitions, track loading, shuffle/repeat state, radio station switches.",
+                    control: SettingControl::Toggle(self.debug_engine_state),
+                },
+                SettingRow {
+                    id: "debug_viz",
+                    label: "Visualizer Raw Data",
+                    description: "Dump raw FFT magnitudes, band values, peak envelope per frame to log.",
+                    control: SettingControl::Toggle(self.debug_visualizer_raw),
+                },
+                SettingRow {
+                    id: "debug_cache",
+                    label: "Cache Statistics",
+                    description: "Log metadata cache hits/misses, eviction policy, LRU order, size on every access.",
+                    control: SettingControl::Toggle(self.debug_cache_stats),
+                },
+                SettingRow {
+                    id: "debug_lyrics",
+                    label: "Lyrics Timing Debug",
+                    description: "Log sync timestamp parsing, line matching, scroll position, drift correction.",
+                    control: SettingControl::Toggle(self.debug_lyrics_timing),
+                },
+                SettingRow {
+                    id: "debug_search",
+                    label: "Search Query Logging",
+                    description: "Log every search query, suggestion request, result count, and latency.",
+                    control: SettingControl::Toggle(self.debug_search_queries),
+                },
+                SettingRow {
+                    id: "debug_log_file",
+                    label: "Write Debug Log to File",
+                    description: "Persist all debug output to ~/.cache/tuna-tui/debug.log (rotates at 10MB).",
+                    control: SettingControl::Toggle(self.debug_log_file),
+                },
+                SettingRow {
+                    id: "debug_log_level",
+                    label: "Debug Log Verbosity",
+                    description: "0=Errors only, 1=Warnings, 2=Info, 3=Debug, 4=Trace (noisiest).",
+                    control: SettingControl::Number {
+                        val: self.debug_log_level as i64,
+                        min: 0,
+                        max: 4,
+                        step: 1,
+                        suffix: "",
+                    },
+                },
+                SettingRow {
                     id: "sep_cache",
                     label: "",
                     description: "",
@@ -643,10 +756,10 @@ impl SettingsState {
                     },
                 },
                 SettingRow {
-                    id: "sep_debug",
+                    id: "sep_diag",
                     label: "",
                     description: "",
-                    control: SettingControl::Separator("━━━  Debug & Diagnostics  ━━━"),
+                    control: SettingControl::Separator("━━━  Diagnostics  ━━━"),
                 },
                 SettingRow {
                     id: "export_config",
@@ -972,12 +1085,33 @@ impl SettingsState {
 
             // System
             "mpris" => self.mpris_enabled = !self.mpris_enabled,
+
+            // Debug
+            "debug_mode" => self.debug_mode = !self.debug_mode,
+            "debug_verbose" => self.debug_verbose_logging = !self.debug_verbose_logging,
+            "debug_perf" => self.debug_performance_overlay = !self.debug_performance_overlay,
+            "debug_network" => self.debug_network_logging = !self.debug_network_logging,
+            "debug_audio" => self.debug_audio_diagnostics = !self.debug_audio_diagnostics,
+            "debug_engine" => self.debug_engine_state = !self.debug_engine_state,
+            "debug_viz" => self.debug_visualizer_raw = !self.debug_visualizer_raw,
+            "debug_cache" => self.debug_cache_stats = !self.debug_cache_stats,
+            "debug_lyrics" => self.debug_lyrics_timing = !self.debug_lyrics_timing,
+            "debug_search" => self.debug_search_queries = !self.debug_search_queries,
+            "debug_log_file" => self.debug_log_file = !self.debug_log_file,
+            "debug_log_level" => {
+                if forward && self.debug_log_level < 4 {
+                    self.debug_log_level += 1;
+                } else if !forward && self.debug_log_level > 0 {
+                    self.debug_log_level -= 1;
+                }
+            },
             "clear_cache" => return Some(SettingsAction::ClearCache),
             "cache_size" => {
                 let max = 5;
                 if forward && self.visualizer_color_scheme < max {
-                    // reuse field for cache size selection
+                    // cycle cache size option forward
                 } else if !forward && self.visualizer_color_scheme > 0 {
+                    // cycle cache size option backward
                 }
             }
             "export_config" => {
@@ -1033,6 +1167,20 @@ impl SettingsState {
 
         // System
         c.mpris_enabled = self.mpris_enabled;
+
+        // Debug
+        c.debug_mode = self.debug_mode;
+        c.debug_verbose_logging = self.debug_verbose_logging;
+        c.debug_performance_overlay = self.debug_performance_overlay;
+        c.debug_network_logging = self.debug_network_logging;
+        c.debug_audio_diagnostics = self.debug_audio_diagnostics;
+        c.debug_engine_state = self.debug_engine_state;
+        c.debug_visualizer_raw = self.debug_visualizer_raw;
+        c.debug_cache_stats = self.debug_cache_stats;
+        c.debug_lyrics_timing = self.debug_lyrics_timing;
+        c.debug_search_queries = self.debug_search_queries;
+        c.debug_log_file = self.debug_log_file;
+        c.debug_log_level = self.debug_log_level;
     }
 }
 
