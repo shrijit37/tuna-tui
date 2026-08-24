@@ -83,7 +83,7 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
     }
     out.push((Section::Playlists, playlists));
 
-    // Albums section: saved albums + albums/releases from history and liked tracks
+    // Albums section: saved albums only
     let mut albums: Vec<LibItem> = Vec::new();
     if !store.albums.is_empty() {
         albums.extend(
@@ -92,23 +92,6 @@ pub(crate) fn build_all_sections(store: &Store) -> Vec<(Section, Vec<LibItem>)> 
                 .iter()
                 .map(|a| LibItem::ctx(a.name.clone(), a.subtitle.clone(), a.uri.clone())),
         );
-    }
-    let mut seen_albums = std::collections::HashSet::new();
-    for a in &store.albums {
-        seen_albums.insert(a.name.to_lowercase());
-    }
-    for h in store.history.iter().rev() {
-        let name = h.title.trim();
-        let artist = h.artist.trim();
-        if !name.is_empty() && seen_albums.insert(name.to_lowercase()) {
-            let uri = format!("yt:album:{} {}", name, artist);
-            let subtitle = if artist.is_empty() {
-                "Single / Release".to_string()
-            } else {
-                artist.to_string()
-            };
-            albums.push(LibItem::ctx(name.to_string(), subtitle, uri));
-        }
     }
     out.push((Section::Albums, albums));
 
@@ -556,10 +539,16 @@ mod tests {
     }
 
     #[test]
-    fn build_all_sections_populates_artists_and_albums_from_history() {
+    fn build_all_sections_populates_artists_from_history_and_saved_albums() {
         let mut store = Store::default();
         store.record_played("yt:video:kesariya", "Kesariya", "Arijit Singh, Pritam");
         store.record_played("yt:video:luther", "luther", "Kendrick Lamar & SZA");
+        store.toggle(
+            StoreKind::Album,
+            "DAMN.".into(),
+            "Kendrick Lamar".into(),
+            "yt:album:DAMN. Kendrick Lamar".into(),
+        );
         let sections = build_all_sections(&store);
         let artists_sec = sections
             .iter()
@@ -580,10 +569,9 @@ mod tests {
         assert!(artist_names.contains(&"Kendrick Lamar"));
         assert!(artists_sec.1[0].uri.starts_with("yt:artist:"));
 
-        // Albums must contain Kesariya and luther
+        // Albums must contain saved albums
         let album_names: Vec<&str> = albums_sec.1.iter().map(|i| i.name.as_str()).collect();
-        assert!(album_names.contains(&"Kesariya"));
-        assert!(album_names.contains(&"luther"));
+        assert!(album_names.contains(&"DAMN."));
         assert!(albums_sec.1[0].uri.starts_with("yt:album:"));
 
         // Playlists always starts with "New Playlist" action
