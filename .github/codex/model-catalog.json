@@ -2,6 +2,7 @@
   "models": [
     {
       "slug": "hy4-flash-free",
+      "base_instructions": "You are Codex, a coding agent working in a shared workspace. Use the available tools to inspect files and run commands. Complete the user's task and report the result concisely.",
       "display_name": "hy4-flash-free",
       "description": "Custom Responses-API gateway model used by this repository's CI.",
       "context_window": 200000,
