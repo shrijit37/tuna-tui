@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Theme Pipeline Performance**: RGB→HSL color conversion is now memoized process-wide, eliminating redundant float math when reactive palettes are re-derived each frame.
+
+---
+
 ## [0.4.0] - 2026-08-23
 
 ### Added

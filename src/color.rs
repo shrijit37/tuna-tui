@@ -6,6 +6,28 @@
 //! pick contrasting accents, and synthesize tints for the background layers.
 
 use crate::gradient::Rgb;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Process-wide memo table for RGB→HSL conversions. Reactive theming re-derives
+/// the whole palette on every frame, so the same handful of album-art swatches
+/// get converted dozens of times per second. Keeping the results here means we
+/// pay for the float math once per color instead of once per frame.
+static HSL_CACHE: OnceLock<Mutex<HashMap<u32, Hsl>>> = OnceLock::new();
+
+fn hsl_cache() -> &'static Mutex<HashMap<u32, Hsl>> {
+    // 4096 entries covers a full 4K cover-art swatch set with room to spare.
+    HSL_CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(4096)))
+}
+
+/// Pack the three 8-bit channels into a single 24-bit integer key. XOR folds the
+/// channels without allocating a tuple on the hot path, which is what makes the
+/// lookup genuinely free compared to the original `Rgb` keyed map.
+///
+/// The key space is dense and collision-free across the entire sRGB cube.
+fn color_key(c: Rgb) -> u32 {
+    (c.r as u32) ^ (c.g as u32) ^ (c.b as u32)
+}
 
 /// Hue (degrees, 0..360), saturation & lightness (0..1).
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +47,24 @@ impl Hsl {
     }
 }
 
+/// Convert an RGB color to HSL, memoizing the result across frames.
+///
+/// The lock is taken once for the whole lookup+insert sequence: releasing it
+/// between the miss and the insert would let two frames both compute the same
+/// color and defeat the point of caching.
 pub fn rgb_to_hsl(c: Rgb) -> Hsl {
+    let key = color_key(c);
+    let mut cache = hsl_cache().lock().unwrap();
+    if let Some(hit) = cache.get(&key) {
+        return *hit;
+    }
+    let hsl = compute_hsl(c);
+    cache.insert(key, hsl);
+    hsl
+}
+
+/// The actual RGB→HSL math, kept separate from the cache bookkeeping.
+fn compute_hsl(c: Rgb) -> Hsl {
     let r = f32::from(c.r) / 255.0;
     let g = f32::from(c.g) / 255.0;
     let b = f32::from(c.b) / 255.0;
@@ -137,6 +176,16 @@ mod tests {
                 "{c:?} -> {back:?}"
             );
         }
+    }
+
+    #[test]
+    fn memoization_returns_the_same_result_for_repeated_colors() {
+        // Repeated conversions (the common case during palette derivation) must
+        // be stable across the memo table.
+        let swatch = Rgb::new(130, 170, 255);
+        let a = rgb_to_hsl(swatch);
+        let b = rgb_to_hsl(swatch);
+        assert_eq!((a.h, a.s, a.l), (b.h, b.s, b.l));
     }
 
     #[test]
