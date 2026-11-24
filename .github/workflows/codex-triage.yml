@@ -1,0 +1,121 @@
+name: Codex Issue Triage
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Prepare issue context (untrusted input) and label list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            printf 'Issue number: %s\n' "$ISSUE_NUMBER"
+            printf 'Title: %s\n' "$ISSUE_TITLE"
+            printf 'Body:\n%s\n' "$ISSUE_BODY"
+            printf '\nExisting labels:\n'
+            gh api "repos/$REPO/labels" --jq '.[].name'
+          } > .github/codex/context.md
+
+      # Codex is deliberately the last step in this job.
+      - name: Run Codex triage
+        id: codex
+        # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_ENDPOINT }}
+          model: ${{ vars.CODEX_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT }}
+          permission-profile: ':read-only'
+          prompt-file: .github/codex/prompts/triage.md
+
+  apply:
+    needs: triage
+    if: needs.triage.outputs.final_message != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Apply labels and post triage comment
+        uses: actions/github-script@v7
+        env:
+          CODEX_OUTPUT: ${{ needs.triage.outputs.final_message }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        with:
+          script: |
+            const out = process.env.CODEX_OUTPUT.trim();
+            const issue = Number(process.env.ISSUE_NUMBER);
+            const { owner, repo } = context.repo;
+
+            let parsed;
+            try {
+              const start = out.indexOf('{');
+              const end = out.lastIndexOf('}');
+              if (start < 0 || end < start) throw new Error('no JSON object');
+              parsed = JSON.parse(out.slice(start, end + 1));
+            } catch (error) {
+              core.warning(`Codex triage output was not JSON: ${error.message}`);
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue,
+                body: `<!-- codex-triage -->\n### Codex triage (raw output)\n\n${out}`,
+              });
+              return;
+            }
+
+            const { data: available } = await github.rest.issues.listLabelsForRepo({
+              owner, repo, per_page: 100,
+            });
+            const valid = new Set(available.map((label) => label.name));
+
+            const labels = new Set(
+              (Array.isArray(parsed.labels) ? parsed.labels : [])
+                .filter((label) => typeof label === 'string' && valid.has(label))
+            );
+            const complexity = parsed.complexity;
+            if (['low', 'medium', 'high'].includes(complexity)) {
+              const label = `complexity:${complexity}`;
+              if (valid.has(label)) labels.add(label);
+            }
+
+            if (labels.size > 0) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: issue, labels: [...labels],
+              });
+            }
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issue,
+              body: [
+                '<!-- codex-triage -->',
+                '### Codex triage',
+                '',
+                typeof parsed.comment === 'string'
+                  ? parsed.comment
+                  : 'Automated triage complete.',
+              ].join('\n'),
+            });
