@@ -38,6 +38,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure Codex model catalog
+        run: |
+          mkdir -p .github/codex/codex-home
+          printf 'model_catalog_json = "%s/.github/codex/model-catalog.json"\n' "$GITHUB_WORKSPACE" > .github/codex/codex-home/config.toml
+
       # Codex is deliberately the last step in this job.
       - name: Run Codex
         id: codex
@@ -49,6 +54,7 @@ jobs:
           model: ${{ inputs.model || vars.CODEX_MODEL }}
           effort: ${{ inputs.effort || vars.CODEX_EFFORT }}
           permission-profile: ':read-only'
+          codex-home: .github/codex/codex-home
           prompt: ${{ inputs.prompt }}
 
   basic-report:
@@ -78,6 +84,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure Codex model catalog
+        run: |
+          mkdir -p .github/codex/codex-home
+          printf 'model_catalog_json = "%s/.github/codex/model-catalog.json"\n' "$GITHUB_WORKSPACE" > .github/codex/codex-home/config.toml
+
       - name: Run Codex with an output schema
         id: codex
         # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
@@ -88,6 +99,7 @@ jobs:
           model: ${{ inputs.model || vars.CODEX_MODEL }}
           effort: ${{ inputs.effort || vars.CODEX_EFFORT }}
           permission-profile: ':read-only'
+          codex-home: .github/codex/codex-home
           prompt: 'Return a JSON object with a single boolean key "ok" set to true.'
           output-schema: '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}'
 
