@@ -1,0 +1,110 @@
+name: Codex provider smoke test
+
+# Manual-only: verifies the configured custom Responses endpoint, model and key
+# work with openai/codex-action before relying on them in the PR pipelines.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: Prompt to send to Codex
+        required: false
+        default: 'Reply with exactly: OK'
+      model:
+        description: Model override (blank uses the CODEX_MODEL variable)
+        required: false
+        default: ''
+      effort:
+        description: Effort override (blank uses the CODEX_EFFORT variable)
+        required: false
+        default: ''
+      test_schema:
+        description: Also test structured JSON output in a separate job
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  basic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Codex is deliberately the last step in this job.
+      - name: Run Codex
+        id: codex
+        # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_ENDPOINT }}
+          model: ${{ inputs.model || vars.CODEX_MODEL }}
+          effort: ${{ inputs.effort || vars.CODEX_EFFORT }}
+          permission-profile: ':read-only'
+          prompt: ${{ inputs.prompt }}
+
+  basic-report:
+    needs: basic
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check response
+        env:
+          FINAL: ${{ needs.basic.outputs.final_message }}
+        run: |
+          if [ -z "$FINAL" ]; then
+            echo "::error::Codex returned an empty final message"
+            exit 1
+          fi
+          echo "Codex responded with ${#FINAL} characters:"
+          printf '%s\n' "$FINAL" | head -c 500
+          echo
+
+  structured:
+    if: inputs.test_schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Run Codex with an output schema
+        id: codex
+        # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_ENDPOINT }}
+          model: ${{ inputs.model || vars.CODEX_MODEL }}
+          effort: ${{ inputs.effort || vars.CODEX_EFFORT }}
+          permission-profile: ':read-only'
+          prompt: 'Return a JSON object with a single boolean key "ok" set to true.'
+          output-schema: '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}'
+
+  structured-report:
+    needs: structured
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check structured response
+        env:
+          FINAL: ${{ needs.structured.outputs.final_message }}
+        run: |
+          if [ -z "$FINAL" ]; then
+            echo "::error::Codex returned an empty structured response"
+            exit 1
+          fi
+          printf '%s' "$FINAL" | jq -e '.ok == true' > /dev/null || {
+            echo "::error::Structured output did not match the schema: $FINAL"
+            exit 1
+          }
+          echo "Structured output works."

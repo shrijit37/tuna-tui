@@ -1,0 +1,150 @@
+name: Codex Issue Implementation
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-implement-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    if: github.event.label.name == 'codex-implement'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      has_patch: ${{ steps.patch.outputs.has_patch }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libasound2-dev libssl-dev pkg-config
+
+      # Pre-fetch so Codex can build/test with the network-disabled workspace profile.
+      - name: Prefetch Cargo dependencies
+        run: cargo fetch --locked
+
+      - name: Prepare issue context (untrusted input)
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          {
+            printf 'Issue number: %s\n' "$ISSUE_NUMBER"
+            printf 'Title: %s\n' "$ISSUE_TITLE"
+            printf 'Body:\n%s\n' "$ISSUE_BODY"
+          } > .github/codex/context.md
+
+      - name: Run Codex implementation
+        id: codex
+        # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_ENDPOINT }}
+          model: ${{ vars.CODEX_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT }}
+          permission-profile: ':workspace'
+          safety-strategy: drop-sudo
+          prompt-file: .github/codex/prompts/implement.md
+        env:
+          CARGO_NET_OFFLINE: 'true'
+
+      # This is the one deliberate exception to "Codex is the last step": exporting
+      # its uncommitted edits as a patch. The commands are fixed (no agent input)
+      # and run with hooks disabled, so nothing is pushed from this untrusted job.
+      - name: Export Codex edits as a patch
+        id: patch
+        run: |
+          rm -f .github/codex/context.md
+          git -c core.hooksPath=/dev/null add -A
+          if git -c core.hooksPath=/dev/null diff --cached --binary --quiet; then
+            echo "has_patch=false" >> "$GITHUB_OUTPUT"
+            echo "Codex produced no changes; no PR will be opened."
+          else
+            git -c core.hooksPath=/dev/null diff --cached --binary > implementation.patch
+            echo "has_patch=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload patch
+        if: steps.patch.outputs.has_patch == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-implementation
+          path: implementation.patch
+          if-no-files-found: error
+
+  publish:
+    needs: implement
+    if: needs.implement.outputs.has_patch == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libasound2-dev libssl-dev pkg-config
+
+      - name: Download patch
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-implementation
+
+      - name: Apply, verify, push and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          git apply --check implementation.patch
+          git apply implementation.patch
+
+          cargo fmt --all --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-features
+
+          BRANCH="codex/issue-${ISSUE_NUMBER}"
+          git checkout -B "$BRANCH"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "Codex implementation for issue #${ISSUE_NUMBER}"
+
+          # Dedicated bot branch: recreating it on each run is intentional.
+          git push --force origin "$BRANCH"
+
+          if gh pr view "$BRANCH" --repo "$REPO" > /dev/null 2>&1; then
+            echo "PR for $BRANCH already exists; skipping creation."
+          else
+            gh pr create \
+              --repo "$REPO" \
+              --base master \
+              --head "$BRANCH" \
+              --title "Codex: implement issue #${ISSUE_NUMBER}" \
+              --body "Automated implementation for #${ISSUE_NUMBER}. Generated by Codex — review carefully."
+          fi

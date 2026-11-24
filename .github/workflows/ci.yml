@@ -77,3 +77,249 @@ jobs:
       # CI; everything else runs.
       - name: Test
         run: cargo test --all-features
+
+  # ── AI stages (run only after the build/test stages above pass) ──────────
+  # Fork PRs do not receive repository secrets, so Codex jobs are skipped for
+  # them — the same limitation accepted for the Jules reviewer.
+
+  codex-review:
+    name: Codex code review
+    needs: [nix-build, test]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pre-fetch PR base and head refs
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+
+      - name: Prepare PR context (untrusted input)
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          {
+            printf 'PR number: %s\n' "$PR_NUMBER"
+            printf 'Title: %s\n' "$PR_TITLE"
+            printf 'Base SHA: %s\n' "$BASE_SHA"
+            printf 'Head SHA: %s\n' "$HEAD_SHA"
+            printf 'Body:\n%s\n' "$PR_BODY"
+          } > .github/codex/context.md
+
+      # Codex is deliberately the last step in this job.
+      - name: Run Codex review
+        id: codex
+        # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_ENDPOINT }}
+          model: ${{ vars.CODEX_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT }}
+          permission-profile: ':read-only'
+          safety-strategy: drop-sudo
+          prompt-file: .github/codex/prompts/review.md
+
+  codex-review-comment:
+    name: Post Codex review
+    needs: codex-review
+    if: needs.codex-review.outputs.final_message != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Post one PR comment
+        uses: actions/github-script@v7
+        env:
+          CODEX_OUTPUT: ${{ needs.codex-review.outputs.final_message }}
+        with:
+          script: |
+            const out = process.env.CODEX_OUTPUT.trim();
+            if (!out || out === 'NO_FINDINGS') return;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: ['<!-- codex-review -->', '### Codex review', '', out].join('\n'),
+            });
+
+  codex-security:
+    name: Codex security audit
+    needs: [nix-build, test]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pre-fetch PR base and head refs
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+
+      - name: Prepare PR context (untrusted input)
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          {
+            printf 'PR number: %s\n' "$PR_NUMBER"
+            printf 'Title: %s\n' "$PR_TITLE"
+            printf 'Base SHA: %s\n' "$BASE_SHA"
+            printf 'Head SHA: %s\n' "$HEAD_SHA"
+            printf 'Body:\n%s\n' "$PR_BODY"
+          } > .github/codex/context.md
+
+      - name: Run Codex security audit
+        id: codex
+        # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_ENDPOINT }}
+          model: ${{ vars.CODEX_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT }}
+          permission-profile: ':read-only'
+          safety-strategy: drop-sudo
+          prompt-file: .github/codex/prompts/security.md
+
+  codex-security-comment:
+    name: Report Codex security audit
+    needs: codex-security
+    if: needs.codex-security.outputs.final_message != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Post findings and gate on verdict
+        uses: actions/github-script@v7
+        env:
+          CODEX_OUTPUT: ${{ needs.codex-security.outputs.final_message }}
+        with:
+          script: |
+            const out = process.env.CODEX_OUTPUT.trim();
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: ['<!-- codex-security -->', '### Codex security audit', '', out].join('\n'),
+            });
+            if (out.includes('SECURITY_VERDICT: FAIL')) {
+              core.setFailed('Codex reported critical/high security findings (SECURITY_VERDICT: FAIL).');
+            } else if (!out.includes('SECURITY_VERDICT:')) {
+              core.warning('Codex did not emit a SECURITY_VERDICT line; no automatic gate applied.');
+            }
+
+  codex-docs:
+    name: Codex documentation sync
+    needs: [nix-build, test]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pre-fetch PR base and head refs
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+
+      - name: Prepare PR context (untrusted input)
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          {
+            printf 'PR number: %s\n' "$PR_NUMBER"
+            printf 'Title: %s\n' "$PR_TITLE"
+            printf 'Base SHA: %s\n' "$BASE_SHA"
+            printf 'Head SHA: %s\n' "$HEAD_SHA"
+            printf 'Body:\n%s\n' "$PR_BODY"
+          } > .github/codex/context.md
+
+      - name: Run Codex docs check
+        id: codex
+        # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_ENDPOINT }}
+          model: ${{ vars.CODEX_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT }}
+          permission-profile: ':read-only'
+          safety-strategy: drop-sudo
+          prompt-file: .github/codex/prompts/docs-sync.md
+
+  codex-docs-comment:
+    name: Report Codex docs check
+    needs: codex-docs
+    if: needs.codex-docs.outputs.final_message != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Comment only when docs are stale
+        uses: actions/github-script@v7
+        env:
+          CODEX_OUTPUT: ${{ needs.codex-docs.outputs.final_message }}
+        with:
+          script: |
+            const out = process.env.CODEX_OUTPUT.trim();
+            if (!out || out.includes('DOCS_IN_SYNC')) return;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: ['<!-- codex-docs -->', '### Documentation out of sync', '', out].join('\n'),
+            });
