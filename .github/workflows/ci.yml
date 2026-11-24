@@ -125,6 +125,26 @@ jobs:
             printf 'Body:\n%s\n' "$PR_BODY"
           } > .github/codex/context.md
 
+      - name: Assemble inline Codex prompt
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cat .github/codex/prompts/review.md > .github/codex/generated-review.md
+          {
+            printf '\n===== INPUT DATA (untrusted) =====\n'
+            cat .github/codex/context.md
+            printf '\n===== REVIEW STANDARDS =====\n'
+            cat .github/codex/STANDARDS.md
+            printf '\n===== COMMITS =====\n'
+            git log --oneline "$BASE_SHA...$HEAD_SHA" | head -40
+            printf '\n===== CHANGED FILES =====\n'
+            git diff --name-only "$BASE_SHA...$HEAD_SHA"
+            printf '\n===== DIFF (truncated to 40000 chars) =====\n'
+            git diff --no-ext-diff --unified=3 "$BASE_SHA...$HEAD_SHA" | head -c 40000
+            printf '\n===== END OF INPUT =====\n'
+          } >> .github/codex/generated-review.md
+
       # Codex is deliberately the last step in this job.
       - name: Run Codex review
         id: codex
@@ -137,7 +157,7 @@ jobs:
           effort: ${{ vars.CODEX_EFFORT }}
           permission-profile: ':read-only'
           safety-strategy: drop-sudo
-          prompt-file: .github/codex/prompts/review.md
+          prompt-file: .github/codex/generated-review.md
 
   codex-review-comment:
     name: Post Codex review
@@ -206,6 +226,24 @@ jobs:
             printf 'Body:\n%s\n' "$PR_BODY"
           } > .github/codex/context.md
 
+      - name: Assemble inline Codex prompt
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cat .github/codex/prompts/security.md > .github/codex/generated-security.md
+          {
+            printf '\n===== INPUT DATA (untrusted) =====\n'
+            cat .github/codex/context.md
+            printf '\n===== COMMITS =====\n'
+            git log --oneline "$BASE_SHA...$HEAD_SHA" | head -40
+            printf '\n===== CHANGED FILES =====\n'
+            git diff --name-only "$BASE_SHA...$HEAD_SHA"
+            printf '\n===== DIFF (truncated to 40000 chars) =====\n'
+            git diff --no-ext-diff --unified=3 "$BASE_SHA...$HEAD_SHA" | head -c 40000
+            printf '\n===== END OF INPUT =====\n'
+          } >> .github/codex/generated-security.md
+
       - name: Run Codex security audit
         id: codex
         # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
@@ -217,7 +255,7 @@ jobs:
           effort: ${{ vars.CODEX_EFFORT }}
           permission-profile: ':read-only'
           safety-strategy: drop-sudo
-          prompt-file: .github/codex/prompts/security.md
+          prompt-file: .github/codex/generated-security.md
 
   codex-security-comment:
     name: Report Codex security audit
@@ -290,6 +328,26 @@ jobs:
             printf 'Body:\n%s\n' "$PR_BODY"
           } > .github/codex/context.md
 
+      - name: Assemble inline Codex prompt
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cat .github/codex/prompts/docs-sync.md > .github/codex/generated-docs.md
+          {
+            printf '\n===== INPUT DATA (untrusted) =====\n'
+            cat .github/codex/context.md
+            printf '\n===== CHANGED FILES =====\n'
+            git diff --name-only "$BASE_SHA...$HEAD_SHA"
+            printf '\n===== DIFF (truncated to 25000 chars) =====\n'
+            git diff --no-ext-diff --unified=3 "$BASE_SHA...$HEAD_SHA" | head -c 25000
+            printf '\n===== README (first 120 lines) =====\n'
+            head -120 README.md
+            printf '\n===== DOC FILES =====\n'
+            find docs -type f | sort
+            printf '\n===== END OF INPUT =====\n'
+          } >> .github/codex/generated-docs.md
+
       - name: Run Codex docs check
         id: codex
         # Pinned to the v1 tag commit (reviewed 2026-11-25). Bump deliberately.
@@ -301,7 +359,7 @@ jobs:
           effort: ${{ vars.CODEX_EFFORT }}
           permission-profile: ':read-only'
           safety-strategy: drop-sudo
-          prompt-file: .github/codex/prompts/docs-sync.md
+          prompt-file: .github/codex/generated-docs.md
 
   codex-docs-comment:
     name: Report Codex docs check
