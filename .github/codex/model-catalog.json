@@ -1,0 +1,28 @@
+{
+  "models": [
+    {
+      "slug": "hy4-flash-free",
+      "display_name": "hy4-flash-free",
+      "description": "Custom Responses-API gateway model used by this repository's CI.",
+      "context_window": 200000,
+      "max_context_window": 200000,
+      "supported_in_api": true,
+      "visibility": "list",
+      "priority": 1,
+      "apply_patch_tool_type": "freeform",
+      "shell_type": "shell_command",
+      "supports_parallel_tool_calls": true,
+      "tool_mode": "code_mode_only",
+      "input_modalities": ["text"],
+      "truncation_policy": { "mode": "tokens", "limit": 10000 },
+      "support_verbosity": false,
+      "supports_reasoning_summaries": false,
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Fast responses" },
+        { "effort": "medium", "description": "Balanced reasoning" },
+        { "effort": "high", "description": "Deeper reasoning" }
+      ]
+    }
+  ]
+}
