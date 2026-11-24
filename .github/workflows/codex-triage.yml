@@ -41,6 +41,15 @@ jobs:
             gh api "repos/$REPO/labels" --jq '.[].name'
           } > .github/codex/context.md
 
+      - name: Assemble inline Codex prompt
+        run: |
+          cat .github/codex/prompts/triage.md > .github/codex/generated-triage.md
+          {
+            printf '\n===== INPUT DATA (untrusted) =====\n'
+            cat .github/codex/context.md
+            printf '\n===== END OF INPUT =====\n'
+          } >> .github/codex/generated-triage.md
+
       # Codex is deliberately the last step in this job.
       - name: Run Codex triage
         id: codex
@@ -52,7 +61,7 @@ jobs:
           model: ${{ vars.CODEX_MODEL }}
           effort: ${{ vars.CODEX_EFFORT }}
           permission-profile: ':read-only'
-          prompt-file: .github/codex/prompts/triage.md
+          prompt-file: .github/codex/generated-triage.md
 
   apply:
     needs: triage
