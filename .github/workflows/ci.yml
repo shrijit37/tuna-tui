@@ -84,7 +84,8 @@ jobs:
 
   codex-review:
     name: Codex code review
-    needs: [nix-build, test]
+    # Gated on tests only: an unrelated Nix-build failure must not suppress review.
+    needs: test
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -164,7 +165,8 @@ jobs:
 
   codex-security:
     name: Codex security audit
-    needs: [nix-build, test]
+    # Gated on tests only: an unrelated Nix-build failure must not suppress review.
+    needs: test
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -247,7 +249,8 @@ jobs:
 
   codex-docs:
     name: Codex documentation sync
-    needs: [nix-build, test]
+    # Gated on tests only: an unrelated Nix-build failure must not suppress review.
+    needs: test
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
